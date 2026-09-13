@@ -55,10 +55,42 @@
     };
   }
 
-  async function load() {
-    if (state.loading) return;
+  /* Which events window the `events` array holds, as "from|to". The calendar
+     can move on without the data: the reload at a date change can fail (a
+     laptop waking before its Wi-Fi) or be asked for while another load runs. */
+  var loadedWindow = null;
+  var windowKey = function () { return CAL.loadFrom + '|' + CAL.loadTo; };
+
+  /* A load asked for while one is running is queued, not dropped: the running
+     one may be reading a window that is already out of date. Queued requests
+     collapse into one, which is quiet only if every request was. `quiet` means
+     a background load — no toast on failure, and the repaint waits for drafts. */
+  var running = null;
+  var queued = null;
+
+  function load(options) {
+    var quiet = !!(options && options.quiet === true);
+    if (running) {
+      queued = queued
+        ? { quiet: queued.quiet && quiet, promise: queued.promise }
+        : {
+            quiet: quiet,
+            promise: running.then(function () {
+              var next = queued;
+              queued = null;
+              return load({ quiet: next.quiet });
+            })
+          };
+      return queued.promise;
+    }
+    running = loadOnce(quiet).then(function () { running = null; });
+    return running;
+  }
+
+  async function loadOnce(quiet) {
     state.loading = true;
     state.error = null;
+    var key = windowKey();
 
     try {
       var d = window.workspaceData;
@@ -129,9 +161,12 @@
           i = liveContacts.findIndex(function (c) { return c.id === note.entityId; });
           return i < 0 ? null : ['crm', i];
         }
+        /* Events are keyed by uuid, not position: the events window moves by
+           itself at a date change, and a position would then name another
+           event. */
         if (note.entityType === 'event') {
-          i = liveEvents.findIndex(function (e) { return e.id === note.entityId; });
-          return i < 0 ? null : ['agenda', i];
+          var ev = liveEvents.filter(function (e) { return e.id === note.entityId; })[0];
+          return ev ? ['agenda', ev.id] : null;
         }
         return null;
       };
@@ -149,17 +184,28 @@
       });
 
       bodies = {};
+      loadedWindow = key;
       state.loaded = true;
       state.loading = false;
       document.body.dispatchEvent(new CustomEvent('workspace:loaded', { detail: state }));
-      if (typeof render === 'function') render();
+      repaint(quiet);
+      /* The date moved while this was in flight, so what landed is already
+         the old window. load() queues behind the one still running. */
+      if (windowKey() !== key) load({ quiet: true });
     } catch (err) {
       state.loading = false;
       state.error = err;
       console.error('[workspace] could not load:', err);
       document.body.dispatchEvent(new CustomEvent('workspace:load-failed', { detail: err }));
-      if (typeof toast === 'function') toast(err.message);
+      /* A background load that fails is retried (bottom of this file); a
+         toast every minute while offline would tell nobody anything new. */
+      if (!quiet && typeof toast === 'function') toast(err.message);
     }
+  }
+
+  function repaint(quiet) {
+    if (quiet && typeof repaintWhenIdle === 'function') repaintWhenIdle();
+    else if (typeof render === 'function') render();
   }
 
   /* Thread bodies, fetched when a thread is opened rather than with the list.
@@ -226,7 +272,7 @@
         return c ? { type: 'contact', id: c.id } : null;
       }
       if (kind === 'agenda') {
-        var e = events[Number(id)];
+        var e = events.filter(function (ev) { return ev.id === String(id); })[0];
         return e ? { type: 'event', id: e.id } : null;
       }
       return null;
@@ -251,8 +297,23 @@
 
   /* A tab left open past midnight, or over a weekend, is holding the wrong
      window of events. Only once someone is signed in: before that there is
-     nothing loaded to replace, and RLS would hand back empty rows anyway. */
+     nothing loaded to replace, and RLS would hand back empty rows anyway.
+     Until the new window lands, keep only the events still inside it — after
+     a long sleep the rest would show up under the new week's matching day
+     numbers. */
   CAL.onChange(function () {
-    if (state.loaded) load();
+    if (!state.loaded) return;
+    swap(events, events.filter(function (e) { return e.row && CAL.contains(e.row.starts_at); }));
+    repaint(true);
+    load({ quiet: true });
   });
+
+  /* Retry a window that never arrived: as soon as the connection is back, and
+     otherwise once a minute. A load already running is left to finish. */
+  var RETRY_MS = 60 * 1000;
+  function retryStaleWindow() {
+    if (state.loaded && !running && loadedWindow !== windowKey()) load({ quiet: true });
+  }
+  window.addEventListener('online', retryStaleWindow);
+  setInterval(retryStaleWindow, RETRY_MS);
 })();

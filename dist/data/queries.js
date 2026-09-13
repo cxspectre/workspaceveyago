@@ -105,7 +105,9 @@
         .from('calendar_events')
         .select('id, title, detail, location, starts_at, ends_at, all_day, kind, status, project_id')
         .neq('status', 'cancelled')
-        .gte('starts_at', from).lte('starts_at', to)
+        /* End-exclusive: `to` is the midnight AFTER the last day shown, and an
+           event starting on it belongs to a day no grid draws. */
+        .gte('starts_at', from).lt('starts_at', to)
         .order('starts_at'), 'the agenda');
       return rows.map(function (r) {
         return {

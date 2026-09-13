@@ -115,7 +115,28 @@ function createCalendar(clock) {
     return () => { listeners = listeners.filter(l => l !== fn); };
   }
 
+  const pad = n => String(n).padStart(2, '0');
+  /* A date as a form can carry it and a person can read it — "2026-09-18" in
+     local time. Not toISOString(), which is UTC and shifts the day for anyone
+     east of Greenwich before 1 a.m. and west of it after 11 p.m. */
+  const dayKey = date => date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate());
+  const parseDayKey = text => {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text == null ? '' : String(text));
+    if (!m) return null;
+    const date = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    /* new Date(2026, 1, 30) quietly becomes March 2; a key that does not
+       survive the round trip was never a real date. */
+    return dayKey(date) === m[0] ? date : null;
+  };
+  /* Whether an instant falls inside the loaded window — from inclusive, to
+     exclusive, the same bounds the events query uses. */
+  const contains = instant => {
+    const t = new Date(instant).getTime();
+    return !isNaN(t) && t >= snap.from.getTime() && t < snap.to.getTime();
+  };
+
   const api = {
+    dayKey, parseDayKey, contains,
     names: Object.freeze(WEEKDAYS.slice(0, WORK_DAYS)),
     short: Object.freeze(['Mon', 'Tue', 'Wed', 'Thu', 'Fri']),
     get days() { return snap.days; },

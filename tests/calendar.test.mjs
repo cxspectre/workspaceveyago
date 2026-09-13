@@ -139,6 +139,92 @@ test('Friday night rolls the grid over to the next week', () => {
   assert.equal(cal.isNextWeek, true);
 });
 
+test('dayKey and parseDayKey round-trip a local date, and refuse anything else', () => {
+  const { cal } = at(2026, 9, 18);
+  assert.equal(cal.dayKey(cal.days[4]), '2026-09-18');
+  const parsed = cal.parseDayKey('2026-09-18');
+  assert.equal(key(parsed), '2026-9-18');
+  assert.equal(parsed.getHours(), 0);
+  for (const bad of ['', '18', '2026-9-18', '2026-02-30', 'not a date', null, undefined]) {
+    assert.equal(cal.parseDayKey(bad), null, `refuses ${bad}`);
+  }
+});
+
+test('contains says whether an instant is inside the loaded window, end exclusive', () => {
+  const { cal } = at(2026, 9, 13);                         // Sep 13 00:00 → Sep 21 00:00
+  assert.equal(cal.contains(new Date(2026, 8, 13, 0, 0).toISOString()), true);
+  assert.equal(cal.contains(new Date(2026, 8, 20, 23, 59).toISOString()), true);
+  assert.equal(cal.contains(new Date(2026, 8, 21, 0, 0).toISOString()), false);
+  assert.equal(cal.contains(new Date(2026, 8, 12, 23, 59).toISOString()), false);
+  assert.equal(cal.contains('garbage'), false);
+});
+
+/* The whole day-number lookup rests on this: inside one load window, a day
+   number means exactly one date. */
+test('no two days in a load window share a day number, two years round', () => {
+  const clock = { now: new Date(2026, 0, 1, 12) };
+  const cal = load()(() => new Date(clock.now));
+  for (let i = 0; i < 731; i++) {
+    clock.now = new Date(2026, 0, 1 + i, 12);
+    cal.refresh();
+    const from = new Date(cal.loadFrom);
+    const to = new Date(cal.loadTo);
+    const numbers = [];
+    for (let d = from; d < to; d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1)) {
+      numbers.push(d.getDate());
+    }
+    assert.equal(new Set(numbers).size, numbers.length, `window from ${cal.loadFrom}`);
+    assert.ok(cal.inWeek(cal.focus), 'the focus day is always in the grid');
+    numbers.forEach(n => assert.notEqual(cal.nameFor(n), '', `day ${n} has a weekday`));
+  }
+});
+
+test('month shapes: a four-row February and a six-row November', () => {
+  const feb = at(2027, 2, 10).cal.month();
+  assert.equal(feb.cells.length, 28);
+  assert.equal(key(feb.cells[0].date), '2027-2-1');
+
+  const nov = at(2026, 11, 18).cal.month();
+  assert.equal(nov.cells.length, 42);
+  assert.equal(key(nov.cells[0].date), '2026-10-26');
+  assert.deepEqual([...nov.cells.filter(c => c.inWeek).map(c => c.day)], [16, 17, 18, 19, 20],
+    'December 1–6 spill into the last row but are never pickable');
+});
+
+test('a day number outside the window has no weekday and borrows the week\'s month', () => {
+  const { cal } = at(2026, 9, 16);                         // window Sep 14 – 20
+  assert.equal(cal.nameFor(25), '');
+  assert.equal(cal.label(25), 'September 25');
+});
+
+function inZone(zone, fn) {
+  const previous = process.env.TZ;
+  process.env.TZ = zone;
+  try {
+    fn();
+  } finally {
+    if (previous === undefined) delete process.env.TZ;
+    else process.env.TZ = previous;
+  }
+}
+
+test('a spring-forward week still reaches its Sunday (Berlin, March 2027)', () => {
+  inZone('Europe/Berlin', () => {
+    const { cal } = at(2027, 3, 24);
+    assert.equal(cal.nameFor(28), 'Sunday');
+    assert.equal(cal.loadTo, new Date(2027, 2, 29).toISOString());
+  });
+});
+
+test('a DST change at midnight neither skips nor repeats a day (Santiago, Sep 2026)', () => {
+  inZone('America/Santiago', () => {
+    const before = at(2026, 9, 2).cal;
+    assert.deepEqual([...before.dates], [31, 1, 2, 3, 4]);
+    assert.equal(before.nameFor(6), 'Sunday');
+    assert.deepEqual([...at(2026, 9, 7).cal.dates], [7, 8, 9, 10, 11]);
+  });
+});
+
 test('a subscriber that throws does not stop the others, and can unsubscribe', () => {
   const clock = { now: new Date(2026, 8, 16) };
   const logged = [];

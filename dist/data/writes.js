@@ -195,7 +195,6 @@
         });
 
       } else if (kind === 'agenda') {
-        var day = Number(d.get('day'));
         var start = String(d.get('time') || '');
         var end = String(d.get('end') || '');
         if (end <= start) {
@@ -204,9 +203,18 @@
           endField.reportValidity();
           return;
         }
-        /* Built from the week the calendar is actually showing, so an event
-           created in a week that straddles a month lands on the right date. */
-        var base = (typeof CAL !== 'undefined' && CAL.days[CAL.indexOf(day)]) || new Date();
+        /* The day arrives as a full date (YYYY-MM-DD), not a day number. A
+           form left open across midnight on a Friday used to look the number
+           up in the NEXT week's grid, miss, fall back to "today" and book the
+           event on Saturday. A date that cannot be read is refused instead. */
+        var base = CAL.parseDayKey(String(d.get('day') || ''));
+        if (!base) {
+          var dayField = form.querySelector('[name="day"]');
+          dayField.setCustomValidity('Pick the day again — the week has changed.');
+          dayField.addEventListener('change', function () { dayField.setCustomValidity(''); }, { once: true });
+          dayField.reportValidity();
+          return;
+        }
         var iso = function (hhmm) {
           var parts = hhmm.split(':');
           return new Date(base.getFullYear(), base.getMonth(), base.getDate(),
