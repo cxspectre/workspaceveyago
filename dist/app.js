@@ -1,44 +1,13 @@
 const icons={overview:'<rect x="3" y="3" width="7" height="7" rx="1.4"/><rect x="14" y="3" width="7" height="7" rx="1.4"/><rect x="3" y="14" width="7" height="7" rx="1.4"/><rect x="14" y="14" width="7" height="7" rx="1.4"/>',mail:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 6 9 7 9-7"/>',tickets:'<path d="M3 7a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v3a2 2 0 0 0 0 4v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-3a2 2 0 0 0 0-4Z"/><path d="M15 5v3m0 3v2m0 3v3"/>',agenda:'<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 3v4m10-4v4M3 11h18m-13 4h2m4 0h2"/>',projects:'<path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M3 9h18"/>',crm:'<circle cx="9" cy="8" r="3"/><path d="M3 21v-3a6 6 0 0 1 12 0v3m1-16a3 3 0 0 1 0 6m2 3a5 5 0 0 1 3 4v3"/>',finance:'<path d="M4 20V10m6 10V4m6 16v-7m5 7H2"/>',company:'<path d="M4 21V5l8-2v18m0-13h8v13M2 21h20M8 7v2m0 3v2m0 3v2m8-8v2m0 3v2"/>',search:'<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/>',bell:'<path d="M18 8a6 6 0 0 0-12 0c0 8-3 8-3 10h18c0-2-3-2-3-10m-12 10a3 3 0 0 0 6 0"/>',plus:'<path d="M12 5v14M5 12h14"/>',arrow:'<path d="M5 12h14m-5-5 5 5-5 5"/>',chevron:'<path d="m9 5 7 7-7 7"/>',dollar:'<path d="M12 2v20m5-16H9a4 4 0 0 0 0 8h6a4 4 0 0 0 0-8M7 18h8"/>',check:'<path d="m5 12 4 4L19 6"/>',menu:'<path d="M4 6h16M4 12h16M4 18h16"/>',clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',reply:'<path d="m9 5-6 6 6 6m-6-6h11a7 7 0 0 1 7 7"/>',external:'<path d="M14 3h7v7m0-7L10 14M10 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-5"/>'};
 const icon=n=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[n]||icons.overview}</svg>`;
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-/* CAL — the working week, derived instead of typed.
-   The agenda shipped hardcoded to Monday 7 – Friday 11 September 2026: day
-   numbers, weekday names indexed by `day - 7`, and "September … 2026" written
-   out in eight places. It was right for exactly one week. Everything the
-   calendar renders now comes from here, so it is right in October too. */
-const CAL=(function(){
-  const MONTHS=['January','February','March','April','May','June','July','August','September','October','November','December'];
-  const now=new Date();
-  const dow=(now.getDay()+6)%7;                       // 0 = Monday
-  const monday=new Date(now.getFullYear(),now.getMonth(),now.getDate()-dow);
-  const days=Array.from({length:5},(_,i)=>new Date(monday.getFullYear(),monday.getMonth(),monday.getDate()+i));
-  const names=['Monday','Tuesday','Wednesday','Thursday','Friday'];
-  const dates=days.map(d=>d.getDate());
-  /* At the weekend there is no "today" in a Mon–Fri grid; Friday is the day a
-     person means when they open the agenda on a Saturday. */
-  const today=dow<5?now.getDate():dates[4];
-  const at=d=>{const i=dates.indexOf(d);return i<0?days[0]:days[i];};
-  return {
-    days, dates, names, short:['Mon','Tue','Wed','Thu','Fri'], today,
-    monthName:MONTHS[monday.getMonth()], year:monday.getFullYear(),
-    inWeek:d=>dates.indexOf(d)!==-1,
-    indexOf:d=>dates.indexOf(d),
-    nameFor:d=>{const i=dates.indexOf(d);return i<0?'':names[i];},
-    label:d=>MONTHS[at(d).getMonth()]+' '+d,
-    full:d=>MONTHS[at(d).getMonth()]+' '+d+', '+at(d).getFullYear(),
-    /* A week can straddle two months — "September 28 – October 2, 2026". */
-    range:function(withYear){
-      const a=days[0],b=days[4];
-      const head=MONTHS[a.getMonth()]+' '+a.getDate();
-      const tail=(a.getMonth()===b.getMonth()?'':MONTHS[b.getMonth()]+' ')+b.getDate();
-      return head+' – '+tail+(withYear===false?'':', '+b.getFullYear());
-    }
-  };
-})();
-/* The context bar shipped with 'Friday, September 11' typed into the HTML —
-   the same failure as the agenda above, one line further up. It is the first
-   thing on the page, so a stale date makes everything under it look stale. */
-(function(){const el=document.querySelector('#today');if(el)el.textContent=new Date().toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric'});})();
+/* CAL — the working week and today's date — lives in calendar.js, which loads
+   before this file and replaces its snapshot when the date changes.
+   The context bar's date sits outside #main, so render() never rebuilds it;
+   a new day has to repaint it explicitly. */
+const paintToday=()=>{const el=document.querySelector('#today');if(el)el.textContent=CAL.todayLong;};
+paintToday();
+CAL.onChange(paintToday);
 /* Declared here, not in workspace.js: app.js renders before that file has
    run, and a binding it cannot see yet throws on the first paint. */
 const recordNotes = {tickets:{}, projects:{}, crm:{}, agenda:{}};

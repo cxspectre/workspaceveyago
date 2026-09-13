@@ -19,21 +19,10 @@
 (function () {
   'use strict';
 
-  /* The agenda renders a Mon–Fri grid, so the window has to be that week — not
-     "today plus seven". In a week that straddles a month (Sep 28 – Oct 2) the
-     earlier days are in the past, and a today-forward window would leave them
-     blank while the grid still drew them. */
-  function weekStart() {
-    var now = new Date();
-    var dow = (now.getDay() + 6) % 7;                       // 0 = Monday
-    return new Date(now.getFullYear(), now.getMonth(), now.getDate() - dow).toISOString();
-  }
-  function weekEnd() {
-    var start = new Date(weekStart());
-    /* Through Sunday, so an event on the weekend still loads for the Schedule
-       and Day views even though the week grid stops at Friday. */
-    return new Date(start.getFullYear(), start.getMonth(), start.getDate() + 7).toISOString();
-  }
+  /* The events window is CAL.loadFrom – CAL.loadTo (calendar.js): the same
+     object the agenda draws its grid from, so the rows loaded and the days
+     drawn cannot disagree — including at the weekend, when the grid is the
+     week about to start and today sits just before it. */
 
   function swap(target, rows) {
     target.length = 0;
@@ -79,7 +68,7 @@
          total is the same. */
       var results = await Promise.all([
         d.tickets(), d.projects(), d.contacts(), d.team(),
-        d.events(weekStart(), weekEnd()), d.invoices(), d.activity(8), d.mailThreads('inbox'),
+        d.events(CAL.loadFrom, CAL.loadTo), d.invoices(), d.activity(8), d.mailThreads('inbox'),
         d.overview().catch(function () { return null; }),      // managers only
         d.revenueSeries(12).catch(function () { return []; }),  // ditto
         d.revenueMix(1).catch(function () { return []; }),
@@ -259,4 +248,11 @@
   };
 
   document.body.addEventListener('workspace:authed', load);
+
+  /* A tab left open past midnight, or over a weekend, is holding the wrong
+     window of events. Only once someone is signed in: before that there is
+     nothing loaded to replace, and RLS would hand back empty rows anyway. */
+  CAL.onChange(function () {
+    if (state.loaded) load();
+  });
 })();

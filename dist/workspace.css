@@ -38,3 +38,7 @@
   .mail-workspace > .reader { overflow: visible; }
   .conversation-list .mail-list-heading { position: static; }
 }
+
+/* Mini month: the spill from the months either side fills out whole weeks,
+   and reads as secondary to the month itself. */
+.mini-days > .outside { opacity: .45; }

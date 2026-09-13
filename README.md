@@ -17,6 +17,8 @@ Then open `http://localhost:4173`.
 - `dist/index.html` — application shell and metadata
 - `dist/styles.css` — base Veyago / Apple-inspired visual system
 - `dist/workspace.css` — workspace-specific layouts and responsive styling
+- `dist/calendar.js` — `CAL`: today's date and the working week the agenda draws;
+  re-checks the clock and tells the views when the date changes
 - `dist/app.js` — shell, icons, dialogs, and core interactions
 - `dist/workspace.js` — connected app views, detail routes, notes, tasks, and subpages
 - `dist/data/` — the Supabase layer (see below)
@@ -24,6 +26,17 @@ Then open `http://localhost:4173`.
 
 Bump the `?v=N` query on the `<script>`/`<link>` tags in `index.html` whenever
 you change CSS or JS, or browsers keep serving the old file.
+
+## Tests
+
+```bash
+node --test
+```
+
+No dependencies. `tests/*.test.mjs` load the browser scripts into a `node:vm`
+sandbox, the way a `<script>` tag runs them, and drive them with a fake clock —
+so "what does the agenda show on a Sunday, or the night a week rolls over" is
+checked without waiting for one.
 
 ## It runs on the database
 
