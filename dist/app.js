@@ -35,6 +35,10 @@ const CAL=(function(){
     }
   };
 })();
+/* The context bar shipped with 'Friday, September 11' typed into the HTML —
+   the same failure as the agenda above, one line further up. It is the first
+   thing on the page, so a stale date makes everything under it look stale. */
+(function(){const el=document.querySelector('#today');if(el)el.textContent=new Date().toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric'});})();
 /* Declared here, not in workspace.js: app.js renders before that file has
    run, and a binding it cannot see yet throws on the first paint. */
 const recordNotes = {tickets:{}, projects:{}, crm:{}, agenda:{}};
