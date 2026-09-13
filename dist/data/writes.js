@@ -70,7 +70,9 @@
   document.addEventListener('click', function (e) {
     var btn = e.target.closest && e.target.closest('[data-action="email-ticket"]');
     if (!btn || !live()) return;
-    var thread = mails[typeof selectedMail === 'number' ? selectedMail : 0];
+    /* By id, from the button itself. The list is filtered by mailbox, folder
+       and search, so a position in `mails` means nothing outside one view. */
+    var thread = mails.filter(function (m) { return m.id === btn.dataset.threadId; })[0];
     if (!thread || !thread.id) return;
     e.stopImmediatePropagation();
     e.preventDefault();

@@ -42,3 +42,77 @@
 /* Mini month: the spill from the months either side fills out whole weeks,
    and reads as secondary to the month itself. */
 .mini-days > .outside { opacity: .45; }
+
+/* -- Mail: mailboxes, the conversation, and email bodies ----------------------
+   The column widths are restated at every breakpoint below: a base rule this
+   late in the file would otherwise beat the earlier media queries. */
+.mail-workspace { grid-template-columns: 214px 290px minmax(0, 1fr); }
+
+.mailbox-switcher { display: flex; flex-direction: column; gap: 2px; padding-bottom: 12px; margin-bottom: 8px; border-bottom: 1px solid var(--line); }
+.mailbox-switcher > .eyebrow { font-size: .6875rem; letter-spacing: 1px; color: #66758a; padding: 0 9px 6px; }
+.mailbox-link { display: flex; align-items: center; gap: 9px; min-width: 0; padding: 8px 9px; border-radius: 10px; color: #56657a; }
+.mailbox-link:hover { background: #eaf2fc; }
+.mailbox-link.selected { background: #e2eeff; color: #0066cc; }
+.mailbox-mark { display: grid; place-items: center; flex-shrink: 0; width: 26px; height: 26px; border-radius: 8px; background: #0071e3; color: #fff; font-size: .75rem; font-weight: 600; }
+.mailbox-mark.personal { background: #8a6fd1; }
+.mailbox-mark.all { background: #e6edf6; color: #56657a; }
+.mailbox-mark svg { width: 15px; height: 15px; }
+.mailbox-name { display: flex; flex: 1; flex-direction: column; min-width: 0; }
+.mailbox-name strong { font-size: .8125rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mailbox-name small { margin-top: 2px; font-size: .6875rem; color: #7d899d; }
+.mailbox-link.selected .mailbox-name small { color: #4d7fb8; }
+.mailbox-name small.mailbox-warning, .mail-folder-foot small.mailbox-warning { color: #b45309; }
+.mail-count { flex-shrink: 0; min-width: 20px; padding: 1px 6px; border-radius: 999px; background: #0071e3; color: #fff; font-size: .6875rem; text-align: center; }
+.mailbox-select { display: none; }
+.mailbox-select select { max-width: 260px; padding: 7px 10px; border: 1px solid #dce0e6; border-radius: 10px; background: #fafbfc; color: var(--ink); font-size: .8125rem; }
+.folder-star { width: 17px; font-size: .9375rem; line-height: 1; text-align: center; }
+
+.mail-list-where { display: block; margin: -6px 0 10px; font-size: .75rem; color: #7d899d; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.thread-item.unread .mail-item-header strong, .thread-item.unread h3 { font-weight: 600; color: var(--ink); }
+.unread-dot { display: inline-block; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: #0071e3; vertical-align: middle; }
+.thread-star { color: #dd9d25; }
+.thread-mailbox { display: inline-block; max-width: 100%; margin-top: 9px; padding: 2px 6px; border-radius: 6px; background: #f1f5fa; color: #7b8fa9; font-size: .6875rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.reader-tools { display: flex; gap: 4px; }
+.reader-tools .icon-btn svg { width: 18px; height: 18px; }
+.reader-empty { display: grid; place-items: center; }
+.mail-thread-count { display: block; margin-top: 4px; font-size: .75rem; color: #7d899d; }
+.mail-conversation { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; }
+.mail-message { overflow: hidden; border: 1px solid var(--line); border-radius: 14px; background: #fff; }
+.mail-message.collapsed { display: flex; align-items: center; gap: 12px; width: 100%; padding: 11px 14px; background: #fafbfd; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.mail-message.collapsed:hover { background: #f2f7fe; }
+.mail-message-head { display: flex; align-items: flex-start; gap: 12px; width: 100%; padding: 13px 16px; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: inherit; font: inherit; text-align: left; }
+button.mail-message-head { cursor: pointer; }
+button.mail-message-head:hover { background: #f7faff; }
+.mail-message-summary, .mail-message-meta { display: flex; flex: 1; flex-direction: column; gap: 3px; min-width: 0; }
+.mail-message-line { display: flex; justify-content: space-between; gap: 10px; font-size: .875rem; }
+.mail-message-line strong { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mail-message-line small { font-size: .75rem; color: #7d899d; white-space: nowrap; }
+.mail-message-snippet { font-size: .8125rem; color: #7d899d; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mail-recipients { font-size: .75rem; color: #7d899d; overflow-wrap: anywhere; }
+.mail-message > .mail-body { padding: 14px 16px 18px; }
+
+/* HTML email is laid out by its own markup: pre-line would turn the source's
+   indentation into visible gaps. Plain text keeps its line breaks. */
+.reader .mail-body { white-space: normal; }
+.mail-plain { white-space: pre-wrap; overflow-wrap: anywhere; }
+.mail-html { overflow-x: auto; overflow-wrap: anywhere; line-height: 1.6; color: #3f4754; }
+.mail-html img { max-width: 100%; height: auto; }
+.mail-html table { border-collapse: collapse; }
+.mail-html a { color: #0066cc; text-decoration: underline; }
+.mail-images-blocked { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; padding: 8px 12px; border-radius: 10px; background: #f4f7fb; color: #66758a; font-size: .8125rem; }
+.mail-image-blocked { display: inline-block; min-width: 24px; min-height: 16px; border-radius: 4px; background: #eef2f7; }
+.mail-loading { padding: 18px 0; }
+
+@media (min-width: 1650px) { .mail-workspace { grid-template-columns: 236px 320px minmax(0, 1fr); } }
+@media (max-width: 1250px) {
+  .mail-workspace { grid-template-columns: 188px 250px minmax(0, 1fr); }
+  .mailbox-mark { display: none; }
+}
+@media (max-width: 1050px) {
+  .mail-workspace { grid-template-columns: 250px minmax(0, 1fr); }
+  .mailbox-switcher { display: none; }
+  .mailbox-select { display: block; margin-right: 6px; }
+  .mail-folder-list { display: flex; flex-wrap: wrap; gap: 6px; }
+}
+@media (max-width: 760px) { .mail-workspace { grid-template-columns: 1fr; } }

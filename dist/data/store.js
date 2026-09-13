@@ -100,12 +100,16 @@
          total is the same. */
       var results = await Promise.all([
         d.tickets(), d.projects(), d.contacts(), d.team(),
-        d.events(CAL.loadFrom, CAL.loadTo), d.invoices(), d.activity(8), d.mailThreads('inbox'),
+        d.events(CAL.loadFrom, CAL.loadTo), d.invoices(), d.activity(8), d.mailThreads(['inbox', 'sent']),
         d.overview().catch(function () { return null; }),      // managers only
         d.revenueSeries(12).catch(function () { return []; }),  // ditto
         d.revenueMix(1).catch(function () { return []; }),
-        d.notes().catch(function () { return []; })
+        d.notes().catch(function () { return []; }),
+        /* The mail switcher's list. Losing it degrades to "All mailboxes"
+           rather than taking the whole workspace down with it. */
+        d.mailboxes().catch(function () { return []; })
       ]);
+      state.mailboxes = results[12];
 
       var liveTickets = results[0];
       var liveProjects = results[1];

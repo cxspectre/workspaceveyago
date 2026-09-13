@@ -29,8 +29,11 @@
     'hr','i','img','li','ol','p','pre','q','small','span','strong','sub','sup',
     'table','tbody','td','tfoot','th','thead','tr','u','ul','center','font'
   ];
+  /* No `class`. An email's own <style> blocks are stripped below, so its class
+     names can only ever match the WORKSPACE's stylesheet — class="gate" or
+     "toast" would dress a message up as part of the app. */
   var ALLOWED_ATTR = [
-    'align','alt','bgcolor','border','cellpadding','cellspacing','class','color',
+    'align','alt','bgcolor','border','cellpadding','cellspacing','color',
     'colspan','dir','face','height','href','rowspan','size','src','style','title',
     'valign','width'
   ];
@@ -42,7 +45,81 @@
     return /^(https?:|mailto:|tel:)/i.test(href) ? href : null;
   }
 
+  /* An inline style is CSS, and DOMPurify does not read CSS. Left alone, an
+     email's style="" can fetch a remote image through url() — a tracking pixel
+     that walks straight past "images blocked" — or pin itself over the
+     workspace with position: fixed. Each declaration is judged on its own, and
+     anything that reaches outside the message goes. */
+  var PROPERTY = /^-?[a-z][a-z0-9-]*$/i;
+  var UNSAFE_PROPERTY = /^(behavior|-moz-binding)$/i;
+  var UNSAFE_VALUE = /expression\s*\(|javascript:|vbscript:|-moz-binding/i;
+  var URL_OPEN = /url\s*\(/gi;
+  var URL_REF = /url\s*\(\s*(['"]?)(.*?)\1\s*\)/gi;
+
+  /* Split on semicolons that are not inside quotes or brackets:
+     font-family: "A;B" and url("a;b.png") are one declaration each. */
+  function declarations(text) {
+    var parts = [];
+    var current = '';
+    var quote = null;
+    var depth = 0;
+    for (var i = 0; i < text.length; i++) {
+      var ch = text.charAt(i);
+      if (quote) {
+        if (ch === quote) quote = null;
+      } else if (ch === '"' || ch === "'") {
+        quote = ch;
+      } else if (ch === '(') {
+        depth++;
+      } else if (ch === ')') {
+        depth = Math.max(0, depth - 1);
+      } else if (ch === ';' && depth === 0) {
+        parts.push(current);
+        current = '';
+        continue;
+      }
+      current += ch;
+    }
+    parts.push(current);
+    return parts;
+  }
+
+  function urlsAllowed(value, showImages) {
+    var opened = (value.match(URL_OPEN) || []).length;
+    if (!opened) return true;
+    if (!showImages) return false;
+    var refs = [];
+    var m;
+    URL_REF.lastIndex = 0;
+    while ((m = URL_REF.exec(value))) refs.push(m[2].trim());
+    /* A url( that did not parse is not given the benefit of the doubt. */
+    return refs.length === opened && refs.every(function (u) { return /^https:\/\//i.test(u); });
+  }
+
+  function keepDeclaration(declaration, showImages) {
+    var text = declaration.trim();
+    var colon = text.indexOf(':');
+    if (colon < 1) return null;
+    var property = text.slice(0, colon).trim();
+    var value = text.slice(colon + 1).trim();
+    if (!value || !PROPERTY.test(property)) return null;
+    if (UNSAFE_PROPERTY.test(property) || UNSAFE_VALUE.test(value)) return null;
+    if (/^position$/i.test(property) && !/^(static|relative)$/i.test(value)) return null;
+    if (!urlsAllowed(value, showImages)) return null;
+    return text;
+  }
+
+  function cleanStyle(style, options) {
+    var showImages = Boolean(options && options.showImages);
+    return declarations(style == null ? '' : String(style))
+      .map(function (d) { return keepDeclaration(d, showImages); })
+      .filter(Boolean)
+      .join('; ');
+  }
+
   window.mailHtml = {
+    cleanStyle: cleanStyle,
+
     /* Returns { html, blockedImages } — the caller decides how to offer the
        "show images" affordance, and how many were hidden. */
     render: function (rawHtml, options) {
@@ -66,6 +143,12 @@
 
       var host = document.createElement('div');
       host.appendChild(clean);
+
+      host.querySelectorAll('[style]').forEach(function (el) {
+        var kept = cleanStyle(el.getAttribute('style'), opts);
+        if (kept) el.setAttribute('style', kept);
+        else el.removeAttribute('style');
+      });
 
       var blocked = 0;
       host.querySelectorAll('img').forEach(function (img) {
