@@ -1,0 +1,151 @@
+/* gate.css — the sign-in screen, and the strip that says who you are.
+   Uses the workspace's own tokens from styles.css, so the door looks like the
+   room. Loaded only by index.html; nothing else depends on it. */
+
+.gate {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background:
+    radial-gradient(ellipse at 88% 4%, #dceaff95, transparent 38%),
+    radial-gradient(ellipse at 8% 63%, #e6eaff80, transparent 30%),
+    var(--bg);
+}
+.gate[hidden] { display: none !important; }
+
+/* The shell stays in the DOM while the gate is up so a sign-in does not cause
+   a full re-layout flash — it is just not readable underneath. */
+.app.locked { filter: blur(7px); pointer-events: none; user-select: none; }
+
+.gate-card {
+  width: 100%;
+  max-width: 380px;
+  padding: 30px 28px 26px;
+  border: 1px solid #ffffffc7;
+  background: var(--surface);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  text-align: center;
+}
+.gate-mark {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  margin: 0 auto 18px;
+  border-radius: 13px;
+  background: linear-gradient(150deg, #30333b, #111318);
+  box-shadow: 0 4px 8px #13192220;
+  color: #fff;
+  font-size: 23px;
+  font-weight: 500;
+  letter-spacing: -2px;
+  padding-right: 2px;
+}
+.gate-card h1 { font-size: 1.25rem; letter-spacing: -.5px; font-weight: 650; }
+.gate-card > p { margin-top: 7px; color: var(--muted); font-size: .875rem; }
+
+.gate-form { margin-top: 22px; display: flex; flex-direction: column; gap: 10px; text-align: left; }
+.gate-form label { font-size: .75rem; font-weight: 500; color: #6e6e73; }
+.gate-form input {
+  width: 100%;
+  padding: 11px 13px;
+  border: 1px solid #dde1e8;
+  border-radius: 12px;
+  background: #fff;
+  font-size: .9375rem;
+  color: var(--ink);
+}
+.gate-form input:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; border-color: transparent; }
+.gate-form .btn-primary { margin-top: 6px; padding: 11px 17px; justify-content: center; }
+.gate-form .btn-primary[disabled] { opacity: .55; cursor: default; }
+
+/* A 6-digit TOTP code reads as digits, not prose. */
+.gate-code {
+  letter-spacing: 7px;
+  text-align: center;
+  font-size: 1.25rem !important;
+  font-variant-numeric: tabular-nums;
+}
+
+.gate-msg { margin-top: 14px; font-size: .8125rem; line-height: 1.5; min-height: 1.2em; }
+.gate-msg.err { color: #b94438; }
+.gate-msg.ok  { color: #28795b; }
+
+.gate-back {
+  margin-top: 18px;
+  border: 0;
+  background: transparent;
+  color: var(--teal);
+  font-size: .8125rem;
+  padding: 4px;
+}
+
+/* Who is signed in, in the header, replacing the static demo avatar. */
+.session-chip {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 4px 5px 4px 11px;
+  border: 1px solid #e4e8f0;
+  border-radius: 999px;
+  background: #ffffff9e;
+  font-size: .8125rem;
+  color: #5c6370;
+  white-space: nowrap;
+}
+.session-chip strong { font-weight: 500; color: var(--ink); }
+.session-chip .avatar { width: 26px; height: 26px; font-size: .6875rem; }
+.session-signout {
+  border: 0;
+  background: transparent;
+  color: #86868b;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+}
+.session-signout:hover { background: #eef1f6; color: var(--ink); }
+.session-signout svg { width: 15px; height: 15px; }
+
+@media (max-width: 760px) {
+  .session-chip > span.session-name { display: none; }
+  .session-chip { padding-left: 5px; }
+}
+
+/* ── Email bodies ─────────────────────────────────────────────────────────
+   Email HTML is written for Outlook in 2005: fixed pixel tables, inline fonts,
+   its own colours. It is contained rather than restyled — overriding it makes
+   half of it unreadable — but it is stopped from breaking the page out. */
+
+.mail-html { max-width: 100%; overflow-x: auto; font-size: .9375rem; line-height: 1.6; }
+.mail-html img { max-width: 100%; height: auto; }
+.mail-html table { max-width: 100% !important; border-collapse: collapse; }
+.mail-html td, .mail-html th { word-break: break-word; }
+.mail-html a { color: var(--teal); text-decoration: underline; }
+/* Email sets its own body colour for a white background; force neither, but
+   do not let a sender make text invisible on ours. */
+.mail-html [style*="color:#fff"], .mail-html [style*="color: #fff"],
+.mail-html [style*="color:white"] { color: inherit !important; }
+
+.mail-plain { white-space: pre-wrap; font-size: .9375rem; line-height: 1.7; color: #5c616c; }
+
+/* A blocked image leaves a marker rather than a broken-image icon. */
+.mail-image-blocked {
+  display: inline-block;
+  min-width: 18px; min-height: 18px;
+  border: 1px dashed #d6dbe4; border-radius: 6px;
+  background: #f4f6fa;
+}
+
+.mail-images-blocked {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-bottom: 16px; padding: 9px 13px;
+  background: #fff8e8; border: 1px solid #f0e2c4; border-radius: 10px;
+  font-size: .8125rem; color: #8a6d3b;
+}
+.mail-images-blocked .text-btn { font-size: .8125rem; padding: 0; }

@@ -1,0 +1,230 @@
+const icons={overview:'<rect x="3" y="3" width="7" height="7" rx="1.4"/><rect x="14" y="3" width="7" height="7" rx="1.4"/><rect x="3" y="14" width="7" height="7" rx="1.4"/><rect x="14" y="14" width="7" height="7" rx="1.4"/>',mail:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 6 9 7 9-7"/>',tickets:'<path d="M3 7a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v3a2 2 0 0 0 0 4v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-3a2 2 0 0 0 0-4Z"/><path d="M15 5v3m0 3v2m0 3v3"/>',agenda:'<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 3v4m10-4v4M3 11h18m-13 4h2m4 0h2"/>',projects:'<path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M3 9h18"/>',crm:'<circle cx="9" cy="8" r="3"/><path d="M3 21v-3a6 6 0 0 1 12 0v3m1-16a3 3 0 0 1 0 6m2 3a5 5 0 0 1 3 4v3"/>',finance:'<path d="M4 20V10m6 10V4m6 16v-7m5 7H2"/>',company:'<path d="M4 21V5l8-2v18m0-13h8v13M2 21h20M8 7v2m0 3v2m0 3v2m8-8v2m0 3v2"/>',search:'<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/>',bell:'<path d="M18 8a6 6 0 0 0-12 0c0 8-3 8-3 10h18c0-2-3-2-3-10m-12 10a3 3 0 0 0 6 0"/>',plus:'<path d="M12 5v14M5 12h14"/>',arrow:'<path d="M5 12h14m-5-5 5 5-5 5"/>',chevron:'<path d="m9 5 7 7-7 7"/>',dollar:'<path d="M12 2v20m5-16H9a4 4 0 0 0 0 8h6a4 4 0 0 0 0-8M7 18h8"/>',check:'<path d="m5 12 4 4L19 6"/>',menu:'<path d="M4 6h16M4 12h16M4 18h16"/>',clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',reply:'<path d="m9 5-6 6 6 6m-6-6h11a7 7 0 0 1 7 7"/>',external:'<path d="M14 3h7v7m0-7L10 14M10 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-5"/>'};
+const icon=n=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[n]||icons.overview}</svg>`;
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+/* CAL — the working week, derived instead of typed.
+   The agenda shipped hardcoded to Monday 7 – Friday 11 September 2026: day
+   numbers, weekday names indexed by `day - 7`, and "September … 2026" written
+   out in eight places. It was right for exactly one week. Everything the
+   calendar renders now comes from here, so it is right in October too. */
+const CAL=(function(){
+  const MONTHS=['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const now=new Date();
+  const dow=(now.getDay()+6)%7;                       // 0 = Monday
+  const monday=new Date(now.getFullYear(),now.getMonth(),now.getDate()-dow);
+  const days=Array.from({length:5},(_,i)=>new Date(monday.getFullYear(),monday.getMonth(),monday.getDate()+i));
+  const names=['Monday','Tuesday','Wednesday','Thursday','Friday'];
+  const dates=days.map(d=>d.getDate());
+  /* At the weekend there is no "today" in a Mon–Fri grid; Friday is the day a
+     person means when they open the agenda on a Saturday. */
+  const today=dow<5?now.getDate():dates[4];
+  const at=d=>{const i=dates.indexOf(d);return i<0?days[0]:days[i];};
+  return {
+    days, dates, names, short:['Mon','Tue','Wed','Thu','Fri'], today,
+    monthName:MONTHS[monday.getMonth()], year:monday.getFullYear(),
+    inWeek:d=>dates.indexOf(d)!==-1,
+    indexOf:d=>dates.indexOf(d),
+    nameFor:d=>{const i=dates.indexOf(d);return i<0?'':names[i];},
+    label:d=>MONTHS[at(d).getMonth()]+' '+d,
+    full:d=>MONTHS[at(d).getMonth()]+' '+d+', '+at(d).getFullYear(),
+    /* A week can straddle two months — "September 28 – October 2, 2026". */
+    range:function(withYear){
+      const a=days[0],b=days[4];
+      const head=MONTHS[a.getMonth()]+' '+a.getDate();
+      const tail=(a.getMonth()===b.getMonth()?'':MONTHS[b.getMonth()]+' ')+b.getDate();
+      return head+' – '+tail+(withYear===false?'':', '+b.getFullYear());
+    }
+  };
+})();
+/* Declared here, not in workspace.js: app.js renders before that file has
+   run, and a binding it cannot see yet throws on the first paint. */
+const recordNotes = {tickets:{}, projects:{}, crm:{}, agenda:{}};
+const workspaceActivity = [];
+const team = [];
+const navs=[['overview','Overview'],['mail','Mail'],['tickets','Tickets'],['agenda','Agenda'],['projects','Projects'],['crm','CRM'],['finance','Finance'],['company','Company']];
+let page='overview',filter='All tickets',mailFolder='Inbox',selectedMail=0,range='6 months',toastTimer;
+/* These arrays start EMPTY. data/store.js fills them from Supabase once
+   someone signs in. They used to hold sample rows, which meant a failed
+   load looked like a working workspace belonging to somebody else — the
+   worst way for a data layer to fail. Empty renders an empty state, which
+   is at least true. */
+const tickets=[];
+const projects=[];
+const contacts=[];
+const mails=[];
+const sent=[];const events=[];
+const invoices=[];
+const openTickets=()=>tickets.filter(t=>t.status!=='Resolved');
+const pill=(text,color)=>`<span class="pill ${color||({Open:'blue','In progress':'amber','In review':'purple',Resolved:'green',Closed:'green',Waiting:'amber',High:'red',Urgent:'red',Medium:'amber',Normal:'amber',Low:'green',Paid:'green',Due:'amber',Overdue:'red',Sent:'blue',Draft:'',Client:'green',Proposal:'purple',Qualified:'purple',Lead:'blue',Dormant:'',Lost:'red',Discovery:'blue',Completed:'green','On hold':'amber',Cancelled:''}[text]||'')}">${esc(text)}</span>`;
+function nav(){document.querySelector('#nav').innerHTML=navs.map(([key,title],i)=>`${i===7?'<div class="nav-divider"></div>':''}<a href="#${key}" title="${title}" class="${key===page?'active':''}" ${key===page?'aria-current="page"':''}><span class="nav-icon">${icon(key)}${key==='mail'?`<span class="nav-badge">${mails.filter(m=>m.unread).length||''}</span>`:key==='tickets'?`<span class="nav-badge">${openTickets().length}</span>`:''}</span><span class="nav-title">${title}</span></a>`).join('')}
+function heading(title,subtitle,action='new'){return `<div class="page-heading"><div><h1>${title}</h1><p>${subtitle}</p></div><div class="heading-actions">${page==='overview'?`<button class="btn date-btn" data-nav="agenda">${icon('agenda')} ${CAL.full(CAL.today)}</button>`:''}${action?`<button class="btn btn-primary" data-action="${action}">${icon('plus')} ${action==='compose'?'Compose':page==='overview'?'Create new':({tickets:'New ticket',projects:'New project',crm:'Add contact',agenda:'New event'}[page]||'Create new')}</button>`:''}</div></div>`}
+function metrics(){
+/* The tiles come from workspace_overview() — one round trip, so the four
+   numbers cannot disagree with each other. Which four you get depends on your
+   role: finance is managers only, and showing a non-manager a dash where the
+   money was tells them nothing except that there is something they cannot see.
+   They get their own work instead. Falls back to counting the loaded arrays
+   when the RPC has not answered yet, so the first paint is never empty. */
+const o=(window.workspaceStore&&workspaceStore.state.overview)||null;
+const fmt=window.workspaceData?workspaceData.money:(v=>'$'+v);
+const pad=n=>String(n??0).padStart(2,'0');
+const high=o?o.tickets_high:openTickets().filter(t=>t.priority==='High'||t.priority==='Urgent').length;
+const openCount=o?o.tickets_open:openTickets().length;
+const activeCount=o?o.projects_active:projects.length;
+let cards;
+if(o&&o.revenue_month!==null&&o.revenue_month!==undefined){
+  const now=Number(o.revenue_month),prev=Number(o.revenue_prev_month??0);
+  /* No previous month means no comparison to draw. Saying "up 100%" from
+     nothing, or "↗ 0%", both read as facts; silence is the honest option. */
+  const trend=prev>0?((now-prev)/prev)*100:null;
+  const foot=trend===null
+    ?'<span>vs. last month</span>'
+    :`<span class="trend" style="${trend<0?'color:#b94438':''}">${trend<0?'↘':'↗'} ${Math.abs(trend).toFixed(1)}%</span> vs. last month`;
+  const inv=o.invoices_outstanding||{count:0,amount:0,due_next:null};
+  const due=inv.due_next?new Date(inv.due_next+'T00:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric'}):null;
+  cards=[
+    ['Revenue this month',fmt(now)+' <span>USD</span>','finance',foot],
+    ['Open tickets',pad(openCount),'tickets',(high?pill(high+' high priority','red'):'<span class="trend">All calm</span>')+' <span>across all products</span>'],
+    ['Active projects',pad(activeCount),'projects','<span class="trend">On track</span> <span>across the studio</span>'],
+    ['Outstanding invoices',(Number(inv.amount)?fmt(inv.amount):'$0')+' <span>USD</span>','dollar',
+     `<span>${inv.count} invoice${inv.count===1?'':'s'}</span>${due?' <span>· Due '+due+'</span>':''}`]
+  ];
+}else{
+  cards=[
+    ['Open tickets',pad(openCount),'tickets',(high?pill(high+' high priority','red'):'<span class="trend">All calm</span>')+' <span>across all products</span>'],
+    ['Active projects',pad(activeCount),'projects','<span class="trend">On track</span> <span>across the studio</span>'],
+    ['Your open tasks',pad(o?o.tasks_mine:projects.reduce((n,p)=>n+(p.tasks.length-((p.checked||[]).length)),0)),'check','<span>assigned to you</span>'],  /* not checkedTasks(): that lives in workspace.js, which loads after this file,      so the first paint would throw before the store has ever answered. */
+    ['Today',pad(o?o.events_today:events.length),'agenda','<span>on the agenda</span>']
+  ];
+}
+return `<div class="metrics">${cards.map(([label,value,i,foot])=>`<section class="metric"><div class="metric-top">${label}<span class="metric-icon">${icon(i)}</span></div><div class="metric-value">${value}</div><div class="metric-foot">${foot}</div></section>`).join('')}</div>`}
+function revenueChart(){
+/* Drawn from revenue_series() — one row per month, zeros included, summed in
+   the database so this agrees with the Revenue tile rather than with whatever
+   window the browser happened to fetch. The sample curve it replaces was a
+   hand-drawn bezier with "$62,480 ↗ 21.4%" written beside it; next to real
+   figures that is not a placeholder, it is a wrong number in a trusted place.
+
+   Falls back to a quiet empty state rather than a fake line: a chart with no
+   data should say so. */
+const year=range==='12 months';
+const series=(window.workspaceStore&&workspaceStore.state.revenue)||null;
+const head=`<div class="panel-head"><div><h2>Revenue overview</h2><p>Income across your products and client work.</p></div><div class="chart-tabs"><button data-range="6 months" class="${!year?'selected':''}">6 months</button><button data-range="12 months" class="${year?'selected':''}">12 months</button></div></div>`;
+
+if(!series||!series.length){
+  return `<section class="panel revenue-panel">${head}<div class="workspace-empty" style="padding:44px 24px"><h3>No income recorded yet</h3><p>Revenue appears here once transactions are synced from Mercury or Stripe.</p></div></section>`;
+}
+
+const rows=series.slice(year?-12:-6);
+const values=rows.map(r=>Number(r.revenue)||0);
+const total=values.reduce((a,b)=>a+b,0);
+const last=values[values.length-1], prev=values[values.length-2];
+/* No previous month, or a previous month of nothing, means there is no
+   percentage to state. Silence beats inventing one. */
+const trend=(prev>0)?((last-prev)/prev)*100:null;
+const peak=Math.max(...values,1);
+/* Round the axis up to something a person would choose. */
+const step=Math.pow(10,Math.floor(Math.log10(peak)));
+const top=Math.max(Math.ceil(peak/step)*step,step);
+const W=600,H=140;
+const x=i=>rows.length===1?W/2:(i/(rows.length-1))*W;
+const y=v=>H-2-((v/top)*(H-12));
+const line=values.map((v,i)=>`${i?'L':'M'}${x(i).toFixed(1)} ${y(v).toFixed(1)}`).join('');
+const area=`${line}L${W} ${H}L0 ${H}Z`;
+const fmt=v=>v>=1000?'$'+Math.round(v/1000)+'k':'$'+Math.round(v);
+const MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const labelFor=r=>MON[new Date(r.month+'T00:00:00').getMonth()];
+const usdFull=v=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:0}).format(v);
+
+return `<section class="panel revenue-panel">${head}<div class="revenue-total"><strong>${usdFull(total)}</strong>${trend===null?'':`<span class="trend" style="${trend<0?'color:#b94438':''}">${trend<0?'↘':'↗'} ${Math.abs(trend).toFixed(1)}%</span>`}<span class="chart-legend"><i class="legend-line"></i> Revenue</span></div><div class="chart" role="img" aria-label="Revenue, ${labelFor(rows[0])} to ${labelFor(rows[rows.length-1])}, ${usdFull(last)} in the latest month"><div class="y-axis"><span>${fmt(top)}</span><span>${fmt(top*2/3)}</span><span>${fmt(top/3)}</span><span>$0</span></div><svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><defs><linearGradient id="chart-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#0071e3" stop-opacity=".15"/><stop offset="100%" stop-color="#0071e3" stop-opacity="0"/></linearGradient></defs><path d="M0 1H${W}M0 46H${W}M0 92H${W}M0 138H${W}" stroke="#edf1f3" stroke-width="1" stroke-dasharray="3 4" fill="none"/><path d="${area}" fill="url(#chart-fill)"/><path d="${line}" stroke="#0071e3" stroke-width="2.8" fill="none" vector-effect="non-scaling-stroke"/><circle cx="${x(values.length-1).toFixed(1)}" cy="${y(last).toFixed(1)}" r="4" fill="#0071e3"/></svg><div class="chart-labels">${rows.map(r=>`<span>${labelFor(r)}</span>`).join('')}</div></div><div class="chart-foot"><span>Income<b>${usdFull(total)}</b></span><span>Latest month<b>${usdFull(last)}</b></span><span>USD</span></div></section>`}
+function ticketTable(items,full=false){return `<div class="table-wrap"><table class="${full?'module-table':''}"><thead><tr><th>Ticket</th>${full?'<th>Product / client</th>':''}<th>Priority</th><th>Status</th><th>Owner</th></tr></thead><tbody>${items.map(t=>`<tr data-action="ticket" data-id="${t.id}" tabindex="0" role="button" aria-label="Open ticket ${esc(t.title)}"><td><div class="cell-main"><span class="ticket-symbol">${icon('tickets')}</span><div><strong>${esc(t.title)}</strong><small><span class="ticket-id">#VYG-${t.id}</span> &nbsp;·&nbsp; ${esc(t.client)}</small></div></div></td>${full?`<td class="muted">${esc(t.product)}</td>`:''}<td>${pill(t.priority)}</td><td>${pill(t.status)}</td><td><div class="avatar sm">${esc(t.owner)}</div></td></tr>`).join('')}</tbody></table>${!items.length?'<div class="empty-state">No tickets in this view.</div>':''}</div>`}
+function projectRows(){if(!projects.length)return '<p class="quiet-text" style="padding:4px 19px 20px">No projects yet. Create one and it will show here with its progress.</p>';
+return `<div class="project-list">${projects.slice(0,3).map(p=>`<div class="project-row" role="button" tabindex="0" data-action="project" data-id="${p.id}"><div class="project-logo ${p.style}">${p.initial}</div><div><div class="project-name">${esc(p.name)}</div><div class="project-meta">${esc(p.client)} &nbsp;·&nbsp; Due ${esc(p.due)}</div></div><div><div class="progress-caption">${p.progress}%</div><div class="progress"><i style="width:${p.progress}%"></i></div></div><div class="avatar sm">${esc((team.filter(m=>m.row&&m.row.id===(p.row&&p.row.owner_id))[0]||{}).initial||'')}</div></div>`).join('')}</div>`}
+function agendaPanel(){return `<section class="panel"><div class="panel-head"><h2>Today's agenda</h2><button class="text-btn" data-nav="agenda" aria-label="Open agenda">${icon('external')}</button></div><div class="agenda-date"><span class="dot"></span><strong>${CAL.nameFor(CAL.today)}</strong> ${CAL.label(CAL.today)}</div><div class="agenda-items">${!events.filter(e=>e.day===CAL.today).length?'<p class="quiet-text" style="padding:2px 0 12px">Nothing in the diary today.</p>':''}${events.filter(e=>e.day===CAL.today).map((e,i)=>`<div class="agenda-item"><div class="agenda-time">${e.time}<br><span>${e.end}</span></div><div class="agenda-description ${i===1?'purple-border':i===2?'blue-border':''}" role="button" tabindex="0" data-action="event" data-id="${events.indexOf(e)}"><strong>${esc(e.title)}</strong><small>${esc(e.detail)}</small>${pill(e.type,i===1?'purple':i===2?'blue':'green')}</div></div>`).join('')}</div><button class="agenda-bottom" data-nav="agenda">View full calendar &nbsp; →</button></section>`}
+function overview(){return `${heading('Your studio, at a glance.',"Welcome back, Cassian. Here’s your day at Veyago.")}${metrics()}<div class="dashboard-columns"><div class="left-column">${revenueChart()}<section class="panel"><div class="panel-head spaced"><h2>Tickets needing attention <span class="small-count">${openTickets().length}</span></h2><button class="text-btn" data-nav="tickets">View all ${icon('arrow')}</button></div>${ticketTable(openTickets().slice(0,3))}<div class="table-bottom"><span>Across your products and client projects</span><span>Updated just now</span></div></section><section class="panel"><div class="panel-head"><h2>Active projects</h2><button class="text-btn" data-nav="projects">All projects ${icon('arrow')}</button></div>${projectRows()}</section></div><div class="right-column">${agendaPanel()}<section class="panel"><div class="panel-head"><h2>Recent activity</h2><span class="muted">···</span></div><div class="activity-list">${workspaceActivity.length?workspaceActivity.slice(0,4).map(a=>`<div class="activity"><span class="avatar owner">${esc(a.initial||'V')}</span><div><p>${esc(a.message)}</p><small>${esc(a.time)}</small></div></div>`).join(''):`<p class="quiet-text" style="padding:6px 0 14px">Nothing yet. Activity appears here as tickets, projects and contacts change.</p>`}</div></section><section class="quick-note">${(()=>{
+/* Whatever is closest to its due date and still moving — the card used to be
+   one project written out by hand, stuck at 72% forever. */
+const live=projects.filter(p=>p.status!=='Completed'&&p.status!=='Cancelled');
+const next=live.slice().sort((a,b)=>{const A=a.row&&a.row.due_on?a.row.due_on:'9999',B=b.row&&b.row.due_on?b.row.due_on:'9999';return A.localeCompare(B);})[0];
+if(!next)return '<div class="eyebrow">UP NEXT</div><h3>Nothing scheduled</h3><p>New projects appear here with the date they are working toward.</p>';
+return `<div class="eyebrow">UP NEXT${next.client&&next.client!=='Internal product'?' · '+esc(next.client.toUpperCase()):''}</div><h3>${esc(next.name)}</h3><p>${esc(next.description||'No description yet.')}</p><div class="launch-meta"><span>${esc(next.due||'No date set')}</span><strong>${next.progress}%</strong></div><div class="progress"><i style="width:${next.progress}%"></i></div><button class="text-btn" data-action="project" data-id="${next.id}">Open project ${icon('arrow')}</button>`;})()}</section></div></div>`}
+function ticketsView(){let items=tickets.filter(t=>filter==='All tickets'||t.status===filter||filter==='High priority'&&t.priority==='High');return `${heading('Tickets','Customer conversations, with a clear next step.')}<div class="view-toolbar"><div class="tabs">${['All tickets','Open','In progress','Resolved','High priority'].map(t=>`<button class="${filter===t?'active':''}" data-filter="${t}">${t}</button>`).join('')}</div></div><section class="panel">${ticketTable(items,true)}</section>`}
+/* Render an email body: sanitised HTML when the message has any, plain text
+   otherwise. Remote images are blocked until the reader asks for them — a
+   remote image is how a sender learns you opened the message. */
+function mailBody(m){
+  /* Bodies are not in the list query — they are fetched per thread. Asking the
+     store both reads the cache and starts the fetch, which re-renders. */
+  if (m.bodyHtml === undefined && m.body === undefined) {
+    const loaded = window.workspaceStore && workspaceStore.threadBody(m.id);
+    if (!loaded) return '<p class="quiet-text">Loading the message…</p>';
+    const newest = loaded[loaded.length - 1];
+    m.thread = loaded;
+    m.body = newest ? newest.body : '';
+    m.bodyHtml = newest ? newest.bodyHtml : '';
+  }
+  const showing = window.__mailShowImages === m.id;
+  if (m.bodyHtml && window.mailHtml) {
+    const out = window.mailHtml.render(m.bodyHtml, { showImages: showing });
+    if (out.html) {
+      const banner = out.blockedImages
+        ? `<div class="mail-images-blocked"><span>${out.blockedImages} image${out.blockedImages===1?'':'s'} not shown</span><button class="text-btn" data-show-images="${esc(String(m.id))}">Show images</button></div>`
+        : '';
+      return banner + `<div class="mail-html">${out.html}</div>`;
+    }
+  }
+  return `<div class="mail-plain">${esc(m.body||'')}</div>`;
+}
+function mailView(){let data=mailFolder==='Inbox'?mails:sent;let m=data[selectedMail]||data[0];return `${heading('Mail','Your conversations, connected to the rest of your work.','compose')}<div class="view-toolbar"><div class="tabs"><button class="${mailFolder==='Inbox'?'active':''}" data-folder="Inbox">Inbox <span class="small-count">${mails.length}</span></button><button class="${mailFolder==='Sent'?'active':''}" data-folder="Sent">Sent <span class="small-count">${sent.length}</span></button></div><span class="muted" style="font-size:12px">hello@veyago.cloud · Demo inbox</span></div><section class="panel mail-layout"><div class="mail-list">${data.map((m,i)=>`<button class="mail-item ${i===selectedMail?'selected':''}" data-mail="${i}"><div class="mail-item-header"><strong>${esc(m.sender)}</strong><small>${esc(m.time)}</small></div><h3>${esc(m.subject)}</h3><p>${esc(m.preview)}</p></button>`).join('')||'<div class="empty-state">No demo messages sent yet.</div>'}</div><div class="mail-content">${m?`<h2>${esc(m.subject)}</h2><div class="mail-person"><div class="avatar">${esc(m.initial)}</div><div><strong>${esc(m.sender)}</strong><small>${esc(m.email)} · ${esc(m.time)}</small></div></div>${pill(m.client||'Demo message','green')}<div class="mail-body" style="margin-top:23px">${mailBody(m)}</div><div class="mail-actions">${mailFolder==='Inbox'?`<button class="btn btn-primary" data-action="reply">${icon('reply')} Reply</button><button class="btn" data-action="email-ticket">${icon('tickets')} Create ticket</button><button class="btn" data-action="email-contact">${icon('crm')} View relationship</button>`:'<span class="muted">Demo message saved in this session. No email was sent externally.</span>'}</div>`:'<div class="empty-state">Compose a demo message to try the mail workflow.</div>'}</div></section>`}
+function projectsView(){return `${heading('Projects','The work behind your products and your clients.')}<div class="project-grid">${projects.map(p=>`<button class="project-card" data-action="project" data-id="${p.id}"><div class="project-logo ${p.style}">${esc(p.initial)}</div><h2>${esc(p.name)}</h2><p>${esc(p.description)}</p>${pill(p.status)}<div class="progress-caption">${p.progress}% complete</div><div class="progress"><i style="width:${p.progress}%"></i></div><div class="project-card-bottom"><span>${esc(p.client)}</span><span>Due ${esc(p.due)}</span></div></button>`).join('')}</div>`}
+function crmView(){return `${heading('CRM','A shared history for every relationship.')}<section class="panel"><div class="table-wrap"><table class="module-table"><thead><tr><th>Contact</th><th>Company</th><th>Relationship</th><th>Opportunity value</th><th></th></tr></thead><tbody>${contacts.map((c,i)=>`<tr data-action="contact" data-id="${i}" tabindex="0" role="button" aria-label="Open ${esc(c.name)}"><td><div class="cell-main"><div class="avatar">${esc(c.initial)}</div><div><strong>${esc(c.name)}</strong><small>${esc(c.email)}</small></div></div></td><td>${esc(c.company)}</td><td>${pill(c.stage)}</td><td>${esc(c.value)}</td><td>${icon('chevron')}</td></tr>`).join('')}</tbody></table></div></section>`}
+function agendaView(){return `${heading('Agenda','Space for meetings, milestones, and focused work.')}<div class="view-toolbar"><h2>${CAL.range()}</h2></div><section class="panel calendar">${CAL.names.map((d,i)=>`<div class="calendar-day ${CAL.dates[i]===CAL.today?'today':''}"><div class="day-head">${d}<strong>${CAL.dates[i]}</strong></div>${events.filter(e=>e.day===CAL.dates[i]).map(e=>`<button class="calendar-event" data-action="event" data-id="${events.indexOf(e)}"><small>${esc(e.time)} – ${esc(e.end)}</small><strong>${esc(e.title)}</strong><small>${esc(e.type)}</small></button>`).join('')||'<div class="empty-calendar">Room to focus</div>'}</div>`).join('')}</section>`}
+function financeView(){return `${heading('Finance','A clear picture of the business behind the work.',null)}${metrics()}<div class="financial-grid">${revenueChart()}<section class="panel breakdown"><h2>Revenue this month</h2>${[['Client services','$8,960',70],['Kept','$2,640',21],['Other product income','$1,240',9]].map(([l,v,p])=>`<div class="breakdown-row"><div class="breakdown-label"><span>${l}</span><strong>${v}</strong></div><div class="progress"><i style="width:${p}%"></i></div></div>`).join('')}<p class="muted" style="font-size:12px;margin-top:25px">September 2026 · USD · From transactions</p></section></div><section class="panel"><div class="panel-head spaced"><h2>Recent invoices</h2><span class="muted" style="font-size:12px">3 invoices</span></div><div class="table-wrap"><table class="module-table"><thead><tr><th>Invoice</th><th>Client</th><th>Amount</th><th>Status</th><th>Date</th></tr></thead><tbody>${invoices.map((n,i)=>`<tr data-action="invoice" data-id="${i}" tabindex="0" role="button" aria-label="Open invoice ${n.id}"><td>${n.id}</td><td>${n.client}</td><td>${n.amount}</td><td>${pill(n.status)}</td><td class="muted">${n.date}</td></tr>`).join('')}</tbody></table></div></section>`}
+function companyView(){
+/* The two people cards were written out by hand — one of them labelled
+   "Team". The team comes from the employees table now, so this
+   shows whoever is actually on it. */
+return `${heading('Company','The people and details behind Veyago.',null)}<div class="team-grid"><section class="panel company-card"><div class="project-logo travel">V</div><h2 style="margin-top:20px">Veyago Inc.</h2><p>Independent software studio.<br>New York, United States<br>hello@veyago.cloud</p><a class="btn" style="margin-top:20px" href="https://www.veyago.cloud" target="_blank" rel="noopener">Company website ${icon('external')}</a></section>${team.map(m=>`<section class="panel company-card"><div class="avatar${m.tag==='Owner'?' owner':''}">${esc(m.initial)}</div><h2>${esc(m.name)}</h2><p>${esc(m.role)}</p>${pill(m.tag,m.tag==='Owner'?'green':'purple')}</section>`).join('')}</div>`}
+function render(){nav();document.querySelector('#breadcrumb').textContent=navs.find(n=>n[0]===page)[1];document.querySelector('#main').innerHTML=({overview,tickets:ticketsView,mail:mailView,projects:projectsView,crm:crmView,agenda:agendaView,finance:financeView,company:companyView}[page])()}
+function navigate(target){if(!navs.some(n=>n[0]===target))return;page=target;history.replaceState(null,'','#'+page);document.querySelector('#sidebar').classList.remove('open');document.querySelector('#menu-toggle').setAttribute('aria-expanded','false');render();window.scrollTo(0,0)}
+function toast(message){clearTimeout(toastTimer);const el=document.querySelector('#toast');el.textContent=message;el.classList.add('show');toastTimer=setTimeout(()=>el.classList.remove('show'),4000)}
+const modal=document.querySelector('#modal');function showModal(eyebrow,body){document.querySelector('#modal-eyebrow').textContent=eyebrow;document.querySelector('#modal-body').innerHTML=body;if(!modal.open)modal.showModal()}
+function showTicket(id){let t=tickets.find(t=>t.id===Number(id));if(!t)return;showModal('TICKET · VYG-'+t.id,`<h2>${esc(t.title)}</h2><div class="detail-meta">${pill(t.status)}${pill(t.priority)}${pill(t.product,'green')}</div><p>${esc(t.body)}</p><div class="detail-section"><div class="compact-kpi"><span>From</span><strong>${esc(t.client)}</strong></div><div class="compact-kpi"><span>Assigned to</span><strong>${esc((team.find(m=>m.initial===t.owner)||{}).name||'Unassigned')}</strong></div></div><div class="dialog-actions"><button class="btn" data-action="ticket-reply" data-id="${t.id}">${icon('reply')} Reply</button><button class="btn btn-primary" data-action="resolve" data-id="${t.id}">${icon('check')} ${t.status==='Resolved'?'Reopen ticket':'Resolve ticket'}</button></div>`)}
+function showProject(id){let p=projects.find(p=>p.id===Number(id));if(!p)return;showModal('PROJECT · '+p.client,`<h2>${esc(p.name)}</h2><div class="detail-meta">${pill(p.status)}${pill('Due '+p.due,'blue')}</div><p>${esc(p.description)}</p><div class="detail-section"><h3>Next steps</h3>${p.tasks.map((t,i)=>`<label class="check-task"><input type="checkbox" data-project-task="${p.id}" data-task="${i}" ${p.checked?.includes(i)?'checked':''}>${esc(t)}</label>`).join('')}</div>${(()=>{const ci=contacts.findIndex(c=>c.company===p.client);return ci<0?'':`<div class="dialog-actions"><button class="btn" data-action="contact" data-id="${ci}">View client relationship →</button></div>`;})()}`)}
+function showContact(id){let c=contacts[Number(id)];if(!c)return;let ps=projects.filter(p=>p.client===c.company),ts=tickets.filter(t=>t.client===c.name||t.product===c.company);showModal('CRM · '+c.company,`<h2>${esc(c.name)}</h2><div class="detail-meta">${pill(c.stage)}${pill(c.value+' opportunity','blue')}</div><p>${esc(c.email)}<br>${esc(c.notes)}</p><div class="detail-section"><h3>Connected work</h3>${ps.map(p=>`<button class="btn" style="margin:0 6px 8px 0" data-action="project" data-id="${p.id}">${icon('projects')}${esc(p.name)}</button>`).join('')}${ts.map(t=>`<div class="detail-row"><span>${esc(t.title)}</span><button class="text-btn" data-action="ticket" data-id="${t.id}">Open →</button></div>`).join('')}${!ps.length&&!ts.length?'<p>No linked projects or tickets yet.</p>':''}</div><div class="dialog-actions"><button class="btn btn-primary" data-action="contact-email" data-id="${id}">${icon('mail')} Write email</button></div>`)}
+function showEvent(id){let e=events[Number(id)];if(!e)return;showModal('AGENDA · SEPTEMBER '+e.day,`<h2>${esc(e.title)}</h2><div class="detail-meta">${pill(e.type,'green')}</div><p>${esc(e.time)} – ${esc(e.end)}<br>${esc(e.detail)}</p><div class="detail-section"><p>This is a sample calendar event. Calendar and video meeting services are not connected.</p></div>`)}
+function compose(to='',subject='',body=''){showModal('MAIL · NEW MESSAGE',`<h2>Compose a message</h2><p class="form-note">Demo mode: your message stays in this session. No email is sent externally.</p><form id="compose-form"><label class="form-field">To<input name="to" type="email" required value="${esc(to)}" placeholder="name@company.com"></label><label class="form-field">Subject<input name="subject" required value="${esc(subject)}" placeholder="A clear subject line"></label><label class="form-field">Message<textarea name="body" required placeholder="Write your message…">${esc(body)}</textarea></label><div class="dialog-actions"><button type="button" class="btn" data-action="close">Cancel</button><button class="btn btn-primary" type="submit">Send demo message ${icon('arrow')}</button></div></form>`)}
+function createForm(kind){const dayOptions=CAL.names.map((n,i)=>`<option ${CAL.dates[i]===CAL.today?'selected':''} value="${CAL.dates[i]}">${n}, ${CAL.label(CAL.dates[i])}</option>`).join('');let cfg={tickets:['Create a ticket','Subject','Customer / requester'],projects:['Create a project','Project name','Client or internal product'],crm:['Add a contact','Full name','Company'],agenda:['Create an event','Event title','Attendees / location']}[kind];if(!cfg){showModal('QUICK CREATE','<h2>What would you like to create?</h2><div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">'+[['tickets','Ticket'],['projects','Project'],['crm','Contact'],['agenda','Event']].map(([k,n])=>`<button class="btn" style="padding:20px" data-create="${k}">${icon(k)}${n}</button>`).join('')+'<button class="btn" style="padding:20px" data-action="compose">'+icon('mail')+'Email</button></div>');return}showModal('WORKSPACE · '+kind.toUpperCase(),`<h2>${cfg[0]}</h2><p class="form-note">Changes are saved to the studio workspace.</p><form id="create-form" data-kind="${kind}"><label class="form-field">${cfg[1]}<input name="name" required placeholder="${cfg[1]}"></label><label class="form-field">${cfg[2]}<input name="context" required placeholder="${cfg[2]}"></label>${kind==='crm'?'<label class="form-field">Email<input type="email" name="email" required placeholder="name@company.com"></label>':''}${kind==='tickets'?'<label class="form-field">Priority<select name="priority"><option>Low</option><option selected>Medium</option><option>High</option></select></label>':''}${kind==='agenda'?`<label class="form-field">Day<select name="day">${dayOptions}</select></label><label class="form-field">Start time<input type="time" name="time" value="10:00" required></label><label class="form-field">End time<input type="time" name="end" value="10:30" required></label>`:''}<label class="form-field">${kind==='agenda'?'Notes':'Description'}<textarea name="description" placeholder="A little more context…"></textarea></label><div class="dialog-actions"><button class="btn" type="button" data-action="close">Cancel</button><button class="btn btn-primary">${cfg[0]}</button></div></form>`)}
+function action(name,id){switch(name){case'new':createForm(page);break;case'compose':compose();break;case'close':modal.close();break;case'ticket':showTicket(id);break;case'project':showProject(id);break;case'contact':showContact(id);break;case'event':showEvent(id);break;case'resolve':{let t=tickets.find(t=>t.id===Number(id));t.status=t.status==='Resolved'?'Open':'Resolved';render();showTicket(id);toast(t.status==='Resolved'?'Ticket resolved':'Ticket reopened');break}case'reply':{let m=mails[selectedMail];compose(m.email,'Re: '+m.subject);break}case'ticket-reply':{let t=tickets.find(t=>t.id===Number(id));let m=mails.find(m=>m.sender===t.client),c=contacts.find(c=>c.name===t.client);compose(m?.email||c?.email||'','Re: '+t.title);break}case'email-ticket':{let m=mails[selectedMail];let existing=tickets.find(t=>t.client===m.sender&&t.product===m.client);if(existing){showTicket(existing.id);toast('This conversation already has a linked ticket')}else{let t={id:Math.max(...tickets.map(t=>t.id))+1,title:m.subject,client:m.sender,product:m.client,priority:'Medium',status:'Open',owner:'C',date:'Today',body:m.body};tickets.unshift(t);render();showTicket(t.id);toast('Ticket created from this conversation')}break}case'email-contact':{let i=contacts.findIndex(c=>c.name===mails[selectedMail].sender);if(i>=0)showContact(i);else showModal('RELATIONSHIP',`<h2>${esc(mails[selectedMail].sender)}</h2><p>${esc(mails[selectedMail].email)}<br>Product customer · ${esc(mails[selectedMail].client)}</p><div class="dialog-actions"><button class="btn" data-action="email-ticket">View linked support ticket →</button></div>`);break}case'contact-email':compose(contacts[Number(id)].email);break;case'invoice':{let i=invoices[Number(id)];showModal('FINANCE · '+i.id,`<h2>${i.client}</h2><div class="detail-meta">${pill(i.status)}</div><p>${i.description}</p><div class="detail-section"><div class="compact-kpi"><span>Amount</span><strong>${i.amount} USD</strong></div><div class="compact-kpi"><span>${i.status==='Paid'?'Paid on':'Due date'}</span><strong>${i.date}</strong></div></div><p class="form-note" style="margin-top:20px">Invoice. Accounting and payment services are not connected.</p>`);break}}}
+document.addEventListener('click',e=>{let n=e.target.closest('[data-nav]');if(n){navigate(n.dataset.nav);return}let a=e.target.closest('[data-action]');if(a){action(a.dataset.action,a.dataset.id);return}let c=e.target.closest('[data-create]');if(c){createForm(c.dataset.create);return}let f=e.target.closest('[data-filter]');if(f){filter=f.dataset.filter;render();return}let m=e.target.closest('[data-mail]');if(m){selectedMail=Number(m.dataset.mail);render();return}let folder=e.target.closest('[data-folder]');if(folder){mailFolder=folder.dataset.folder;selectedMail=0;render();return}let r=e.target.closest('[data-range]');if(r){range=r.dataset.range;render()}});
+document.addEventListener('change',e=>{if(e.target.matches('[data-project-task]')){let p=projects.find(p=>p.id===Number(e.target.dataset.projectTask));p.checked??=[];let t=Number(e.target.dataset.task);p.checked=e.target.checked?[...new Set([...p.checked,t])]:p.checked.filter(x=>x!==t);toast(e.target.checked?'Task completed':'Task reopened')}});
+document.addEventListener('submit',e=>{if(e.target.id==='compose-form'){e.preventDefault();let d=new FormData(e.target);sent.unshift({sender:'To: '+d.get('to'),email:d.get('to'),initial:'C',subject:d.get('subject'),time:'Just now',preview:String(d.get('body')).slice(0,80),body:d.get('body'),client:'Demo message'});modal.close();mailFolder='Sent';selectedMail=0;navigate('mail');toast('Demo message saved to Sent. No external email sent.')}if(e.target.id==='create-form'){e.preventDefault();let d=new FormData(e.target),k=e.target.dataset.kind,n=String(d.get('name')).trim(),c=String(d.get('context')).trim(),desc=String(d.get('description'));if(!n||!c)return;let id=Math.max(...tickets.map(t=>t.id))+1;if(k==='tickets')tickets.unshift({id,title:n,client:c,product:'General',priority:d.get('priority'),status:'Open',owner:'C',date:'Today',body:desc});if(k==='projects')projects.push({id:projects.length,name:n,client:c,initial:n[0].toUpperCase(),style:'client',progress:0,due:'To be planned',status:'In progress',description:desc,tasks:['Define project scope','Set the first milestone']});if(k==='crm')contacts.push({name:n,initial:n.split(' ').map(s=>s[0]).slice(0,2).join(''),company:c,email:d.get('email'),stage:'Lead',value:'$0',notes:desc});if(k==='agenda'){if(d.get('end')<=d.get('time')){e.target.querySelector('[name="end"]').setCustomValidity('End time must be after start time.');e.target.querySelector('[name="end"]').reportValidity();e.target.querySelector('[name="end"]').oninput=function(){this.setCustomValidity('')};return}events.push({title:n,detail:c,time:d.get('time'),end:d.get('end'),type:'Team',day:Number(d.get('day')),notes:desc})}modal.close();filter='All tickets';navigate(k);toast('Created in your demo workspace')}});
+document.addEventListener('keydown',e=>{if(e.key==='/'&&!['INPUT','TEXTAREA'].includes(document.activeElement.tagName)&&!modal.open){e.preventDefault();document.querySelector('#search').focus()}if((e.key==='Enter'||e.key===' ')&&e.target.matches('[role="button"][data-action]')){e.preventDefault();action(e.target.dataset.action,e.target.dataset.id)}if(e.key==='Escape')document.querySelector('#search-results').hidden=true});
+document.querySelector('#close-modal').onclick=()=>modal.close();modal.addEventListener('click',e=>{if(e.target===modal){let r=modal.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)modal.close()}});
+document.querySelector('#menu-toggle').innerHTML=icon('menu');document.querySelector('#menu-toggle').onclick=()=>{const open=document.querySelector('#sidebar').classList.toggle('open');document.querySelector('#menu-toggle').setAttribute('aria-expanded',String(open))};document.querySelector('#search-icon').innerHTML=icon('search');document.querySelector('#notifications').innerHTML=icon('bell');document.querySelector('#notifications').onclick=()=>{
+/* Derived from what is actually loaded rather than written out: three fixed
+   lines that never changed were worse than no bell at all, because a
+   notification that is always there stops being read. */
+const items=[];
+const urgent=tickets.filter(t=>(t.priority==='High'||t.priority==='Urgent')&&t.status!=='Resolved'&&t.status!=='Closed');
+urgent.slice(0,3).forEach(t=>items.push([`#VYG-${t.id} needs attention`,`${esc(t.priority)} priority · ${esc(t.client)}`]));
+const owed=invoices.filter(i=>i.status==='Overdue'||i.status==='Sent'||i.status==='Due');
+owed.slice(0,3).forEach(i=>items.push([`${esc(i.id)} is outstanding`,`${esc(i.amount||'')} · ${esc(i.client)}`]));
+const unread=mails.filter(m=>m.unread);
+if(unread.length)items.push([`${unread.length} unread conversation${unread.length===1?'':'s'}`,'In the studio inbox.']);
+const today=events.filter(e=>e.day===CAL.today);
+if(today.length)items.push([`${today.length} event${today.length===1?'':'s'} today`,esc(today.map(e=>e.title).join(' · ')).slice(0,90)]);
+showModal('WORKSPACE · NOTIFICATIONS',
+  items.length
+    ?`<h2>${items.length} thing${items.length===1?'':'s'} to look at.</h2><div class="notification-list">${items.map(([h,b])=>`<p><strong>${h}</strong><br>${b}</p>`).join('')}</div>`
+    :'<h2>You\u2019re up to date.</h2><p class="quiet-text">Nothing needs attention right now.</p>');};
+window.addEventListener('hashchange',()=>navigate(location.hash.slice(1)));
+const search=document.querySelector('#search'),results=document.querySelector('#search-results');search.addEventListener('input',()=>{let q=search.value.toLowerCase().trim();results.hidden=!q;if(!q)return;let items=[...navs.map(([id,label])=>({type:'App',label,hay:label,nav:id})),
+  ...tickets.map(t=>({type:'Ticket',label:t.title,hay:`${t.title} ${t.client} ${t.product} VYG-${t.id} ${t.id}`,action:'ticket',id:t.id})),
+  ...projects.map(p=>({type:'Project',label:p.name,hay:`${p.name} ${p.client} ${p.description||''}`,action:'project',id:p.id})),
+  ...contacts.map((c,i)=>({type:'Contact',label:c.name+' · '+c.company,hay:`${c.name} ${c.company} ${c.email||''}`,action:'contact',id:i})),
+  ...events.map((e,i)=>({type:'Event',label:e.title,hay:`${e.title} ${e.detail||''}`,action:'event',id:i})),
+  ...invoices.map(v=>({type:'Invoice',label:`${v.id} · ${v.client}`,hay:`${v.id} ${v.client} ${v.amount||''}`,action:'invoice',id:v.id})),
+  ...mails.map((m,i)=>({type:'Mail',label:m.subject,hay:`${m.subject} ${m.sender} ${m.preview||''}`,action:'mail',id:i}))
+].filter(x=>String(x.hay).toLowerCase().includes(q)).slice(0,8);results.innerHTML=items.map(x=>`<button ${x.nav?`data-nav="${x.nav}"`:`data-action="${x.action}" data-id="${x.id}"`}>${esc(x.label)}<small>${x.type}</small></button>`).join('')||'<div class="empty-state">No matching records.</div>'});results.addEventListener('click',()=>{results.hidden=true;search.value=''});document.addEventListener('click',e=>{if(!e.target.closest('.global-search'))results.hidden=true});
+if(!location.hash.includes('/'))navigate(navs.some(n=>n[0]===location.hash.slice(1))?location.hash.slice(1):'overview');
+if(document.modelContext?.registerTool){const lifecycle=new AbortController();window.addEventListener('pagehide',()=>lifecycle.abort(),{once:true});for(const tool of [{name:'navigate_workspace',title:'Open workspace app',description:'Navigate to one of the Veyago demo workspace apps.',inputSchema:{type:'object',properties:{app:{type:'string',enum:navs.map(n=>n[0])}},required:['app'],additionalProperties:false},execute:({app})=>{if(!navs.some(n=>n[0]===app))throw Error('Unknown workspace app');navigate(app);return{app:page}}},{name:'set_demo_ticket_status',title:'Update a demo ticket',description:'Change a sample ticket status in this session. No external systems are updated.',inputSchema:{type:'object',properties:{ticketId:{type:'number'},status:{type:'string',enum:['Open','In progress','Resolved']}},required:['ticketId','status'],additionalProperties:false},execute:({ticketId,status})=>{const t=tickets.find(t=>t.id===ticketId);if(!t||!['Open','In progress','Resolved'].includes(status))throw Error('Invalid ticket or status');t.status=status;render();return{id:t.id,status:t.status}}}]){try{Promise.resolve(document.modelContext.registerTool({...tool,annotations:{readOnlyHint:false,untrustedContentHint:false}},{signal:lifecycle.signal})).catch(()=>{})}catch{}}}

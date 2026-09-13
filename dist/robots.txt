@@ -1,0 +1,5 @@
+# The workspace is a private tool. Nothing here should be indexed, and the
+# X-Robots-Tag header in vercel.json says the same thing for crawlers that
+# ignore this file.
+User-agent: *
+Disallow: /
