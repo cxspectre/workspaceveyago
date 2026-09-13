@@ -296,26 +296,47 @@
     },
 
     /* ── Mail ────────────────────────────────────────────────────────── */
-    /* folders: one name or a list ('inbox', 'sent'). Every thread carries its
-       folder and its mailbox (connection_id), so one load serves each folder
-       and each mailbox the switcher offers — RLS already limits the rows to
-       the studio mailboxes and the reader's own. */
-    async mailThreads(folders) {
-      var THREAD_LIMIT = 500;   // a working inbox, not an archive
+    /* Threads for the mail view, each mailbox's folders loaded on their own.
+       One shared limit let a busy hello@ push a personal mailbox out of the
+       load altogether, and its folders then read as empty. With no mailbox
+       ids (the mailbox list failed) it falls back to one query per folder
+       across whatever RLS lets this person see.
+       Returns { threads, truncated } — truncated names the "mailbox|folder"
+       lists that hit the limit, so the view can say it is not everything. */
+    async mailThreads(folders, mailboxIds) {
+      var PER_FOLDER = 200;   // a working inbox, not an archive
       var wanted = [].concat(folders || 'inbox').map(function (f) { return String(f).toLowerCase(); });
-      var rows = unwrap(await sb()
-        .from('mail_threads')
-        .select('id, connection_id, subject, snippet, folder, is_read, is_starred, message_count, ' +
-                'last_message_at, last_from_name, last_from_email, ticket_id, contact_id, ' +
-                'contact:crm_contacts (full_name, email)')
-        /* Deliberately NO message bodies. Embedding them made this query 16MB
-           for 189 threads — every HTML email in the mailbox, fetched on every
-           reload, to render a list that shows a sender, a subject and a
-           snippet. Bodies load per thread when one is opened. */
-        .in('folder', wanted)
-        .order('last_message_at', { ascending: false, nullsFirst: false })
-        .limit(THREAD_LIMIT), 'mail');
-      return rows.map(function (r) {
+      var boxes = mailboxIds && mailboxIds.length ? mailboxIds : [null];
+
+      function threadQuery(box, folder) {
+        var q = sb()
+          .from('mail_threads')
+          .select('id, connection_id, subject, snippet, folder, is_read, is_starred, message_count, ' +
+                  'last_message_at, last_from_name, last_from_email, ticket_id, contact_id, ' +
+                  'contact:crm_contacts (full_name, email)')
+          /* Deliberately NO message bodies. Embedding them made this query 16MB
+             for 189 threads — every HTML email in the mailbox, fetched on every
+             reload, to render a list that shows a sender, a subject and a
+             snippet. Bodies load per thread when one is opened. */
+          .eq('folder', folder);
+        if (box) q = q.eq('connection_id', box);
+        return q
+          .order('last_message_at', { ascending: false, nullsFirst: false })
+          .limit(PER_FOLDER)
+          .then(function (res) { return { key: (box || 'all') + '|' + folder, rows: unwrap(res, 'mail') }; });
+      }
+
+      var loaded = await Promise.all(boxes.reduce(function (all, box) {
+        return all.concat(wanted.map(function (folder) { return threadQuery(box, folder); }));
+      }, []));
+      var truncated = loaded
+        .filter(function (l) { return l.rows.length >= PER_FOLDER; })
+        .map(function (l) { return l.key; });
+      var rows = loaded
+        .reduce(function (all, l) { return all.concat(l.rows); }, [])
+        .sort(function (a, b) { return String(b.last_message_at || '').localeCompare(String(a.last_message_at || '')); });
+
+      var threads = rows.map(function (r) {
         /* Who wrote, in decreasing order of how much we know about them. The
            subject is NOT a fallback here — it was, and the list showed a
            column of subject lines under a heading meant for names. */
@@ -341,6 +362,7 @@
           row: r
         };
       });
+      return { threads: threads, truncated: truncated };
     },
 
     async mailMessages(threadId) {
@@ -365,15 +387,22 @@
       });
     },
 
-    /* What the mail switcher offers. Every connected mailbox is listed here —
-       mailModel.mailboxesFor() narrows it to the ones this person can read. */
+    /* What the mail switcher offers: the studio's mailboxes and this person's
+       own. RLS lets any member of staff list every connection — colleagues'
+       addresses and last errors included — so the filter is here, in the
+       query, rather than only in the view that would have hidden them again.
+       mailModel.mailboxesFor() applies the same rule a second time. */
     async mailboxes() {
-      return unwrap(await sb()
+      var me = window.workspaceSession.employee;
+      var query = sb()
         .from('integration_status')
         .select('id, provider, account_label, employee_id, employee_name, status, ' +
                 'is_live, last_synced_at, last_error')
-        .eq('provider', 'microsoft_mail')
-        .order('account_label'), 'mailboxes');
+        .eq('provider', 'microsoft_mail');
+      query = me && me.id
+        ? query.or('employee_id.is.null,employee_id.eq.' + me.id)
+        : query.is('employee_id', null);
+      return unwrap(await query.order('account_label'), 'mailboxes');
     },
 
     /* Monthly income for the Overview chart. Summed in the database so it

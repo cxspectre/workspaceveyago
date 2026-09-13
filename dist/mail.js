@@ -26,15 +26,21 @@
   const SNIPPET_LENGTH = 140;
   const MINUTE = 60 * 1000;
 
-  /* Message ids opened beyond the newest, and threads with a read-write in
-     flight. Replaced, never edited, like everything else the view keeps. */
+  /* Message ids opened beyond the newest; threads with a read-write in flight,
+     or one that failed since the last load; email bodies already sanitised.
+     Replaced, never edited, like everything else the view keeps. */
   let expanded = Object.freeze({});
   let markingRead = Object.freeze({});
+  let readFailed = Object.freeze({});
+  let renderedBodies = Object.freeze({});
 
   const live = () => Boolean(window.workspaceStore && workspaceStore.state.loaded);
   const employeeId = () => (window.workspaceSession && workspaceSession.employee && workspaceSession.employee.id) || null;
   const mailboxes = () => M.mailboxesFor(live() ? workspaceStore.state.mailboxes : [], employeeId());
   const threadById = id => mails.find(t => t.id === id) || null;
+  /* "Show images" is decided per message, and showing them in one message no
+     longer hides them again in another. workspace.js's handler adds to this. */
+  const imagesShown = id => (window.__mailShowImages || []).includes(id);
 
   /* The store's arrays are shared with every view, so a changed thread goes
      back in as a new object at the same position. */
@@ -104,6 +110,18 @@
 
   /* ── The conversation list ─────────────────────────────────────────── */
 
+  /* Each mailbox's folders load up to a limit (queries.js). When the one on
+     screen hit it, say so, rather than let the list pass for everything. */
+  function truncatedNote(route) {
+    const keys = (live() && workspaceStore.state.mailTruncated) || [];
+    const folders = route.folder === 'starred' ? ['inbox', 'sent'] : [route.folder];
+    const cut = keys.some(key => {
+      const [box, folder] = key.split('|');
+      return folders.includes(folder) && (route.mailbox === M.ALL || box === 'all' || box === route.mailbox);
+    });
+    return cut ? '<div class="mail-list-truncated">Showing the most recent conversations only.</div>' : '';
+  }
+
   function threadList(route, list, boxes, shownId) {
     const addressOf = id => (boxes.find(b => b.id === id) || {}).address || '';
     const tagMailbox = route.mailbox === M.ALL && boxes.length > 1;
@@ -118,12 +136,21 @@
     return `<div class="conversation-list"><div class="mail-list-heading"><h2>${FOLDER_LABELS[route.folder]}</h2>`
       + `<small class="mail-list-where">${esc(where)}</small>${queryInput('mail', 'Search mail')}</div>`
       + (items || empty('No conversations', queries.mail.trim() ? 'Nothing matches that search.' : 'This folder is empty.'))
-      + `<div class="mail-list-count">${list.length} conversation${list.length === 1 ? '' : 's'}</div></div>`;
+      + `<div class="mail-list-count">${list.length} conversation${list.length === 1 ? '' : 's'}</div>${truncatedNote(route)}</div>`;
   }
 
   /* ── The reading pane ──────────────────────────────────────────────── */
 
   const snippet = message => String(message.body || '').replace(/\s+/g, ' ').trim().slice(0, SNIPPET_LENGTH) || 'Open to read';
+
+  /* DOMPurify on every render of every open message made each keystroke in
+     the search box re-sanitise a whole conversation. A message's body never
+     changes, so its rendering is kept per image choice. */
+  function bodyHtml(message) {
+    const key = message.id + (imagesShown(message.id) ? '|images' : '|blocked');
+    if (!(key in renderedBodies)) renderedBodies = Object.freeze({ ...renderedBodies, [key]: mailBody(message) });
+    return renderedBodies[key];
+  }
 
   function messageCard(message, open, newest) {
     const when = (message.date === 'Today' ? '' : esc(message.date) + ' · ') + esc(message.time);
@@ -141,11 +168,18 @@
     const header = newest
       ? `<div class="mail-message-head">${head}</div>`
       : `<button type="button" class="mail-message-head" data-mail-expand="${esc(message.id)}" aria-expanded="true">${head}</button>`;
-    return `<article class="mail-message">${header}<div class="mail-body">${mailBody(message)}</div></article>`;
+    return `<article class="mail-message">${header}<div class="mail-body">${bodyHtml(message)}</div></article>`;
   }
 
   function conversation(thread) {
-    const messages = live() ? workspaceStore.threadBody(thread.id) : null;
+    if (!live()) return '';
+    /* A failed load used to be cached as an empty conversation: "Loading…"
+       for a while, then "no messages yet", which was not true. */
+    if (workspaceStore.threadFailed(thread.id)) {
+      return `<div class="mail-load-failed"><p>This conversation did not load.</p>`
+        + `<button class="btn" data-mail-retry="${esc(thread.id)}">Try again</button></div>`;
+    }
+    const messages = workspaceStore.threadBody(thread.id);
     if (!messages) return '<p class="quiet-text mail-loading">Loading the conversation…</p>';
     if (!messages.length) return '<p class="quiet-text">This conversation has no messages yet.</p>';
     const newest = messages.length - 1;
@@ -196,8 +230,7 @@
     /* Open even when a search hides it: the link is what was asked for. */
     const shown = route.threadId ? threadById(route.threadId) : null;
 
-    mailFolder = FOLDER_LABELS[route.folder];              // the breadcrumb reads it
-    selectedMail = shown ? mails.indexOf(shown) : 0;       // app.js's contact action still does
+    selectedMail = shown ? mails.indexOf(shown) : 0;       // app.js's contact action still reads it
     if (shown && shown.unread) markRead(shown);
 
     return titlebar('Your conversations.', 'Every mailbox you use, in one place.',
@@ -209,10 +242,13 @@
   /* render() rebuilds #main with innerHTML, which throws away where the list
      and the reader were scrolled. Clicking a thread two hundred rows down
      used to jump the list back to the top. Keep both: the list always, the
-     reader while it still shows the same conversation. */
+     reader while it still shows the same conversation.
+     The breadcrumb is written BEFORE the view runs, so the folder it names is
+     set here rather than inside mailView, where it arrived one render late. */
   const baseRender = render;
   render = function () {
     if (page !== 'mail') return baseRender();
+    mailFolder = FOLDER_LABELS[M.parseMailRoute(routeParts).folder];
     const list = document.querySelector('.conversation-list');
     const pane = document.querySelector('.reader');
     const before = {
@@ -229,20 +265,27 @@
 
   /* ── Writes ────────────────────────────────────────────────────────── */
 
+  /* A failed mark-read is not retried on every render — typing in the search
+     box would send one request per keystroke. The next load clears it. */
   function markRead(thread) {
-    if (!live() || markingRead[thread.id]) return;
+    if (!live() || markingRead[thread.id] || readFailed[thread.id]) return;
     markingRead = Object.freeze({ ...markingRead, [thread.id]: true });
     workspaceActions.markThreadRead(thread.id, true)
       .then(() => {
         replaceThread(thread.id, { unread: false, row: { is_read: true } });
         repaintWhenIdle();
       })
-      .catch(err => console.error('[mail] could not mark the conversation read:', err))
+      .catch(err => {
+        console.error('[mail] could not mark the conversation read:', err);
+        readFailed = Object.freeze({ ...readFailed, [thread.id]: true });
+      })
       .then(() => {
         const { [thread.id]: _finished, ...rest } = markingRead;
         markingRead = Object.freeze(rest);
       });
   }
+
+  document.body.addEventListener('workspace:loaded', () => { readFailed = Object.freeze({}); });
 
   /* Not optimistic, like the rest of the workspace: the star changes when the
      database says it did. */
@@ -281,15 +324,17 @@
   }
 
   /* Still the compose dialog until inline compose replaces it. The reply goes
-     to whoever wrote last from outside, not to the thread's last sender — that
-     is often us. */
+     to whoever last wrote from outside; on a conversation that is only ours,
+     to whoever we last wrote to — never back to ourselves. */
   function replyTo(threadId) {
     const thread = threadById(threadId);
     if (!thread) return;
     const messages = (live() && workspaceStore.threadBody(thread.id)) || [];
     const lastInbound = messages.filter(m => !m.outbound).slice(-1)[0];
+    const lastMessage = messages.slice(-1)[0];
+    const address = lastInbound ? lastInbound.email : (lastMessage && lastMessage.to[0]) || thread.email;
     const subject = /^re:/i.test(thread.subject) ? thread.subject : 'Re: ' + thread.subject;
-    compose(lastInbound ? lastInbound.email : thread.email, subject);
+    compose(address, subject);
   }
 
   document.addEventListener('click', e => {
@@ -300,6 +345,8 @@
     if (unread) { e.preventDefault(); markUnread(unread); return; }
     const reply = e.target.closest('[data-mail-reply]');
     if (reply) { e.preventDefault(); replyTo(reply.dataset.mailReply); return; }
+    const retry = e.target.closest('[data-mail-retry]');
+    if (retry) { e.preventDefault(); workspaceStore.retryThread(retry.dataset.mailRetry); render(); return; }
     const toggle = e.target.closest('[data-mail-expand]');
     if (toggle) {
       e.preventDefault();
@@ -315,4 +362,8 @@
     const route = M.parseMailRoute(routeParts);
     navigate(M.mailRoute({ mailbox: select.value, folder: route.folder }));
   });
+
+  /* workspace.js navigates to the starting route before this file runs, so a
+     link straight to mail was painted by the old view. Paint it with this one. */
+  if (page === 'mail') render();
 })();

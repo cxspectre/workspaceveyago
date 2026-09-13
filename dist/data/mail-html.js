@@ -46,78 +46,60 @@
   }
 
   /* An inline style is CSS, and DOMPurify does not read CSS. Left alone, an
-     email's style="" can fetch a remote image through url() — a tracking pixel
-     that walks straight past "images blocked" — or pin itself over the
-     workspace with position: fixed. Each declaration is judged on its own, and
-     anything that reaches outside the message goes. */
-  var PROPERTY = /^-?[a-z][a-z0-9-]*$/i;
-  var UNSAFE_PROPERTY = /^(behavior|-moz-binding)$/i;
-  var UNSAFE_VALUE = /expression\s*\(|javascript:|vbscript:|-moz-binding/i;
-  var URL_OPEN = /url\s*\(/gi;
-  var URL_REF = /url\s*\(\s*(['"]?)(.*?)\1\s*\)/gi;
+     email's style="" can fetch a remote image — a tracking pixel that walks
+     straight past "images blocked" — or pin itself over the workspace with
+     position: fixed, which is all a fake "sign in again" screen needs.
 
-  /* Split on semicolons that are not inside quotes or brackets:
-     font-family: "A;B" and url("a;b.png") are one declaration each. */
-  function declarations(text) {
-    var parts = [];
-    var current = '';
-    var quote = null;
-    var depth = 0;
-    for (var i = 0; i < text.length; i++) {
-      var ch = text.charAt(i);
-      if (quote) {
-        if (ch === quote) quote = null;
-      } else if (ch === '"' || ch === "'") {
-        quote = ch;
-      } else if (ch === '(') {
-        depth++;
-      } else if (ch === ')') {
-        depth = Math.max(0, depth - 1);
-      } else if (ch === ';' && depth === 0) {
-        parts.push(current);
-        current = '';
-        continue;
-      }
-      current += ch;
-    }
-    parts.push(current);
-    return parts;
-  }
+     The first version parsed the CSS itself and was beaten by what the
+     browser parses differently: escapes (u\rl), comments and backslashes that
+     moved its declaration boundaries, image-set("…") with no url( at all. So
+     the browser parses (cleanStyle, below) and this only judges the result —
+     escapes resolved, comments gone, shorthands expanded to longhands — and
+     judges it by allowlist: a property nobody listed is a property that goes. */
+  var SAFE_PROPERTY = new RegExp('^(' + [
+    'color', 'opacity', 'visibility', 'display', 'float', 'clear', 'direction', 'unicode-bidi',
+    'vertical-align', 'white-space', 'word-break', 'word-spacing', 'overflow-wrap', 'letter-spacing',
+    'line-height', 'box-sizing', 'table-layout', 'border-collapse', 'border-spacing', 'caption-side',
+    'empty-cells', 'list-style-type', 'list-style-position',
+    '(min-|max-)?(width|height)',
+    'font(-family|-size|-style|-weight|-variant|-stretch)?',
+    'text-(align|indent|transform|overflow|shadow|decoration(-line|-color|-style|-thickness)?)',
+    '(margin|padding)(-(top|right|bottom|left))?',
+    'border(-(top|right|bottom|left))?(-(width|style|color))?',
+    'border(-(top|bottom)-(left|right))?-radius',
+    'background-(color|image|position(-x|-y)?|size|repeat(-x|-y)?|clip|origin)'
+  ].join('|') + ')$', 'i');
+  /* Every CSS function that can fetch something, or reach outside the value. */
+  var FETCHES = /(url|image-set|-webkit-image-set|image|cross-fade|element|src|paint|var|attr)\s*\(/i;
+  var RUNS_CODE = /expression\s*\(|javascript:|vbscript:|-moz-binding|behavior/i;
+  /* The browser serialises a url as url("…"), always in double quotes. */
+  var HTTPS_URL = /url\("https:\/\/[^"\\]*"\)/gi;
 
-  function urlsAllowed(value, showImages) {
-    var opened = (value.match(URL_OPEN) || []).length;
-    if (!opened) return true;
-    if (!showImages) return false;
-    var refs = [];
-    var m;
-    URL_REF.lastIndex = 0;
-    while ((m = URL_REF.exec(value))) refs.push(m[2].trim());
-    /* A url( that did not parse is not given the benefit of the doubt. */
-    return refs.length === opened && refs.every(function (u) { return /^https:\/\//i.test(u); });
-  }
-
-  function keepDeclaration(declaration, showImages) {
-    var text = declaration.trim();
-    var colon = text.indexOf(':');
-    if (colon < 1) return null;
-    var property = text.slice(0, colon).trim();
-    var value = text.slice(colon + 1).trim();
-    if (!value || !PROPERTY.test(property)) return null;
-    if (UNSAFE_PROPERTY.test(property) || UNSAFE_VALUE.test(value)) return null;
-    if (/^position$/i.test(property) && !/^(static|relative)$/i.test(value)) return null;
-    if (!urlsAllowed(value, showImages)) return null;
-    return text;
+  function styleAllowed(property, value, options) {
+    var name = String(property || '');
+    var text = String(value || '').trim();
+    if (!text || !SAFE_PROPERTY.test(name) || RUNS_CODE.test(text)) return false;
+    if (!FETCHES.test(text)) return true;
+    /* Images the reader asked to see may come through a plain https url() —
+       and nothing else that fetches, even then. */
+    if (!(options && options.showImages)) return false;
+    return !FETCHES.test(text.replace(HTTPS_URL, ''));
   }
 
   function cleanStyle(style, options) {
-    var showImages = Boolean(options && options.showImages);
-    return declarations(style == null ? '' : String(style))
-      .map(function (d) { return keepDeclaration(d, showImages); })
-      .filter(Boolean)
-      .join('; ');
+    var parsed = document.createElement('div').style;
+    parsed.cssText = style == null ? '' : String(style);
+    var kept = [];
+    for (var i = 0; i < parsed.length; i++) {
+      var name = parsed[i];
+      var value = parsed.getPropertyValue(name);
+      if (styleAllowed(name, value, options)) kept.push(name + ': ' + value);
+    }
+    return kept.join('; ');
   }
 
   window.mailHtml = {
+    styleAllowed: styleAllowed,
     cleanStyle: cleanStyle,
 
     /* Returns { html, blockedImages } — the caller decides how to offer the

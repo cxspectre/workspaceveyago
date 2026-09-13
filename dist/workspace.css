@@ -96,7 +96,13 @@ button.mail-message-head:hover { background: #f7faff; }
    indentation into visible gaps. Plain text keeps its line breaks. */
 .reader .mail-body { white-space: normal; }
 .mail-plain { white-space: pre-wrap; overflow-wrap: anywhere; }
-.mail-html { overflow-x: auto; overflow-wrap: anywhere; line-height: 1.6; color: #3f4754; }
+/* contain: layout makes the body the containing block even for position:
+   fixed, and paint clips to it — a second wall behind the style allowlist in
+   mail-html.js, so an email that slipped one past it still could not lay
+   itself over the workspace. */
+.mail-html { overflow-x: auto; overflow-wrap: anywhere; line-height: 1.6; color: #3f4754; contain: layout paint; }
+.mail-list-truncated { padding: 0 13px 13px; text-align: center; font-size: .75rem; color: #b45309; }
+.mail-load-failed { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border-radius: 12px; background: #fff7ed; color: #9a3412; font-size: .875rem; }
 .mail-html img { max-width: 100%; height: auto; }
 .mail-html table { border-collapse: collapse; }
 .mail-html a { color: #0066cc; text-decoration: underline; }

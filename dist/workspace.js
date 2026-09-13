@@ -104,7 +104,7 @@ document.addEventListener('click', e => {
   if (!btn) return;
   e.preventDefault();
   e.stopImmediatePropagation();
-  window.__mailShowImages = btn.dataset.showImages;
+  window.__mailShowImages = [...(window.__mailShowImages || []), btn.dataset.showImages];
   render();
 }, true);
 

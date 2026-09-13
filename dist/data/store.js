@@ -100,16 +100,12 @@
          total is the same. */
       var results = await Promise.all([
         d.tickets(), d.projects(), d.contacts(), d.team(),
-        d.events(CAL.loadFrom, CAL.loadTo), d.invoices(), d.activity(8), d.mailThreads(['inbox', 'sent']),
+        d.events(CAL.loadFrom, CAL.loadTo), d.invoices(), d.activity(8), loadMail(d),
         d.overview().catch(function () { return null; }),      // managers only
         d.revenueSeries(12).catch(function () { return []; }),  // ditto
         d.revenueMix(1).catch(function () { return []; }),
-        d.notes().catch(function () { return []; }),
-        /* The mail switcher's list. Losing it degrades to "All mailboxes"
-           rather than taking the whole workspace down with it. */
-        d.mailboxes().catch(function () { return []; })
+        d.notes().catch(function () { return []; })
       ]);
-      state.mailboxes = results[12];
 
       var liveTickets = results[0];
       var liveProjects = results[1];
@@ -118,7 +114,9 @@
       var liveEvents = results[4];
       var liveInvoices = results[5];
       var liveActivity = results[6];
-      var liveMail = results[7];
+      var liveMail = results[7].threads;
+      state.mailboxes = results[7].mailboxes;
+      state.mailTruncated = results[7].truncated;
       state.overview = results[8];
       state.revenue = results[9];
       state.revenueMix = results[10];
@@ -212,14 +210,36 @@
     else if (typeof render === 'function') render();
   }
 
+  /* The mailboxes first, then each mailbox's own inbox and sent: one shared
+     limit let a busy hello@ push a personal mailbox out of the load. Losing
+     the mailbox list degrades to one query per folder across everything,
+     rather than taking the rest of the workspace down with it. */
+  function loadMail(d) {
+    return d.mailboxes()
+      .catch(function (err) {
+        console.error('[workspace] could not load the mailboxes:', err);
+        return [];
+      })
+      .then(function (boxes) {
+        var ids = boxes.map(function (b) { return b.id; });
+        return d.mailThreads(['inbox', 'sent'], ids).then(function (result) {
+          return { mailboxes: boxes, threads: result.threads, truncated: result.truncated };
+        });
+      });
+  }
+
   /* Thread bodies, fetched when a thread is opened rather than with the list.
      Cached for the page's lifetime: re-reading a message you just read should
      not be another round trip. */
   var bodies = {};
   var inFlight = {};
+  /* A conversation that failed to load. It used to be cached as an empty one,
+     which read as "no messages yet" — not true. Held until someone asks for a
+     retry, so a render loop cannot turn one failure into a request storm. */
+  var failedThreads = {};
 
   function loadThread(threadId) {
-    if (!threadId || bodies[threadId] || inFlight[threadId]) return;
+    if (!threadId || bodies[threadId] || inFlight[threadId] || failedThreads[threadId]) return;
     inFlight[threadId] = true;
     window.workspaceData.mailMessages(threadId)
       .then(function (messages) {
@@ -237,7 +257,8 @@
       })
       .catch(function (err) {
         console.error('[workspace] could not load the conversation:', err);
-        bodies[threadId] = [];
+        failedThreads[threadId] = true;
+        if (typeof render === 'function') render();
       })
       .then(function () { delete inFlight[threadId]; });
   }
@@ -290,6 +311,12 @@
       return null;
     },
     loadThread: loadThread,
+    threadFailed: function (threadId) { return Boolean(failedThreads[threadId]); },
+    /* Asked for by a person, so it gets one fresh attempt. */
+    retryThread: function (threadId) {
+      delete failedThreads[threadId];
+      loadThread(threadId);
+    },
 
     projectByIndex: function (index) { return projects[index] || null; },
     ticketByNumber: function (n) {

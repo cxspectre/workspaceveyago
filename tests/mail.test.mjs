@@ -1,7 +1,12 @@
 /* Mail's logic, without a page: which mailboxes a person has, what a mail URL
-   means, which threads a folder shows, and what an email's inline styles are
-   allowed to do. Loaded into a sandbox the way <script> tags run them.
+   means, which threads a folder shows, and which inline styles an email may
+   keep. Loaded into a sandbox the way <script> tags run them.
    Run from the repo root with: node --test
+
+   The style rules here take a property and a value AFTER the browser has
+   parsed them — escapes resolved, comments gone, shorthands expanded. That
+   parsing cannot be exercised in node; it was checked against the review's
+   bypass payloads in a real browser (see the commit that added this).
 
    Arrays made inside the sandbox have the sandbox's Array.prototype, which
    strict deep-equality rejects — hence the [...spread] before comparing. */
@@ -18,7 +23,7 @@ function sandbox(file, globals = {}) {
 
 const model = vm.runInContext('mailModel', sandbox('mail-model.js'));
 const htmlContext = sandbox('data/mail-html.js', { window: {} });
-const cleanStyle = vm.runInContext('window.mailHtml.cleanStyle', htmlContext);
+const styleAllowed = vm.runInContext('window.mailHtml.styleAllowed', htmlContext);
 
 const ME = '6b1f7a52-0000-4000-8000-000000000001';
 const COLLEAGUE = '6b1f7a52-0000-4000-8000-000000000002';
@@ -58,8 +63,12 @@ test('a mailbox that needs reconnecting says so', () => {
 
 test('no rows, or no signed-in person, gives no personal mailboxes and no crash', () => {
   assert.equal(model.mailboxesFor(null, ME).length, 0);
-  const boxes = model.mailboxesFor([connection({ employee_id: ME, id: PERSONAL })], null);
-  assert.equal(boxes.length, 0);
+  assert.equal(model.mailboxesFor([connection({ employee_id: ME, id: PERSONAL })], null).length, 0);
+  assert.equal(model.mailboxesFor([connection({ employee_id: ME, id: PERSONAL })], undefined).length, 0);
+});
+
+test('only a real true counts as live', () => {
+  assert.equal(model.mailboxesFor([connection({ is_live: 'true' })], ME)[0].live, false);
 });
 
 /* ── Routes ──────────────────────────────────────────────────────────── */
@@ -78,6 +87,16 @@ test('old position-based links and junk degrade to the inbox, never to another t
     { mailbox: 'all', folder: 'inbox', threadId: null });
   assert.deepEqual({ ...model.parseMailRoute(['mail', '<script>', 'nope', 'x']) },
     { mailbox: 'all', folder: 'inbox', threadId: null });
+});
+
+test('a known mailbox with an unknown folder keeps the mailbox but opens nothing', () => {
+  assert.deepEqual({ ...model.parseMailRoute(['mail', STUDIO, 'junk', THREAD]) },
+    { mailbox: STUDIO, folder: 'inbox', threadId: null });
+});
+
+test('an uppercase uuid is still an id, and extra path parts are ignored', () => {
+  const upper = THREAD.toUpperCase();
+  assert.equal(model.parseMailRoute(['mail', 'all', 'inbox', upper, 'extra']).threadId, upper);
 });
 
 test('mailRoute is the inverse of parseMailRoute', () => {
@@ -142,43 +161,69 @@ test('recipient lines read like a mail client, and stay short', () => {
   assert.equal(model.recipientLine(null), '');
 });
 
-/* ── Email inline styles ─────────────────────────────────────────────── */
+/* ── Email inline styles (after the browser has parsed them) ─────────── */
 
-test('ordinary email styling survives', () => {
-  assert.equal(cleanStyle('color: #333; font-size: 14px; padding: 0 4px', { showImages: false }),
-    'color: #333; font-size: 14px; padding: 0 4px');
-  assert.equal(cleanStyle('position: relative; font-family: "Segoe UI", Arial', { showImages: false }),
-    'position: relative; font-family: "Segoe UI", Arial');
+const blocked = { showImages: false };
+const shown = { showImages: true };
+
+test('ordinary email styling is kept', () => {
+  for (const [property, value] of [
+    ['color', 'rgb(51, 51, 51)'], ['background-color', 'rgb(255, 255, 255)'],
+    ['font-family', '"Segoe UI", Arial'], ['font-size', '14px'], ['font-weight', '600'],
+    ['line-height', '1.5'], ['text-align', 'center'], ['text-decoration-line', 'underline'],
+    ['padding-top', '4px'], ['margin-left', 'auto'], ['border-top-width', '1px'],
+    ['border-top-style', 'solid'], ['border-top-color', 'rgb(0, 0, 0)'],
+    ['border-top-left-radius', '8px'], ['width', '600px'], ['max-width', '100%'],
+    ['display', 'block'], ['vertical-align', 'top'], ['border-collapse', 'collapse'],
+    ['background-image', 'none'],
+  ]) {
+    assert.equal(styleAllowed(property, value, blocked), true, `${property}: ${value}`);
+  }
 });
 
-test('a CSS url() is a remote image, so it is blocked with the others', () => {
-  assert.equal(cleanStyle('color: red; background: url(https://track.example/p.gif)', { showImages: false }),
-    'color: red');
-  assert.equal(cleanStyle('background-image: url("https://cdn.example/hero.png")', { showImages: true }),
-    'background-image: url("https://cdn.example/hero.png")', 'shown once the reader asks');
-  assert.equal(cleanStyle('background: url(http://plain.example/x.png)', { showImages: true }), '',
-    'never plain http');
-  assert.equal(cleanStyle('background: -webkit-image-set(url(https://a.example/1.png) 1x)', { showImages: false }), '');
+test('nothing may position itself, so nothing can be laid over the workspace', () => {
+  for (const value of ['fixed', 'absolute', 'sticky', 'relative', 'static']) {
+    assert.equal(styleAllowed('position', value, blocked), false, `position: ${value}`);
+  }
+  assert.equal(styleAllowed('top', '0px', blocked), false);
+  assert.equal(styleAllowed('inset', '0px', blocked), false);
+  assert.equal(styleAllowed('z-index', '99999', blocked), false);
+  assert.equal(styleAllowed('transform', 'translateY(-500px)', blocked), false);
 });
 
-test('an email cannot pin itself over the workspace or run anything', () => {
-  assert.equal(cleanStyle('position: fixed; inset: 0; z-index: 9999', { showImages: false }), 'inset: 0; z-index: 9999');
-  assert.equal(cleanStyle('position:absolute;top:0', { showImages: false }), 'top:0');
-  assert.equal(cleanStyle('position: sticky', { showImages: false }), '');
-  assert.equal(cleanStyle('width: expression(alert(1))', { showImages: false }), '');
-  assert.equal(cleanStyle('-moz-binding: url(x.xml#y)', { showImages: true }), '');
-  assert.equal(cleanStyle('behavior: url(x.htc)', { showImages: true }), '');
+test('a CSS image is a remote image: blocked with the rest, and only ever https', () => {
+  assert.equal(styleAllowed('background-image', 'url("https://track.example/p.gif")', blocked), false);
+  assert.equal(styleAllowed('background-image', 'url("https://cdn.example/hero.png")', shown), true);
+  assert.equal(styleAllowed('background-image', 'url("http://plain.example/x.png")', shown), false);
+  assert.equal(styleAllowed('background-image', 'url("//cdn.example/x.png")', shown), false);
+  assert.equal(styleAllowed('background-image',
+    'url("https://a.example/1.png"), url("data:image/png;base64,AAAA")', shown), false);
 });
 
-test('semicolons inside quotes or brackets do not split a declaration', () => {
-  assert.equal(cleanStyle('font-family: "A;B", serif; color: blue', { showImages: false }),
-    'font-family: "A;B", serif; color: blue');
-  assert.equal(cleanStyle('background: url("https://x.example/a;b.png"); color: blue', { showImages: false }),
-    'color: blue');
+test('every other way CSS can fetch something is refused, images shown or not', () => {
+  for (const value of [
+    'image-set(url("https://t.example/p.gif") 1dppx)',
+    '-webkit-image-set(url("https://t.example/p.gif") 1x)',
+    'cross-fade(url("https://a.example/a.png"), url("https://a.example/b.png"), 50%)',
+    'image("https://t.example/p.gif")',
+    'element(#logo)',
+    'var(--anything)',
+  ]) {
+    assert.equal(styleAllowed('background-image', value, shown), false, value);
+  }
+  assert.equal(styleAllowed('list-style-image', 'url("https://t.example/p.gif")', shown), false);
+  assert.equal(styleAllowed('cursor', 'url("https://t.example/c.cur"), auto', shown), false);
+  assert.equal(styleAllowed('border-image-source', 'url("https://t.example/b.png")', shown), false);
+  assert.equal(styleAllowed('content', 'url("https://t.example/p.gif")', shown), false);
 });
 
-test('garbage in, nothing out', () => {
-  assert.equal(cleanStyle('', { showImages: false }), '');
-  assert.equal(cleanStyle(null, { showImages: false }), '');
-  assert.equal(cleanStyle('}{ color red; 9bad: 1', { showImages: false }), '');
+test('properties that can run code, or that the list does not know, are refused', () => {
+  assert.equal(styleAllowed('behavior', 'url(x.htc)', shown), false);
+  assert.equal(styleAllowed('-moz-binding', 'url(x.xml#y)', shown), false);
+  assert.equal(styleAllowed('width', 'expression(alert(1))', blocked), false);
+  assert.equal(styleAllowed('--brand', 'red', blocked), false);
+  assert.equal(styleAllowed('filter', 'url("#blur")', shown), false);
+  assert.equal(styleAllowed('mask-image', 'none', blocked), false);
+  assert.equal(styleAllowed('', 'red', blocked), false);
+  assert.equal(styleAllowed('color', '', blocked), false);
 });
