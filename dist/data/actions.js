@@ -15,6 +15,9 @@
   function sb() { return window.workspaceSession.client; }
   function me() { return window.workspaceSession.employee; }
 
+  /* Where attachments wait between being added and being sent (0038 §5). */
+  var MAIL_ATTACHMENTS = 'mail-attachments';
+
   /* supabase-js reports a missing function as a FunctionsFetchError or a 404;
      both mean "not deployed", which is a different problem from "refused". */
   function isMissingFunction(err) {
@@ -25,21 +28,31 @@
         || (err && err.context && err.context.status === 404);
   }
 
-  /* What went wrong, in the function's own words. supabase-js answers a non-2xx
-     with { data: null, error } and the Response on error.context, so an Edge
-     Function's { error } body is only readable from there — without this, all a
-     person sees is "Edge Function returned a non-2xx status code". */
-  async function functionError(res, fallback) {
+  /* An Edge Function's own JSON answer to a failed call. supabase-js answers a
+     non-2xx with { data: null, error } and the Response on error.context, so
+     the function's body is only readable from there — once: a Response body
+     cannot be read twice. */
+  async function functionBody(res) {
     var context = res.error && res.error.context;
     if (context && typeof context.json === 'function') {
       try {
         var body = await context.json();
-        if (body && (body.error || body.message)) return String(body.error || body.message);
+        if (body && typeof body === 'object') return body;
       } catch (notJson) {
         /* A gateway page rather than our JSON: the generic message will do. */
       }
     }
-    return (res.data && res.data.error) || (res.error && res.error.message) || fallback;
+    return res.data && typeof res.data === 'object' ? res.data : {};
+  }
+
+  /* What went wrong, in the function's own words — without it, all a person
+     sees is "Edge Function returned a non-2xx status code". */
+  function errorMessage(res, body, fallback) {
+    return String(body.error || body.message || (res.error && res.error.message) || fallback);
+  }
+
+  async function functionError(res, fallback) {
+    return errorMessage(res, await functionBody(res), fallback);
   }
 
   function must(condition, message) {
@@ -333,6 +346,71 @@
       var url = String(res.data && res.data.consentUrl || '');
       must(/^https:\/\/login\.microsoftonline\.com\//.test(url), 'Microsoft did not send a sign-in page back.');
       return url;
+    },
+
+    /* ── Mail: sending ───────────────────────────────────────────────── */
+
+    /* One message, new or an answer, through send-mail — which checks all of
+       it again and stores the sent copy. A refusal is an Error that also says
+       whether reconnecting the mailbox would help (reconnect) and whether the
+       message is waiting in Outlook's Drafts (draftSaved). */
+    async sendMail(request) {
+      var res = await sb().functions.invoke('send-mail', { body: request });
+      if (!res.error) return res.data;
+      var body = await functionBody(res);
+      var status = res.error.context && res.error.context.status;
+      /* No answer of send-mail's own — the connection dropped, or the gateway
+         gave up while it was still working — says nothing about whether the
+         message went. Saying "not sent" invites a retry that mails someone twice. */
+      var unknown = !body.error && (!status || status >= 500);
+      var err = new Error(unknown
+        ? 'The message may have been sent. Look in Sent before sending it again.'
+        : errorMessage(res, body, 'The message was not sent.'));
+      err.reconnect = body.reconnect === true;
+      err.draftSaved = body.draftSaved === true;
+      err.unknownOutcome = unknown;
+      throw err;
+    },
+
+    /* An attachment goes to Storage before its message is sent; send-mail
+       reads it from there, as the sender. <your auth id>/<a fresh folder>/<a
+       plain name> is the only shape it accepts, and an upload never replaces
+       another. */
+    async uploadMailAttachment(file) {
+      must(file && Number(file.size) > 0, '"' + String(file && file.name || 'That file') + '" is empty.');
+      var session = window.workspaceSession.session;
+      must(session && session.user && session.user.id, 'Sign in again to attach files.');
+      var contentType = file.type || 'application/octet-stream';
+      var path = session.user.id + '/' + window.crypto.randomUUID() + '/' + mailModel.storageName(file.name);
+      var res = await sb().storage.from(MAIL_ATTACHMENTS).upload(path, file, { contentType: contentType, upsert: false });
+      if (res.error) throw new Error('Could not attach "' + file.name + '": ' + res.error.message);
+      return { path: path, name: String(file.name), size: Number(file.size), contentType: contentType };
+    },
+
+    /* Uploads for a message that will not be sent — removed, or discarded. */
+    async removeMailAttachments(paths) {
+      var list = (paths || []).filter(Boolean);
+      if (!list.length) return;
+      var res = await sb().storage.from(MAIL_ATTACHMENTS).remove(list);
+      if (res.error) throw new Error('Could not remove the attachment: ' + res.error.message);
+    },
+
+    /* ── Mail: signatures ────────────────────────────────────────────── */
+
+    /* One per mailbox (connectionId), or one for every mailbox (null). Cleaned
+       before it is stored: it goes into the editor, and from there into mail
+       sent under the studio's name. */
+    async saveSignature(fields) {
+      must(me(), 'You need to be signed in as a team member to save a signature.');
+      must(window.DOMPurify, 'The editor is still loading. Try again in a moment.');
+      var html = window.DOMPurify.sanitize(String(fields && fields.html || ''), mailModel.PURIFY_CONFIG);
+      return one(await sb().from('mail_signatures').upsert({
+        employee_id: me().id,
+        connection_id: fields.connectionId || null,
+        html: html,
+        use_on_new: fields.useOnNew !== false,
+        use_on_replies: fields.useOnReplies !== false
+      }, { onConflict: 'employee_id,connection_id' }).select().single(), 'save the signature');
     }
   };
 })();

@@ -25,14 +25,19 @@
     return window.workspaceStore && window.workspaceStore.state.loaded;
   }
 
-  /* The app keeps no companies array — they arrive attached to contacts. */
+  /* Every company a typed name can mean: those loaded with the workspace —
+     including the ones with no contacts yet — and any that arrived attached to
+     a contact since. Only looking at contacts' companies is how a second
+     company with the same name got created. */
   function companies() {
     var seen = {};
-    return contacts.reduce(function (acc, c) {
-      var co = c.row && c.row.company;
-      if (co && !seen[co.id]) { seen[co.id] = 1; acc.push(co); }
-      return acc;
-    }, []);
+    var loaded = (window.workspaceStore && window.workspaceStore.state.companies) || [];
+    var fromContacts = contacts.map(function (c) { return c.row && c.row.company; });
+    return loaded.map(function (c) { return c.row || c; }).concat(fromContacts).filter(function (co) {
+      if (!co || seen[co.id]) return false;
+      seen[co.id] = 1;
+      return true;
+    });
   }
 
   function fail(err) {
@@ -40,15 +45,28 @@
     if (typeof toast === 'function') toast(err.message || 'That did not save.');
   }
 
+  /* A write before the workspace has loaded has nowhere real to go, and the
+     offline handlers it would fall through to only pretend ("Updated in this
+     demo session"). Say so instead. */
+  function notYet() {
+    if (typeof toast === 'function') toast('Not saved: the workspace is still loading. Try again in a moment.');
+  }
+
+  function resetSelect(select) {
+    var shown = [].filter.call(select.options, function (o) { return o.defaultSelected; })[0];
+    if (shown) select.value = shown.value;
+  }
+
   /* A checkbox that has already flipped in the DOM but not yet in the database
      is a lie in progress; put it back until the write lands. */
   document.addEventListener('change', function (e) {
     var box = e.target.closest && e.target.closest('[data-project-task]');
-    if (!box || !live()) return;
+    if (!box || !window.workspaceStore) return;
     e.stopImmediatePropagation();
     e.preventDefault();
+    if (!live()) { box.checked = !box.checked; notYet(); return; }
 
-    var project = window.workspaceStore.projectByIndex(Number(box.dataset.projectTask));
+    var project = window.workspaceStore.projectById(box.dataset.projectTask);
     var index = Number(box.dataset.task);
     var taskId = project && project.taskIds && project.taskIds[index];
     if (!taskId) return;
@@ -62,6 +80,31 @@
       })
       .catch(function (err) { box.checked = !wanted; fail(err); })
       .then(function () { box.disabled = false; });
+  }, true);
+
+  /* A project's status, from the select on its page. workspace.js changed it
+     in memory and said "Updated in this demo session"; nothing was saved, and
+     a reload put the old status back. */
+  document.addEventListener('change', function (e) {
+    var select = e.target.closest && e.target.closest('[data-record-kind="projects"][data-field="status"]');
+    if (!select || !window.workspaceStore) return;
+    e.stopImmediatePropagation();
+    if (!live()) { resetSelect(select); notYet(); return; }
+
+    var project = window.workspaceStore.projectById(select.dataset.recordId);
+    var status = projectsModel.statusValue(select.value);
+    if (!project || !status) {
+      resetSelect(select);
+      fail(new Error('That project is not loaded any more. Reload the page and try again.'));
+      return;
+    }
+
+    select.disabled = true;
+    window.workspaceStore
+      .after(window.workspaceActions.setProjectStatus(project.uuid, status))
+      .then(function () { if (typeof toast === 'function') toast('Status saved: ' + select.value); })
+      .catch(function (err) { select.value = project.status; fail(err); })
+      .then(function () { select.disabled = false; });
   }, true);
 
   /* "Create ticket" on a mail thread. app.js handled this by inventing a
@@ -97,7 +140,15 @@
 
   document.addEventListener('submit', function (e) {
     var form = e.target;
-    if (!form || !form.matches || !live()) return;
+    if (!form || !form.matches || !window.workspaceStore) return;
+    if (!live()) {
+      var ours = form.id === 'create-form' || form.matches('[data-add-task], [data-note-form], [data-ticket-reply]');
+      if (!ours) return;
+      e.stopImmediatePropagation();
+      e.preventDefault();
+      notYet();
+      return;
+    }
 
     /* Add a task to a project. */
     if (form.matches('[data-add-task]')) {
@@ -105,7 +156,7 @@
       e.preventDefault();
       var title = String(new FormData(form).get('task') || '').trim();
       if (!title) return;
-      var project = window.workspaceStore.projectByIndex(Number(form.dataset.addTask));
+      var project = window.workspaceStore.projectById(form.dataset.addTask);
       if (!project) return;
       form.reset();
       window.workspaceStore
@@ -149,7 +200,7 @@
       var A = window.workspaceActions;
       var lower = function (s) { return String(s || '').trim().toLowerCase(); };
       var companyNamed = function (n) {
-        var hit = companies().filter(function (c) { return lower(c.name) === lower(n); })[0];
+        var hit = projectsModel.findCompany(companies(), n);
         return hit ? hit.id : null;
       };
       var contactNamed = function (n) {

@@ -405,6 +405,15 @@
       return unwrap(await query.order('account_label'), 'mailboxes');
     },
 
+    /* The signed-in person's own signatures: one per mailbox, and at most one
+       for every mailbox (connection_id null). RLS returns nobody else's. */
+    async mailSignatures() {
+      return unwrap(await sb()
+        .from('mail_signatures')
+        .select('id, connection_id, html, use_on_new, use_on_replies, updated_at')
+        .order('updated_at', { ascending: false }), 'your signatures');
+    },
+
     /* Monthly income for the Overview chart. Summed in the database so it
        agrees with the Revenue tile; empty for a non-manager, by RLS. */
     async revenueSeries(months) {

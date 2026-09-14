@@ -213,7 +213,15 @@
         '</svg>' +
       '</button>';
     chip.querySelector('.session-signout').addEventListener('click', function () {
-      window.workspaceSession.signOut();
+      /* What someone left in Mail is theirs: a draft, its uploads, the
+         signatures it loaded. The uploads are removed while their session can
+         still remove them, and the page starts over afterwards, so whoever
+         signs in next in this tab finds none of it. */
+      var closing = typeof mailComposer !== 'undefined' ? mailComposer.close() : null;
+      Promise.resolve(closing)
+        .catch(function () { return null; })
+        .then(function () { return window.workspaceSession.signOut(); })
+        .then(function () { location.reload(); }, function () { location.reload(); });
     });
     avatar.replaceWith(chip);
   }

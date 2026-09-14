@@ -66,6 +66,62 @@
 .mailbox-connection small { display: block; }
 .mail-folder-foot .mailbox-reconnect { margin-top: 7px; padding: 5px 11px; font-size: .75rem; }
 .mail-folder-foot .mailbox-reconnect:disabled { opacity: .55; cursor: progress; }
+
+/* ── Compose, in the reading pane ─────────────────────────────────────── */
+.reader-compose .reader-content { padding-top: 16px; }
+.composer { margin: 6px 0 18px; overflow: hidden; border: 1px solid #d6e2f2; border-radius: 16px; background: #fff; box-shadow: 0 6px 22px #2336530d; }
+.composer.dropping { outline: 2px dashed #0071e3; outline-offset: -6px; }
+.composer.sending { opacity: .8; }
+.composer-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: #f7faff; }
+.composer-head strong { font-size: .875rem; font-weight: 600; }
+.composer-status { font-size: .75rem; color: #66758a; text-align: right; }
+.composer-status[data-kind="error"] { color: #c62828; }
+.composer-fields { border-bottom: 1px solid var(--line); }
+.composer-row { display: flex; align-items: center; gap: 10px; min-height: 42px; padding: 3px 16px; border-bottom: 1px solid #eef1f5; }
+.composer-row:last-child { border-bottom: 0; }
+.composer-row[hidden] { display: none; }
+.composer-label { flex-shrink: 0; width: 58px; font-size: .8125rem; color: #66758a; }
+.composer-row > select, .composer-row > input { flex: 1; min-width: 0; padding: 7px 0; border: 0; background: transparent; color: var(--ink); font-size: .875rem; outline: none; }
+.composer-row > select:disabled { opacity: 1; color: var(--ink); appearance: none; }
+.composer-row .text-btn[hidden] { display: none; }
+.composer-chips { display: flex; flex: 1; flex-wrap: wrap; align-items: center; gap: 5px; min-width: 0; }
+.composer-chips [data-chips] { display: contents; }
+.composer-chips input { flex: 1; min-width: 140px; padding: 7px 0; border: 0; background: transparent; color: var(--ink); font-size: .875rem; outline: none; }
+.composer-chips input.invalid { color: #c62828; }
+.chip { display: inline-flex; align-items: center; gap: 3px; max-width: 100%; padding: 3px 4px 3px 10px; border-radius: 999px; background: #e8f1fd; color: #0b4fa0; font-size: .8125rem; }
+.chip button { width: 18px; height: 18px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: inherit; line-height: 1; cursor: pointer; }
+.chip button:hover { background: #cfe0f8; }
+.composer-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; padding: 6px 10px; border-bottom: 1px solid var(--line); background: #fbfcfe; }
+.composer-tool { min-width: 30px; height: 30px; padding: 0 7px; border: 0; border-radius: 8px; background: transparent; color: #3c4a5c; font-size: .8125rem; cursor: pointer; }
+.composer-tool:hover, .composer-tool[aria-pressed="true"] { background: #e3ebf6; color: #0b4fa0; }
+.composer-size { height: 30px; margin: 0 4px; padding: 0 6px; border: 1px solid #dce0e6; border-radius: 8px; background: #fff; font-size: .8125rem; }
+.composer-swatches { display: inline-flex; align-items: center; gap: 4px; margin: 0 6px; }
+.composer-swatch { width: 16px; height: 16px; padding: 0; border: 2px solid #fff; border-radius: 50%; box-shadow: 0 0 0 1px #d0d7e2; cursor: pointer; }
+.composer-highlight { padding: 0 3px; border-radius: 3px; background: #fff3a3; }
+.composer-editor { min-height: 220px; max-height: 60vh; padding: 14px 16px; overflow-y: auto; font-size: .9375rem; line-height: 1.55; overflow-wrap: anywhere; outline: none; }
+.composer-editor p { margin: 0; }
+.composer-editor blockquote { margin: 8px 0; padding-left: 12px; border-left: 3px solid #d0d7e2; color: #56657a; }
+.composer-editor ul, .composer-editor ol { margin: 4px 0; padding-left: 22px; }
+.composer-editor a { color: #0066cc; }
+.composer-signature { color: #56657a; }
+.composer-attachments { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; padding: 0 16px; list-style: none; }
+.composer-attachments:not(:empty) { padding: 10px 16px; border-top: 1px solid var(--line); }
+.composer-file { display: inline-flex; align-items: center; gap: 8px; max-width: 290px; padding: 5px 5px 5px 12px; border: 1px solid #dce3ec; border-radius: 10px; background: #f8fafc; font-size: .8125rem; }
+.composer-file-name { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.composer-file small { flex-shrink: 0; color: #7d899d; }
+.composer-file.failed { border-color: #f3c2c2; background: #fff5f5; }
+.composer-file.failed small { color: #c62828; }
+.composer-file button { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 50%; background: transparent; cursor: pointer; }
+.composer-file button:hover { background: #e3ebf6; }
+.composer-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 11px 16px; border-top: 1px solid var(--line); }
+.composer-importance { display: inline-flex; align-items: center; gap: 6px; font-size: .8125rem; color: #66758a; }
+.composer-importance select { padding: 5px 8px; border: 1px solid #dce0e6; border-radius: 8px; background: #fff; font-size: .8125rem; }
+.composer-discard { margin-left: auto; }
+.composer-discard.armed { color: #c62828; font-weight: 600; }
+.signature-toolbar { display: flex; gap: 2px; }
+.signature-editor { min-height: 120px; border: 1px solid #dce0e6; border-radius: 12px; background: #fafbfc; font-weight: 400; }
+.check-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; font-size: .875rem; }
+.mail-actions { flex-wrap: wrap; }
 .mail-count { flex-shrink: 0; min-width: 20px; padding: 1px 6px; border-radius: 999px; background: #0071e3; color: #fff; font-size: .6875rem; text-align: center; }
 .mailbox-select { display: none; }
 .mailbox-select select { max-width: 260px; padding: 7px 10px; border: 1px solid #dce0e6; border-radius: 10px; background: #fafbfc; color: var(--ink); font-size: .8125rem; }
@@ -129,3 +185,62 @@ button.mail-message-head:hover { background: #f7faff; }
   .mail-folder-foot:has(.mailbox-reconnect) { display: block; }
 }
 @media (max-width: 760px) { .mail-workspace { grid-template-columns: 1fr; } }
+
+/* ── Mail, full screen ─────────────────────────────────────────────────────
+   Mail is a workspace of its own, not a page with a panel on it. Below the
+   topbar it takes the whole screen: no page heading, breadcrumb bar or footer,
+   no max-width, and the folders, the list and the reading pane each scroll on
+   their own. mail.js sets body.mail-mode while Mail is open. */
+body.mail-mode { --mail-chrome: 72px; }             /* the 58px topbar and the gap under the panel */
+body.mail-mode .context-bar,
+body.mail-mode footer { display: none; }
+body.mail-mode .workspace { padding-right: 14px; }
+body.mail-mode .topbar,
+body.mail-mode main { max-width: none; }
+body.mail-mode main { padding: 0 0 14px; }
+/* Mail re-renders as you work; the page's entrance animation would replay each time. */
+body.mail-mode main > :first-child { animation: none; }
+body.mail-mode .mail-workspace { grid-template-columns: 228px 360px minmax(0, 1fr); min-height: 480px; }
+body.mail-mode .reader-content { max-width: 1120px; }
+.mail-new { width: 100%; margin: 0 0 16px; }
+
+/* Reading or writing with the whole width: folders and list step aside. */
+body.mail-mode .mail-workspace.reader-expanded { grid-template-columns: minmax(0, 1fr); }
+body.mail-mode .mail-workspace.reader-expanded > .mail-folders,
+body.mail-mode .mail-workspace.reader-expanded > .conversation-list { display: none; }
+body.mail-mode .mail-workspace.reader-expanded .reader-content { max-width: 1280px; margin: 0 auto; }
+
+/* A new message uses the full height of the reading pane. */
+body.mail-mode .reader-compose { display: flex; flex-direction: column; }
+body.mail-mode .reader-compose .reader-content { display: flex; flex: 1; flex-direction: column; min-height: 0; max-width: none; padding: 14px 16px; }
+body.mail-mode .reader-compose .composer { display: flex; flex: 1; flex-direction: column; min-height: 0; margin: 0; }
+body.mail-mode .reader-compose .composer-editor { flex: 1; min-height: 240px; max-height: none; }
+
+@media (min-width: 1650px) { body.mail-mode .mail-workspace { grid-template-columns: 250px 400px minmax(0, 1fr); } }
+@media (max-width: 1250px) { body.mail-mode .mail-workspace { grid-template-columns: 196px 300px minmax(0, 1fr); } }
+@media (max-width: 1050px) {
+  body.mail-mode .mail-workspace { grid-template-columns: 290px minmax(0, 1fr); }
+  .mail-new { width: auto; margin: 0 8px 0 0; }
+}
+@media (max-width: 760px) {
+  body.mail-mode .mail-workspace { grid-template-columns: 1fr; }
+  body.mail-mode .workspace { padding-right: 20px; }
+}
+
+/* ── Projects board: a column for every stage work can be in ──────────────
+   Its own class: the CRM pipeline is a .project-board too, with three columns. */
+.project-board.stage-board { grid-template-columns: repeat(5, minmax(230px, 1fr)); overflow-x: auto; padding-bottom: 8px; scroll-snap-type: x proximity; }
+.project-board.stage-board .board-column { scroll-snap-align: start; }
+/* The role chip is painted in once someone has signed in. */
+.demo-label:empty { display: none; }
+
+/* ── Compose, after review ─────────────────────────────────────────────── */
+/* Whatever is pasted stays inside the editor's box, however it is styled. */
+.composer-editor { contain: layout paint; }
+.composer-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; min-width: 0; }
+.composer-about { font-size: .75rem; color: #66758a; }
+.composer-note { flex-shrink: 0; font-size: .75rem; color: #7d899d; }
+.composer-status[data-kind="confirm"] { color: #b45309; }
+.composer-chips input[aria-invalid="true"] { text-decoration: underline wavy #c62828; text-underline-offset: 3px; }
+.mail-message-actions { display: flex; flex-wrap: wrap; gap: 16px; padding: 2px 16px 12px; }
+.mail-message-actions .text-btn { font-size: .8125rem; color: #0066cc; }

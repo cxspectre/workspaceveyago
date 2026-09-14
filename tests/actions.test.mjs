@@ -40,12 +40,16 @@ const unreachable = {
   error: { name: 'FunctionsFetchError', message: 'Failed to send a request to the Edge Function', context: {} }
 };
 
-/* answer(name, options): what functions.invoke resolves to. */
-function workspace(answer) {
+const USER = 'a0000000-0000-4000-8000-000000000001';
+
+/* answer(name, options): what functions.invoke resolves to.
+   storage(bucket): the stand-in for sb().storage.from(bucket).
+   purify: the stand-in for DOMPurify. */
+function workspace(answer, { storage, purify } = {}) {
   const invoked = [];
   const written = [];
-  const record = (table, what) => (change) => {
-    written.push({ table, what, change: { ...change } });
+  const record = (table, what) => (change, options) => {
+    written.push({ table, what, change: { ...change }, ...(options ? { options: { ...options } } : {}) });
     const chain = {
       eq: () => chain,
       select: () => chain,
@@ -60,11 +64,17 @@ function workspace(answer) {
         return answer(name, options);
       }
     },
-    from: (table) => ({ update: record(table, 'update'), insert: record(table, 'insert') })
+    from: (table) => ({ update: record(table, 'update'), insert: record(table, 'insert'), upsert: record(table, 'upsert') }),
+    storage: { from: (bucket) => (storage ? storage(bucket) : {}) }
   };
-  const session = { client, employee: { id: 'emp-1' }, session: null };
-  const context = vm.createContext({ console, window: { workspaceSession: session } });
-  vm.runInContext(readFileSync(new URL('../dist/data/actions.js', import.meta.url), 'utf8'), context);
+  const session = { client, employee: { id: 'emp-1' }, session: { user: { id: USER } } };
+  const context = vm.createContext({
+    console,
+    window: { workspaceSession: session, DOMPurify: purify, crypto: globalThis.crypto }
+  });
+  for (const file of ['mail-model.js', 'data/actions.js']) {
+    vm.runInContext(readFileSync(new URL(`../dist/${file}`, import.meta.url), 'utf8'), context);
+  }
   return { actions: context.window.workspaceActions, invoked, written };
 }
 
@@ -172,4 +182,161 @@ test('reconnecting needs a mailbox to reconnect', async () => {
   const ws = workspace(async () => ({ data: { consentUrl: CONSENT }, error: null }));
   await assert.rejects(ws.actions.reconnectMailbox(''), /mailbox/i);
   assert.equal(ws.invoked.length, 0);
+});
+
+/* ── Sending ──────────────────────────────────────────────────────────── */
+
+const SEND = {
+  connectionId: 'c0000000-0000-4000-8000-00000000000b', mode: 'new', messageId: null,
+  to: ['ana@northline.example'], cc: [], bcc: [], subject: 'Kick-off', html: '<p>Hi</p>',
+  importance: 'high', attachments: []
+};
+
+test('sending hands send-mail the request, and its answer back', async () => {
+  const ws = workspace(async () => ({ data: { ok: true, sent: true, threadId: 't1', stored: true }, error: null }));
+  const result = await ws.actions.sendMail(SEND);
+  assert.equal(result.threadId, 't1');
+  assert.deepEqual(ws.invoked, [{ name: 'send-mail', body: SEND }]);
+});
+
+test('a mailbox that needs reconnecting says so, in a way the view can act on', async () => {
+  const ws = workspace(async () => httpError(409, {
+    error: 'This mailbox needs reconnecting before it can send from the workspace.', reconnect: true
+  }));
+  await assert.rejects(ws.actions.sendMail(SEND), (err) => {
+    assert.match(err.message, /needs reconnecting/);
+    assert.equal(err.reconnect, true);
+    assert.equal(err.draftSaved, false);
+    return true;
+  });
+});
+
+test('a send whose answer never arrived may have gone out, and says so', async () => {
+  const ws = workspace(async () => unreachable);
+  await assert.rejects(ws.actions.sendMail(SEND), (err) => {
+    assert.equal(err.unknownOutcome, true);
+    assert.match(err.message, /may have been sent/i);
+    assert.match(err.message, /Sent/, 'it says where to look before trying again');
+    return true;
+  });
+
+  const timedOut = workspace(async () => httpError(504));
+  await assert.rejects(timedOut.actions.sendMail(SEND), (err) => {
+    assert.equal(err.unknownOutcome, true, 'a gateway timeout without our answer is not a refusal');
+    return true;
+  });
+});
+
+test('a refusal from send-mail itself is a refusal, not an unknown', async () => {
+  const ws = workspace(async () => httpError(400, { error: 'Add a subject' }));
+  await assert.rejects(ws.actions.sendMail(SEND), (err) => {
+    assert.equal(err.unknownOutcome, false);
+    assert.equal(err.message, 'Add a subject');
+    return true;
+  });
+});
+
+test('a send that failed after its draft existed says where the draft is', async () => {
+  const ws = workspace(async () => httpError(502, {
+    error: 'The message was not sent: Graph → 503 It is saved in Drafts in Outlook.', draftSaved: true
+  }));
+  await assert.rejects(ws.actions.sendMail(SEND), (err) => {
+    assert.match(err.message, /Drafts/);
+    assert.equal(err.draftSaved, true);
+    assert.equal(err.reconnect, false);
+    return true;
+  });
+});
+
+/* ── Attachments ──────────────────────────────────────────────────────── */
+
+function storageStub(error = null) {
+  const calls = [];
+  return {
+    calls,
+    storage: (bucket) => ({
+      upload: async (path, file, options) => {
+        calls.push({ bucket, what: 'upload', path, options: { ...options } });
+        return { data: error ? null : { path }, error };
+      },
+      remove: async (paths) => {
+        calls.push({ bucket, what: 'remove', paths: [...paths] });
+        return { data: [], error };
+      }
+    })
+  };
+}
+
+test('an attachment is stored under your own id, a fresh folder and a plain name', async () => {
+  const stub = storageStub();
+  const ws = workspace(async () => ({}), { storage: stub.storage });
+  const ref = await ws.actions.uploadMailAttachment({ name: 'Quarterly Report (Final).pdf', size: 1234, type: 'application/pdf' });
+
+  assert.equal(stub.calls.length, 1);
+  assert.equal(stub.calls[0].bucket, 'mail-attachments');
+  assert.match(stub.calls[0].path, new RegExp(`^${USER}/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/Quarterly-Report-Final\\.pdf$`));
+  assert.equal(stub.calls[0].options.upsert, false, 'an upload never replaces another');
+  assert.deepEqual({ ...ref }, {
+    path: stub.calls[0].path, name: 'Quarterly Report (Final).pdf', size: 1234, contentType: 'application/pdf'
+  }, 'the name a recipient sees stays as it was');
+});
+
+test('two uploads of the same file never share a path', async () => {
+  const stub = storageStub();
+  const ws = workspace(async () => ({}), { storage: stub.storage });
+  const one = await ws.actions.uploadMailAttachment({ name: 'a.pdf', size: 1, type: '' });
+  const two = await ws.actions.uploadMailAttachment({ name: 'a.pdf', size: 1, type: '' });
+  assert.notEqual(one.path, two.path);
+  assert.equal(one.contentType, 'application/octet-stream');
+});
+
+test('an empty file is refused before anything is uploaded', async () => {
+  const stub = storageStub();
+  const ws = workspace(async () => ({}), { storage: stub.storage });
+  await assert.rejects(ws.actions.uploadMailAttachment({ name: 'empty.txt', size: 0, type: 'text/plain' }), /empty/);
+  assert.equal(stub.calls.length, 0);
+});
+
+test('a refused upload says which file it was', async () => {
+  const stub = storageStub({ message: 'new row violates row-level security policy' });
+  const ws = workspace(async () => ({}), { storage: stub.storage });
+  await assert.rejects(ws.actions.uploadMailAttachment({ name: 'a.pdf', size: 5, type: 'application/pdf' }), /a\.pdf/);
+});
+
+test('removing attachments removes exactly those, and nothing when there are none', async () => {
+  const stub = storageStub();
+  const ws = workspace(async () => ({}), { storage: stub.storage });
+  await ws.actions.removeMailAttachments([`${USER}/x/a.pdf`, '', null]);
+  await ws.actions.removeMailAttachments([]);
+  assert.deepEqual(stub.calls, [{ bucket: 'mail-attachments', what: 'remove', paths: [`${USER}/x/a.pdf`] }]);
+});
+
+/* ── Signatures ───────────────────────────────────────────────────────── */
+
+test('a signature is saved once per mailbox, cleaned first', async () => {
+  const purify = { sanitize: (html) => String(html).replace(/<script[\s\S]*?<\/script>/gi, '') };
+  const ws = workspace(async () => ({}), { purify });
+  await ws.actions.saveSignature({ connectionId: null, html: '<p>Cassian</p><script>alert(1)</script>', useOnNew: true, useOnReplies: false });
+  assert.deepEqual(ws.written, [{
+    table: 'mail_signatures', what: 'upsert',
+    change: { employee_id: 'emp-1', connection_id: null, html: '<p>Cassian</p>', use_on_new: true, use_on_replies: false },
+    options: { onConflict: 'employee_id,connection_id' }
+  }]);
+});
+
+test('a signature is cleaned with the same setting as the editor', async () => {
+  const seen = [];
+  const purify = { sanitize: (html, config) => { seen.push(config); return String(html); } };
+  const ws = workspace(async () => ({}), { purify });
+  await ws.actions.saveSignature({ connectionId: null, html: '<p>Cassian</p>' });
+  assert.equal(seen.length, 1);
+  assert.ok(seen[0].FORBID_ATTR.includes('class'));
+  assert.ok(seen[0].FORBID_ATTR.includes('popover'));
+  assert.equal(seen[0].ALLOW_DATA_ATTR, false);
+});
+
+test('a signature is not saved uncleaned', async () => {
+  const ws = workspace(async () => ({}), { purify: undefined });
+  await assert.rejects(ws.actions.saveSignature({ connectionId: null, html: '<p>x</p>' }), /editor/i);
+  assert.equal(ws.written.length, 0);
 });

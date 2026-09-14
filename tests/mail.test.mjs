@@ -227,3 +227,187 @@ test('properties that can run code, or that the list does not know, are refused'
   assert.equal(styleAllowed('', 'red', blocked), false);
   assert.equal(styleAllowed('color', '', blocked), false);
 });
+
+/* ── Compose ─────────────────────────────────────────────────────────── */
+
+test('answers carry one Re: or Fw:, however many the subject had', () => {
+  assert.equal(model.subjectFor('reply', 'Homepage'), 'Re: Homepage');
+  assert.equal(model.subjectFor('replyAll', 'RE: Homepage'), 'RE: Homepage');
+  assert.equal(model.subjectFor('forward', 'Re: Homepage'), 'Fw: Re: Homepage');
+  assert.equal(model.subjectFor('forward', 'FW: Homepage'), 'FW: Homepage');
+  assert.equal(model.subjectFor('forward', 'Fwd: Homepage'), 'Fwd: Homepage');
+  assert.equal(model.subjectFor('new', '  Kick-off  '), 'Kick-off');
+  assert.equal(model.subjectFor('reply', ''), 'Re:');
+});
+
+const CONVERSATION = [
+  { id: 'm1', email: 'ana@northline.example', outbound: false, to: ['hello@veyago.cloud'], cc: [] },
+  { id: 'm2', email: 'hello@veyago.cloud', outbound: true, to: ['ana@northline.example'], cc: [] },
+  { id: 'm3', email: 'ben@northline.example', outbound: false, to: ['hello@veyago.cloud'], cc: ['ana@northline.example'] },
+  { id: 'm4', email: 'hello@veyago.cloud', outbound: true, to: ['ben@northline.example'], cc: [] }
+];
+
+test('a reply answers whoever wrote last from outside', () => {
+  const answer = model.answerFor(CONVERSATION, 'reply', ['hello@veyago.cloud']);
+  assert.equal(answer.messageId, 'm3');
+  assert.deepEqual([...answer.to], ['ben@northline.example']);
+  assert.deepEqual([...answer.cc], []);
+});
+
+test('reply all adds everyone the message went to, never the mailbox itself, and nobody twice', () => {
+  const thread = [{
+    id: 'm1', email: 'ben@northline.example', outbound: false,
+    to: ['Hello@Veyago.cloud', 'ops@northline.example'],
+    cc: ['ana@northline.example', 'BEN@northline.example', 'ops@northline.example', 'cdrefke@veyago.cloud']
+  }];
+  const answer = model.answerFor(thread, 'replyAll', ['hello@veyago.cloud', 'cdrefke@veyago.cloud']);
+  assert.deepEqual([...answer.to], ['ben@northline.example']);
+  assert.deepEqual([...answer.cc], ['ops@northline.example', 'ana@northline.example']);
+});
+
+test('on a conversation that is only ours, an answer goes back to whoever we wrote to', () => {
+  const thread = [{ id: 'm1', email: 'hello@veyago.cloud', outbound: true, to: ['ana@northline.example', 'hello@veyago.cloud'], cc: ['ops@northline.example'] }];
+  assert.deepEqual([...model.answerFor(thread, 'reply', ['hello@veyago.cloud']).to], ['ana@northline.example']);
+  const all = model.answerFor(thread, 'replyAll', ['hello@veyago.cloud']);
+  assert.deepEqual([...all.to], ['ana@northline.example']);
+  assert.deepEqual([...all.cc], ['ops@northline.example']);
+});
+
+test('a forward sends on the newest message to nobody yet; nothing to answer is nothing', () => {
+  const forward = model.answerFor(CONVERSATION, 'forward', ['hello@veyago.cloud']);
+  assert.equal(forward.messageId, 'm4', 'the newest message carries the whole exchange below it');
+  assert.deepEqual([...forward.to], []);
+  assert.deepEqual([...forward.cc], []);
+  assert.equal(model.answerFor([], 'reply', []), null);
+  assert.equal(model.answerFor(null, 'reply', []), null);
+});
+
+test('an answer can be to any message in the conversation, not only the newest from outside', () => {
+  /* We wrote to Ana and Ben; Ana replied to all; then Ben's out-of-office came in. */
+  const thread = [
+    { id: 'm1', email: 'hello@veyago.cloud', outbound: true, to: ['ana@northline.example', 'ben@northline.example'], cc: [] },
+    { id: 'm2', email: 'ana@northline.example', outbound: false, to: ['hello@veyago.cloud'], cc: ['ben@northline.example'] },
+    { id: 'm3', email: 'ben@northline.example', outbound: false, to: ['hello@veyago.cloud'], cc: [] }
+  ];
+  const own = ['hello@veyago.cloud'];
+  const toAna = model.answerFor(thread, 'replyAll', own, 'm2');
+  assert.equal(toAna.messageId, 'm2');
+  assert.deepEqual([...toAna.to], ['ana@northline.example']);
+  assert.deepEqual([...toAna.cc], ['ben@northline.example'], 'Ana\'s reply-all keeps Ben');
+  assert.equal(model.answerFor(thread, 'forward', own, 'm1').messageId, 'm1');
+  assert.equal(model.answerFor(thread, 'reply', own, 'm9'), null, 'a message that is not in the conversation is not guessed at');
+  assert.equal(model.answerFor(thread, 'replyAll', own).messageId, 'm3', 'without a choice, the newest from outside');
+});
+
+test('names with commas in them, quotes, mailto: and stray brackets still give their address', () => {
+  const parsed = model.parseAddresses('Lima, Ana <ana@northline.example>; Hart, Ben <ben@northline.example>');
+  assert.deepEqual([...parsed.valid], ['ana@northline.example', 'ben@northline.example']);
+  assert.deepEqual([...parsed.invalid], []);
+  assert.deepEqual([...model.parseAddresses('"ops@northline.example"').valid], ['ops@northline.example']);
+  assert.deepEqual([...model.parseAddresses('mailto:ops@northline.example').valid], ['ops@northline.example']);
+  assert.deepEqual([...model.parseAddresses('ops@northline.example>').valid], ['ops@northline.example']);
+  assert.deepEqual([...model.parseAddresses("'Ana Lima' <ana@northline.example>, ops@northline.example").valid],
+    ['ana@northline.example', 'ops@northline.example']);
+});
+
+test('a subject already answered in another language keeps its prefix', () => {
+  assert.equal(model.subjectFor('reply', 'AW: Angebot'), 'AW: Angebot');
+  assert.equal(model.subjectFor('replyAll', 'SV: Offert'), 'SV: Offert');
+  assert.equal(model.subjectFor('reply', 'Antw: Vraag'), 'Antw: Vraag');
+  assert.equal(model.subjectFor('forward', 'WG: Angebot'), 'WG: Angebot');
+  assert.equal(model.subjectFor('forward', 'TR: Devis'), 'TR: Devis');
+  assert.equal(model.subjectFor('forward', 'AW: Angebot'), 'Fw: AW: Angebot', 'forwarding an answer is still a forward');
+  assert.equal(model.subjectFor('reply', 'Return policy'), 'Re: Return policy', 'a word that starts like a prefix is not one');
+});
+
+test('a message too big to send is said before sending', () => {
+  const ok = { mode: 'new', connectionId: STUDIO, to: ['ana@northline.example'], subject: 'Kick-off', text: 'Hi' };
+  assert.equal(model.sendProblem({ ...ok, htmlBytes: model.LIMITS.htmlBytes }), null);
+  assert.equal(model.sendProblem({ ...ok, htmlBytes: model.LIMITS.htmlBytes + 1 }), 'The message is too long.');
+});
+
+test('what the editor keeps from pasted HTML is one setting, used for signatures too', () => {
+  const config = model.PURIFY_CONFIG;
+  for (const attr of ['class', 'id', 'contenteditable', 'popover', 'tabindex', 'autofocus']) {
+    assert.ok(config.FORBID_ATTR.includes(attr), attr);
+  }
+  for (const tag of ['style', 'form', 'input', 'button', 'dialog', 'template']) {
+    assert.ok(config.FORBID_TAGS.includes(tag), tag);
+  }
+  assert.equal(config.ALLOW_DATA_ATTR, false, 'a pasted data-action must not become a workspace button');
+});
+
+test('typed and pasted addresses are split, named ones unwrapped, bad ones kept apart', () => {
+  const parsed = model.parseAddresses('Ana Lima <ana@northline.example>, ops@northline.example; not-an-address\nben@northline.example BEN@northline.example');
+  assert.deepEqual([...parsed.valid], ['ana@northline.example', 'ops@northline.example', 'ben@northline.example']);
+  assert.deepEqual([...parsed.invalid], ['not-an-address']);
+  assert.deepEqual([...model.parseAddresses('').valid], []);
+  assert.deepEqual([...model.parseAddresses('  ,; \n').invalid], []);
+  assert.equal(model.isAddress('ana@northline.example'), true);
+  assert.equal(model.isAddress('ana@localhost'), false);
+});
+
+test('an upload is stored under a plain name that keeps its extension', () => {
+  assert.equal(model.storageName('Quarterly Report (Final).pdf'), 'Quarterly-Report-Final.pdf');
+  assert.equal(model.storageName('résumé.docx'), 'resume.docx');
+  assert.equal(model.storageName('../../etc/passwd'), 'etc-passwd');
+  assert.equal(model.storageName('...'), 'attachment');
+  assert.equal(model.storageName('日本語.pdf'), 'attachment.pdf');
+  assert.equal(model.storageName('archive.tar.gz'), 'archive.tar.gz');
+  assert.equal(model.storageName('PHOTO.JPG'), 'PHOTO.jpg');
+  const long = model.storageName('a'.repeat(300) + '.pdf');
+  assert.equal(long.length, 200);
+  assert.ok(long.endsWith('.pdf'));
+  for (const name of ['Quarterly Report (Final).pdf', '../../etc/passwd', '...', '', null, '%2e%2e']) {
+    assert.match(model.storageName(name), /^[A-Za-z0-9._-]{1,200}$/, String(name));
+    assert.doesNotMatch(model.storageName(name), /^\.+$/, String(name));
+    assert.doesNotMatch(model.storageName(name), /%/, String(name));
+  }
+});
+
+test('attachments are checked against what one message can carry, before uploading', () => {
+  const MB = 1024 * 1024;
+  assert.equal(model.attachmentProblem([], [{ name: 'a.pdf', size: MB }]), null);
+  assert.match(model.attachmentProblem([{ name: 'x', size: 20 * MB }], [{ name: 'big.mov', size: 6 * MB }]), /25 MB/);
+  assert.match(model.attachmentProblem(Array.from({ length: 20 }, (_, i) => ({ name: `f${i}`, size: 1 })), [{ name: 'one-more', size: 1 }]), /20 attachments/);
+  assert.match(model.attachmentProblem([], [{ name: 'empty.txt', size: 0 }]), /empty\.txt/);
+});
+
+test('a mailbox\'s own signature wins over the one for every mailbox, even when it is switched off', () => {
+  const studio = { connection_id: STUDIO, html: '<p>Studio</p>', use_on_new: true, use_on_replies: false };
+  const every = { connection_id: null, html: '<p>Everywhere</p>', use_on_new: true, use_on_replies: true };
+  assert.equal(model.signatureFor([every, studio], STUDIO, 'new'), '<p>Studio</p>');
+  assert.equal(model.signatureFor([every, studio], STUDIO, 'reply'), null, 'off for replies: no falling back to the general one');
+  assert.equal(model.signatureFor([every, studio], PERSONAL, 'forward'), '<p>Everywhere</p>');
+  assert.equal(model.signatureFor([], STUDIO, 'new'), null);
+  assert.equal(model.signatureFor(null, STUDIO, 'new'), null);
+  assert.equal(model.signatureFor([{ connection_id: null, html: '  ', use_on_new: true, use_on_replies: true }], STUDIO, 'new'), null);
+});
+
+test('what would stop a send is said before sending, in send-mail\'s words', () => {
+  const ok = { mode: 'new', connectionId: STUDIO, to: ['ana@northline.example'], cc: [], bcc: [], subject: 'Kick-off', text: 'Hi', attachments: [] };
+  assert.equal(model.sendProblem(ok), null);
+  assert.match(model.sendProblem({ ...ok, connectionId: '' }), /mailbox/);
+  assert.match(model.sendProblem({ ...ok, to: [] }), /recipient/);
+  assert.match(model.sendProblem({ ...ok, to: [], cc: ['x@y.example'] }), /recipient/, 'a new message needs someone in To');
+  assert.equal(model.sendProblem({ ...ok, mode: 'reply', to: [], cc: ['x@y.example'], subject: '' }), null, 'an answer only needs someone');
+  assert.match(model.sendProblem({ ...ok, mode: 'forward', to: [], cc: ['x@y.example'] }), /recipient/);
+  assert.match(model.sendProblem({ ...ok, subject: '  ' }), /subject/);
+  assert.match(model.sendProblem({ ...ok, subject: 'x'.repeat(999) }), /too long/);
+  assert.match(model.sendProblem({ ...ok, text: '  ' }), /empty/);
+  assert.equal(model.sendProblem({ ...ok, text: '', attachments: [{ name: 'a.pdf' }] }), null);
+  assert.equal(model.sendProblem({ ...ok, text: '', hasImage: true }), null);
+  assert.match(model.sendProblem({ ...ok, to: Array.from({ length: 501 }, (_, i) => `p${i}@x.example`) }), /500/);
+});
+
+test('suggestions come from the CRM first, then from conversations, each address once and never our own', () => {
+  const book = model.addressBook(
+    [{ name: 'Ana Lima', email: 'ana@northline.example' }, { name: 'No mail', email: '' }],
+    [{ sender: 'Ana', email: 'ANA@northline.example' }, { sender: 'Ben', email: 'ben@northline.example' },
+     { sender: 'Studio', email: 'hello@veyago.cloud' }],
+    ['hello@veyago.cloud']);
+  assert.deepEqual([...book].map(entry => ({ ...entry })), [
+    { name: 'Ana Lima', email: 'ana@northline.example' },
+    { name: 'Ben', email: 'ben@northline.example' }
+  ]);
+});

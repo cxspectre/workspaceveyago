@@ -30,6 +30,8 @@
      or one that failed since the last load; email bodies already sanitised.
      Replaced, never edited, like everything else the view keeps. */
   let expanded = Object.freeze({});
+  /* Whether the reading pane has the whole width, folders and list set aside. */
+  let readerExpanded = false;
   let markingRead = Object.freeze({});
   let readFailed = Object.freeze({});
   let renderedBodies = Object.freeze({});
@@ -115,7 +117,9 @@
          to grant a permission added since, say — is a click from any view. */
       : canReconnect() ? `<span class="eyebrow">CONNECTIONS</span>${boxes.map(connectionRow).join('')}` : '';
 
-    return `<aside class="mail-folders"><div class="mailbox-switcher"><span class="eyebrow">MAILBOXES</span>${all}${each}</div>`
+    const newMessage = `<button class="btn btn-primary mail-new" data-action="compose">${icon('plus')}`
+      + `${mailComposer.isOpen() ? 'Continue draft' : 'New message'}</button>`;
+    return `<aside class="mail-folders">${newMessage}<div class="mailbox-switcher"><span class="eyebrow">MAILBOXES</span>${all}${each}</div>`
       /* A div, not <nav>: the sidebar's `nav a` rules would stack every folder
          into an icon-over-label tile. */
       + `${select}<div class="mail-folder-list" role="navigation" aria-label="Folders">${folders}</div><div class="mail-folder-foot">${foot}</div></aside>`;
@@ -165,7 +169,7 @@
     return renderedBodies[key];
   }
 
-  function messageCard(message, open, newest) {
+  function messageCard(message, open, newest, threadId) {
     const when = (message.date === 'Today' ? '' : esc(message.date) + ' · ') + esc(message.time);
     const avatar = `<div class="avatar${message.outbound ? ' owner' : ''}">${esc(message.initial)}</div>`;
     if (!open) {
@@ -181,7 +185,12 @@
     const header = newest
       ? `<div class="mail-message-head">${head}</div>`
       : `<button type="button" class="mail-message-head" data-mail-expand="${esc(message.id)}" aria-expanded="true">${head}</button>`;
-    return `<article class="mail-message">${header}<div class="mail-body">${bodyHtml(message)}</div></article>`;
+    /* Answer this message — not whichever came in last, which may be an
+       out-of-office or a bounce. */
+    const answers = [['reply', 'Reply'], ['replyAll', 'Reply all'], ['forward', 'Forward']].map(([mode, label]) =>
+      `<button type="button" class="text-btn" data-mail-answer="${mode}" data-thread-id="${esc(threadId)}" data-message-id="${esc(message.id)}">${label}</button>`).join('');
+    return `<article class="mail-message">${header}<div class="mail-body">${bodyHtml(message)}</div>`
+      + `<div class="mail-message-actions">${answers}</div></article>`;
   }
 
   function conversation(thread) {
@@ -196,7 +205,7 @@
     if (!messages) return '<p class="quiet-text mail-loading">Loading the conversation…</p>';
     if (!messages.length) return '<p class="quiet-text">This conversation has no messages yet.</p>';
     const newest = messages.length - 1;
-    return messages.map((m, i) => messageCard(m, i === newest || Boolean(expanded[m.id]), i === newest)).join('');
+    return messages.map((m, i) => messageCard(m, i === newest || Boolean(expanded[m.id]), i === newest, thread.id)).join('');
   }
 
   function related(thread) {
@@ -209,8 +218,27 @@
       + '</div>';
   }
 
-  function reader(thread, boxes, listLength) {
+  /* A draft with nowhere else to be shown: a new message, or an answer whose
+     conversation has left the list — archived in Outlook, or past the newest
+     the list holds — rather than a draft nobody can get back to. */
+  const draftWithoutThread = () => mailComposer.isOpen()
+    && (mailComposer.mode() === 'new' || !threadById(mailComposer.threadId()));
+
+  function expandButton(expanded) {
+    const label = expanded ? 'Show folders and conversations' : 'Use the full width';
+    return `<button class="icon-btn" data-mail-expand-reader aria-pressed="${expanded ? 'true' : 'false'}"`
+      + ` title="${label}" aria-label="${label}">${expanded ? '⤡' : '⤢'}</button>`;
+  }
+
+  function reader(thread, boxes, listLength, expanded) {
     if (!thread) {
+      /* A new message is written where a conversation would be read. */
+      if (draftWithoutThread()) {
+        const note = mailComposer.mode() === 'new' ? ''
+          : '<small class="quiet-text">This conversation is no longer in Inbox or Sent. The answer still goes to it.</small>';
+        return `<div class="reader reader-compose"><div class="reader-toolbar"><span>${note}</span><div class="reader-tools">${expandButton(expanded)}</div></div>`
+          + '<div class="reader-content"><div data-composer-slot></div></div></div>';
+      }
       return `<div class="reader reader-empty">${listLength
         ? empty('Select a conversation', 'It opens here, next to the list.')
         : empty('Nothing to read here', 'Try another folder or mailbox.')}</div>`;
@@ -219,13 +247,17 @@
     const hasTicket = Boolean(thread.ticketId && tickets.some(t => t.uuid === thread.ticketId));
     const starLabel = thread.starred ? 'Unstar conversation' : 'Star conversation';
     return `<div class="reader" data-thread-id="${esc(thread.id)}"><div class="reader-toolbar">`
-      + `<span>${box ? pill(box.address, box.kind === 'personal' ? 'purple' : 'blue') : ''}</span><div class="reader-tools">`
+      + `<span>${box ? pill(box.address, box.kind === 'personal' ? 'purple' : 'blue') : ''}</span><div class="reader-tools">${expandButton(expanded)}`
       + `<button class="icon-btn" data-mail-unread="${esc(thread.id)}" title="Mark as unread" aria-label="Mark as unread">${icon('mail')}</button>`
       + `<button class="icon-btn${thread.starred ? ' starred' : ''}" data-mail-star="${esc(thread.id)}" aria-pressed="${thread.starred ? 'true' : 'false'}" title="${starLabel}" aria-label="${starLabel}">${thread.starred ? '★' : '☆'}</button>`
       + `</div></div><div class="reader-content"><h2>${esc(thread.subject)}</h2>`
       + (thread.count > 1 ? `<small class="mail-thread-count">${thread.count} messages</small>` : '')
+      /* An answer being written sits above the conversation, where it is seen. */
+      + (mailComposer.threadId() === thread.id ? '<div data-composer-slot></div>' : '')
       + `<div class="mail-conversation">${conversation(thread)}</div><div class="mail-actions">`
-      + `<button class="btn btn-primary" data-mail-reply="${esc(thread.id)}">${icon('reply')}Reply</button>`
+      + `<button class="btn btn-primary" data-mail-answer="reply" data-thread-id="${esc(thread.id)}">${icon('reply')}Reply</button>`
+      + `<button class="btn" data-mail-answer="replyAll" data-thread-id="${esc(thread.id)}">Reply all</button>`
+      + `<button class="btn" data-mail-answer="forward" data-thread-id="${esc(thread.id)}">${icon('arrow')}Forward</button>`
       + `<button class="btn" data-action="email-ticket" data-thread-id="${esc(thread.id)}">${icon('tickets')}${hasTicket ? 'Open ticket' : 'Create ticket'}</button>`
       + `</div>${related(thread)}</div></div>`;
   }
@@ -246,10 +278,12 @@
     selectedMail = shown ? mails.indexOf(shown) : 0;       // app.js's contact action still reads it
     if (shown && shown.unread) markRead(shown);
 
-    return titlebar('Your conversations.', 'Every mailbox you use, in one place.',
-        `<button class="btn btn-primary" data-action="compose">${icon('plus')}Compose</button>`)
-      + `<section class="panel mail-workspace">${mailboxColumn(current, boxes)}`
-      + `${threadList(current, list, boxes, shown && shown.id)}${reader(shown, boxes, list.length)}</section>`;
+    /* Full screen, so no page heading: the one thing it carried, writing a new
+       message, is at the top of the folders. The full width is only kept while
+       there is something to read or write in it. */
+    const expanded = readerExpanded && Boolean(shown || draftWithoutThread());
+    return `<section class="panel mail-workspace${expanded ? ' reader-expanded' : ''}">${mailboxColumn(current, boxes)}`
+      + `${threadList(current, list, boxes, shown && shown.id)}${reader(shown, boxes, list.length, expanded)}</section>`;
   };
 
   /* render() rebuilds #main with innerHTML, which throws away where the list
@@ -260,6 +294,7 @@
      set here rather than inside mailView, where it arrived one render late. */
   const baseRender = render;
   render = function () {
+    document.body.classList.toggle('mail-mode', page === 'mail');
     if (page !== 'mail') return baseRender();
     mailFolder = FOLDER_LABELS[M.parseMailRoute(routeParts).folder];
     const list = document.querySelector('.conversation-list');
@@ -269,7 +304,12 @@
       reader: pane ? pane.scrollTop : 0,
       thread: pane ? pane.dataset.threadId : null
     };
-    baseRender();
+    mailComposer.beforeRender();
+    try {
+      baseRender();
+    } finally {
+      mailComposer.afterRender();
+    }
     const nextList = document.querySelector('.conversation-list');
     const nextPane = document.querySelector('.reader');
     if (nextList) nextList.scrollTop = before.list;
@@ -349,19 +389,110 @@
       });
   }
 
-  /* Still the compose dialog until inline compose replaces it. The reply goes
-     to whoever last wrote from outside; on a conversation that is only ours,
-     to whoever we last wrote to — never back to ourselves. */
-  function replyTo(threadId) {
+  /* ── Writing ───────────────────────────────────────────────────────── */
+
+  /* Addresses that are us: never among an answer's recipients, never offered
+     as a suggestion. */
+  const ownAddresses = () => mailboxes().map(b => b.address)
+    .concat(window.workspaceSession && workspaceSession.employee && workspaceSession.employee.email
+      ? [workspaceSession.employee.email] : []);
+
+  function composerContext() {
+    return {
+      boxes: mailboxes(),
+      book: M.addressBook(contacts, mails, ownAddresses()),
+      canReconnect: canReconnect(),
+      onSent: afterSend,
+      onClose: () => { if (page === 'mail') render(); }
+    };
+  }
+
+  /* Takes the person to the draft: the conversation it answers, or the reading
+     pane of the mailbox they were in for a new message. */
+  function showDraft() {
+    const route = M.parseMailRoute(page === 'mail' ? routeParts : []);
+    const thread = mailComposer.threadId() ? threadById(mailComposer.threadId()) : null;
+    navigate(M.mailRoute({
+      mailbox: route.mailbox,
+      folder: thread ? thread.folder : route.folder,
+      threadId: thread ? thread.id : null
+    }));
+    /* After the render has put the draft on screen. Not requestAnimationFrame:
+       a tab in the background may never run it. */
+    setTimeout(() => mailComposer.focus(), 0);
+  }
+
+  /* Every "write an email" in the workspace — the Compose button, a contact's
+     address — opens the draft here, in the reading pane, not in a window. A
+     draft in progress is shown rather than replaced. */
+  compose = function (to = '', subject = '', body = '') {
+    const asked = Boolean(to || subject || body);
+    if (mailComposer.isOpen() && (!asked || mailComposer.hasContent())) {
+      if (asked) toast('Finish or discard the message you are writing first.');
+      showDraft();
+      return;
+    }
+    if (!live()) { toast('Mail is still loading.'); return; }
+    const boxes = mailboxes();
+    if (!boxes.length) { toast('Connect a mailbox to send mail from the workspace.'); return; }
+    const route = M.parseMailRoute(page === 'mail' ? routeParts : []);
+    const from = boxes.find(b => b.id === route.mailbox) || boxes[0];
+    const opened = mailComposer.open({
+      mode: 'new', connectionId: from.id, to: M.parseAddresses(to).valid, subject, bodyText: body
+    }, composerContext());
+    if (!opened) { toast('Wait for the message being sent to finish.'); return; }
+    showDraft();
+  };
+
+  /* messageId: answer that message; without it, the newest from outside. */
+  function answer(mode, threadId, messageId) {
     const thread = threadById(threadId);
     if (!thread) return;
-    const messages = (live() && workspaceStore.threadBody(thread.id)) || [];
-    const lastInbound = messages.filter(m => !m.outbound).slice(-1)[0];
-    const lastMessage = messages.slice(-1)[0];
-    const address = lastInbound ? lastInbound.email : (lastMessage && lastMessage.to[0]) || thread.email;
-    const subject = /^re:/i.test(thread.subject) ? thread.subject : 'Re: ' + thread.subject;
-    compose(address, subject);
+    if (mailComposer.isOpen() && (mailComposer.hasContent() || mailComposer.isSending())) {
+      toast(mailComposer.isSending() ? 'Wait for the message being sent to finish.' : 'Finish or discard the message you are writing first.');
+      showDraft();
+      return;
+    }
+    const messages = live() ? workspaceStore.threadBody(thread.id) : null;
+    if (!messages) { toast('The conversation is still loading. Try again in a moment.'); return; }
+    const recipients = M.answerFor(messages, mode, ownAddresses(), messageId || undefined);
+    if (!recipients) return;
+    /* The subject of the message being answered, not the list's label for it:
+       a conversation without one is shown as "(no subject)", which is not a
+       subject to reply to. */
+    const original = messages.find(m => m.id === recipients.messageId);
+    const when = original ? `${original.date === 'Today' ? '' : `${original.date} `}${original.time}` : '';
+    const opened = mailComposer.open({
+      mode, connectionId: thread.mailboxId, threadId: thread.id, messageId: recipients.messageId,
+      to: recipients.to, cc: recipients.cc,
+      subject: M.subjectFor(mode, original ? original.subject : thread.subject),
+      about: original ? `${mode === 'forward' ? 'Forwarding' : 'Replying to'} ${original.sender} · ${when}` : ''
+    }, composerContext());
+    if (!opened) { toast('Wait for the message being sent to finish.'); return; }
+    render();
+    setTimeout(() => mailComposer.focus(), 0);
   }
+
+  /* Sent: re-read what changed, and show the conversation the message is in. */
+  function afterSend(result, sent) {
+    toast(sent.from ? `Sent from ${sent.from}.` : 'Sent.');
+    Promise.resolve(workspaceStore.reload()).then(() => {
+      if (page !== 'mail') return;
+      const thread = result && result.threadId ? threadById(result.threadId) : null;
+      if (!thread) {
+        if (!(result && result.threadId)) toast('Sent. It shows in the conversation after the next sync.');
+        render();
+        return;
+      }
+      navigate(M.mailRoute({ mailbox: M.parseMailRoute(routeParts).mailbox, folder: thread.folder, threadId: thread.id }));
+    });
+  }
+
+  window.addEventListener('beforeunload', e => {
+    if (!mailComposer.hasContent()) return;
+    e.preventDefault();
+    e.returnValue = '';
+  });
 
   /* Reconnecting asks Microsoft again, with the permissions the app has now: a
      permission added since a mailbox was connected (Mail.ReadWrite) arrives
@@ -407,8 +538,18 @@
     if (star) { e.preventDefault(); toggleStar(star); return; }
     const unread = e.target.closest('[data-mail-unread]');
     if (unread) { e.preventDefault(); markUnread(unread); return; }
-    const reply = e.target.closest('[data-mail-reply]');
-    if (reply) { e.preventDefault(); replyTo(reply.dataset.mailReply); return; }
+    if (e.target.closest('[data-mail-expand-reader]')) {
+      e.preventDefault();
+      readerExpanded = !readerExpanded;
+      render();
+      return;
+    }
+    const answerButton = e.target.closest('[data-mail-answer]');
+    if (answerButton) {
+      e.preventDefault();
+      answer(answerButton.dataset.mailAnswer, answerButton.dataset.threadId, answerButton.dataset.messageId);
+      return;
+    }
     const retry = e.target.closest('[data-mail-retry]');
     if (retry) { e.preventDefault(); workspaceStore.retryThread(retry.dataset.mailRetry); render(); return; }
     const toggle = e.target.closest('[data-mail-expand]');
@@ -418,6 +559,17 @@
       expanded = Object.freeze({ ...expanded, [id]: !expanded[id] });
       render();
     }
+  });
+
+  /* Escape gives the folders and the list back. */
+  document.addEventListener('keydown', e => {
+    if (e.key !== 'Escape' || page !== 'mail' || !readerExpanded) return;
+    if (document.querySelector('#modal').open) return;
+    /* Escape while writing belongs to the writing — a spellcheck or suggestion
+       popup — not to the layout. */
+    if (e.target.closest && e.target.closest('.composer')) return;
+    readerExpanded = false;
+    render();
   });
 
   document.addEventListener('change', e => {

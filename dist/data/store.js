@@ -10,7 +10,7 @@
  * Identity is preserved where the views depend on it:
  *   tickets    keyed by ticket number, which is already an integer in the
  *              database, so `tickets.find(t => t.id === Number(id))` still works
- *   projects   given a stable index, with the real uuid alongside as `.uuid`
+ *   projects   known by their uuid (projects-model.js): a position is not stable
  *   contacts   addressed by array position, as they already are
  *
  * Anything that writes goes through workspaceActions with the uuid, so the
@@ -32,28 +32,8 @@
 
   var state = { loaded: false, loading: false, error: null, overview: null, revenue: [], revenueMix: [] };
 
-  /* A project's tasks render as strings with a parallel list of checked
-     indices (taskRows / checkedTasks). Live tasks are rows, so the titles go
-     where the strings were and the uuids ride alongside in `taskIds` — which
-     is what lets a tick in the UI become an UPDATE. */
-  function shapeProject(p, tasks, index) {
-    var mine = tasks.filter(function (t) { return t.row.project_id === p.id; });
-    return {
-      id: index,
-      uuid: p.id,
-      name: p.name,
-      client: p.client,
-      initial: p.initial,
-      style: p.style,
-      progress: p.progress,
-      due: p.due,
-      status: p.status,
-      description: p.description,
-      tasks: mine.map(function (t) { return t.title; }),
-      taskIds: mine.map(function (t) { return t.id; }),
-      checked: mine.reduce(function (acc, t, i) { if (t.done) acc.push(i); return acc; }, [])
-    };
-  }
+  /* A project's shape — known by its id, with its tasks as titles, ticks and
+     ids — is projectsModel.shapeProject() in projects-model.js, which is tested. */
 
   /* Which events window the `events` array holds, as "from|to". The calendar
      can move on without the data: the reload at a date change can fail (a
@@ -104,7 +84,9 @@
         d.overview().catch(function () { return null; }),      // managers only
         d.revenueSeries(12).catch(function () { return []; }),  // ditto
         d.revenueMix(1).catch(function () { return []; }),
-        d.notes().catch(function () { return []; })
+        d.notes().catch(function () { return []; }),
+        /* Every company, contacts or not: what a typed client name is matched to. */
+        d.companies().catch(function () { return []; })
       ]);
 
       var liveTickets = results[0];
@@ -121,17 +103,15 @@
       state.revenue = results[9];
       state.revenueMix = results[10];
       var liveNotes = results[11];
+      state.companies = results[12];
 
-      /* Tasks for every project in one query rather than one per project. */
-      var allTasks = [];
-      for (var i = 0; i < liveProjects.length; i++) {
-        var rows = await d.projectTasks(liveProjects[i].id);
-        allTasks = allTasks.concat(rows);
-      }
+      /* Every project's tasks at once, rather than one project after another. */
+      var taskLists = await Promise.all(liveProjects.map(function (p) { return d.projectTasks(p.id); }));
+      var allTasks = [].concat.apply([], taskLists);
 
       swap(tickets, liveTickets);
-      swap(projects, liveProjects.map(function (p, idx) {
-        return shapeProject(p, allTasks, idx);
+      swap(projects, liveProjects.map(function (p) {
+        return projectsModel.shapeProject(p, allTasks);
       }));
       swap(contacts, liveContacts);
       swap(team, liveTeam);
@@ -156,8 +136,8 @@
           return t ? ['tickets', t.id] : null;
         }
         if (note.entityType === 'project') {
-          i = liveProjects.findIndex(function (p) { return p.id === note.entityId; });
-          return i < 0 ? null : ['projects', i];
+          return liveProjects.some(function (p) { return p.id === note.entityId; })
+            ? ['projects', note.entityId] : null;
         }
         if (note.entityType === 'contact') {
           i = liveContacts.findIndex(function (c) { return c.id === note.entityId; });
@@ -266,7 +246,11 @@
   window.workspaceStore = {
     get state() { return state; },
     load: load,
-    reload: function () { state.loaded = false; return load(); },
+    /* Everything again, after a write. The workspace stays "loaded" while it
+       runs, because what is on screen is still the last good data: a write made
+       meanwhile goes to the database rather than to the offline handlers, and a
+       reload that fails leaves the data in place instead of an empty page. */
+    reload: function () { return load(); },
 
     /* Views call this after a write so the screen and the database agree
        without a full reload. */
@@ -289,7 +273,7 @@
         return t ? { type: 'ticket', id: t.uuid } : null;
       }
       if (kind === 'projects') {
-        var p = projects[Number(id)];
+        var p = projectsModel.projectById(projects, String(id || ''));
         return p ? { type: 'project', id: p.uuid } : null;
       }
       if (kind === 'crm') {
@@ -318,7 +302,8 @@
       loadThread(threadId);
     },
 
-    projectByIndex: function (index) { return projects[index] || null; },
+    /* Projects are known by id (projects-model.js), never by position. */
+    projectById: function (id) { return projectsModel.projectById(projects, String(id || '')); },
     ticketByNumber: function (n) {
       return tickets.filter(function (t) { return t.id === Number(n); })[0] || null;
     }
