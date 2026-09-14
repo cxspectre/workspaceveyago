@@ -32,7 +32,14 @@
   function companies() {
     var seen = {};
     var loaded = (window.workspaceStore && window.workspaceStore.state.companies) || [];
-    var fromContacts = contacts.map(function (c) { return c.row && c.row.company; });
+    /* A contact's company counts only if it is one of the companies loaded:
+       the contacts embed does not leave deleted companies out. Until companies
+       have loaded at all, contacts are all there is. */
+    var known = {};
+    loaded.forEach(function (c) { known[c.id] = 1; });
+    var fromContacts = contacts
+      .map(function (c) { return c.row && c.row.company; })
+      .filter(function (co) { return co && (!loaded.length || known[co.id]); });
     return loaded.map(function (c) { return c.row || c; }).concat(fromContacts).filter(function (co) {
       if (!co || seen[co.id]) return false;
       seen[co.id] = 1;
@@ -52,6 +59,12 @@
     if (typeof toast === 'function') toast('Not saved: the workspace is still loading. Try again in a moment.');
   }
 
+  /* Moving through a closed select with the arrow keys fires a change for every
+     option passed (Chrome and Firefox on Windows and Linux). A status is saved
+     once the choice settles, not once per key. */
+  var STATUS_SETTLE_MS = 600;
+  var statusTimers = {};
+
   function resetSelect(select) {
     var shown = [].filter.call(select.options, function (o) { return o.defaultSelected; })[0];
     if (shown) select.value = shown.value;
@@ -67,9 +80,15 @@
     if (!live()) { box.checked = !box.checked; notYet(); return; }
 
     var project = window.workspaceStore.projectById(box.dataset.projectTask);
-    var index = Number(box.dataset.task);
-    var taskId = project && project.taskIds && project.taskIds[index];
-    if (!taskId) return;
+    /* By the task's own id: a background load can replace the list between the
+       render and the tick, and a position would then name another task. */
+    var taskId = box.dataset.taskId
+      || (project && project.taskIds && project.taskIds[Number(box.dataset.task)]);
+    if (!project || !taskId || project.taskIds.indexOf(taskId) < 0) {
+      box.checked = !box.checked;
+      fail(new Error('That task has changed since the page was drawn. Try again.'));
+      return;
+    }
 
     var wanted = box.checked;
     box.disabled = true;
@@ -99,12 +118,17 @@
       return;
     }
 
-    select.disabled = true;
-    window.workspaceStore
-      .after(window.workspaceActions.setProjectStatus(project.uuid, status))
-      .then(function () { if (typeof toast === 'function') toast('Status saved: ' + select.value); })
-      .catch(function (err) { select.value = project.status; fail(err); })
-      .then(function () { select.disabled = false; });
+    clearTimeout(statusTimers[project.uuid]);
+    statusTimers[project.uuid] = setTimeout(function () {
+      delete statusTimers[project.uuid];
+      var chosen = projectsModel.statusValue(select.value);
+      if (!chosen || select.value === project.status) return;
+      var label = select.value;
+      window.workspaceStore
+        .after(window.workspaceActions.setProjectStatus(project.uuid, chosen))
+        .then(function () { if (typeof toast === 'function') toast('Status saved: ' + label); })
+        .catch(function (err) { select.value = project.status; fail(err); });
+    }, STATUS_SETTLE_MS);
   }, true);
 
   /* "Create ticket" on a mail thread. app.js handled this by inventing a
@@ -190,6 +214,10 @@
     if (form.id === 'create-form') {
       e.stopImmediatePropagation();
       e.preventDefault();
+      /* One create per click. A double click, or Enter pressed twice, used to
+         look the company up twice before either insert landed: two companies,
+         two projects. */
+      if (form.dataset.pending === '1') return;
       var d = new FormData(form);
       var kind = form.dataset.kind;
       var name = String(d.get('name') || '').trim();
@@ -199,9 +227,14 @@
 
       var A = window.workspaceActions;
       var lower = function (s) { return String(s || '').trim().toLowerCase(); };
+      /* Two companies with the same name: the person chooses, not the first in
+         the alphabet. Thrown inside the chain, so it arrives as a message. */
       var companyNamed = function (n) {
-        var hit = projectsModel.findCompany(companies(), n);
-        return hit ? hit.id : null;
+        var matches = projectsModel.matchCompanies(companies(), n);
+        if (matches.length > 1) {
+          throw new Error('More than one company is called "' + String(n).trim() + '". Rename one in the CRM, then try again.');
+        }
+        return matches.length ? matches[0].id : null;
       };
       var contactNamed = function (n) {
         var hit = contacts.filter(function (c) { return lower(c.name) === lower(n); })[0];
@@ -225,7 +258,7 @@
       } else if (kind === 'projects') {
         /* A client name that is not in the CRM yet is a new client, not a
            typo — that is what someone means when they type it here. */
-        work = Promise.resolve(companyNamed(context)).then(function (id) {
+        work = Promise.resolve(context).then(companyNamed).then(function (id) {
           if (id || /^internal/i.test(context)) return id;
           return A.createCompany({ name: context, kind: 'client', stage: 'client' })
                   .then(function (c) { return c.id; });
@@ -237,7 +270,7 @@
         });
 
       } else if (kind === 'crm') {
-        work = Promise.resolve(companyNamed(context)).then(function (id) {
+        work = Promise.resolve(context).then(companyNamed).then(function (id) {
           if (id) return id;
           return A.createCompany({ name: context }).then(function (c) { return c.id; });
         }).then(function (companyId) {
@@ -281,9 +314,14 @@
         return;
       }
 
+      form.dataset.pending = '1';
+      var submitButton = form.querySelector('button:not([type="button"])');
+      if (submitButton) submitButton.disabled = true;
       var modal = document.getElementById('modal');
       var outcome = null;
+      var created = false;
       work.then(function (result) {
+        created = true;
         outcome = result;
         if (modal && modal.close) modal.close();
         return window.workspaceStore.reload();
@@ -297,7 +335,14 @@
             : 'Saved here — no calendar is connected yet');
         }
         toast('Saved to the workspace');
-      }).catch(fail);
+      }).catch(function (err) {
+        /* Not created: the form is still open, and can be sent again. */
+        if (!created) {
+          form.dataset.pending = '';
+          if (submitButton) submitButton.disabled = false;
+        }
+        fail(err);
+      });
       return;
     }
 

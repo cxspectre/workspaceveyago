@@ -97,12 +97,24 @@ test('a status label maps back to what the database stores', () => {
   assert.equal(model.statusValue(''), null);
 });
 
-test('active means neither completed nor cancelled', () => {
+test('active means being worked on: not on hold, completed or cancelled — the Overview tile\'s rule', () => {
   const as = status => model.shapeProject(row({ status }), []);
   assert.equal(model.isActive(as('Discovery')), true);
-  assert.equal(model.isActive(as('On hold')), true);
+  assert.equal(model.isActive(as('In progress')), true);
+  assert.equal(model.isActive(as('In review')), true);
+  assert.equal(model.isActive(as('On hold')), false, 'paused work is not active, as workspace_overview() counts it');
   assert.equal(model.isActive(as('Completed')), false);
   assert.equal(model.isActive(as('Cancelled')), false);
+});
+
+test('every project\'s tasks from one list are grouped by project, in order', () => {
+  const tasks = [task('t1', P1), task('t2', P2), task('t3', P1), { id: 'loose', row: { project_id: null } }, null];
+  const grouped = model.groupTasks(tasks);
+  assert.deepEqual([...grouped[P1]].map(t => t.id), ['t1', 't3']);
+  assert.deepEqual([...grouped[P2]].map(t => t.id), ['t2']);
+  assert.equal(grouped.null, undefined, 'a task without a project belongs to none');
+  assert.deepEqual([...model.shapeProject(row(), grouped[P1]).taskIds], ['t1', 't3']);
+  assert.deepEqual(Object.keys(model.groupTasks(null)), []);
 });
 
 /* ── People and companies ────────────────────────────────────────────── */
@@ -121,6 +133,21 @@ test('a project\'s due date is its date, wherever the browser is', () => {
   assert.equal(p.dueOn, '2026-10-01');
   assert.equal(model.shapeProject(row({ due: '', row: { id: P1, due_on: null } }), []).due, '');
   assert.equal(model.shapeProject(row({ due: '', row: { id: P1, due_on: null } }), []).dueOn, null);
+});
+
+test('spaces inside a name, and look-alike characters, do not make a second company', () => {
+  const companies = [{ id: COMPANY, name: 'Harbor & Co' }, { id: 'c-wide', name: 'ＡＢＣ Studio' }];
+  assert.equal(model.findCompany(companies, 'Harbor  &   Co').id, COMPANY);
+  assert.equal(model.findCompany(companies, 'Harbor & Co').id, COMPANY, 'a non-breaking space is a space');
+  assert.equal(model.findCompany(companies, 'abc studio').id, 'c-wide', 'full-width letters are letters');
+});
+
+test('when two companies share a name, none is picked for you', () => {
+  const companies = [{ id: 'c1', name: 'Northline' }, { id: 'c2', name: 'northline ' }, { id: 'c3', name: 'Harbor' }];
+  assert.deepEqual([...model.matchCompanies(companies, 'NORTHLINE')].map(c => c.id), ['c1', 'c2']);
+  assert.equal(model.findCompany(companies, 'Northline'), null, 'ambiguous: the person chooses, not the first in the alphabet');
+  assert.equal(model.findCompany(companies, 'Harbor').id, 'c3');
+  assert.deepEqual([...model.matchCompanies(companies, '')], []);
 });
 
 test('a typed client is an existing company whatever its case or spacing, contacts or not', () => {

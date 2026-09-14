@@ -26,7 +26,10 @@ const projectsModel = (function () {
   const STATUS_LABELS = Object.freeze(STATUSES.map(s => s.label));
   /* The board is for work that is still somewhere. Cancelled work stays in the list. */
   const BOARD = Object.freeze(STATUS_LABELS.filter(label => label !== 'Cancelled'));
-  const FINISHED = Object.freeze(['Completed', 'Cancelled']);
+  /* Not being worked on: paused, finished or dropped. The Overview tile
+     (workspace_overview(), 0029) counts discovery, in progress and in review as
+     active, and so does everything here. */
+  const INACTIVE = Object.freeze(['On hold', 'Completed', 'Cancelled']);
 
   /* A date column ('2026-10-03') as a list shows it. A date has no time of day,
      so it is read and written in UTC: anywhere west of Greenwich, local midnight
@@ -42,7 +45,21 @@ const projectsModel = (function () {
     return found ? found.value : null;
   }
 
-  const isActive = project => Boolean(project) && !FINISHED.includes(project.status);
+  const isActive = project => Boolean(project) && !INACTIVE.includes(project.status);
+
+  /* Every project's tasks from one list, by project id, in the list's order. A
+     task without a project belongs to none. Built in place here: copying the
+     groups for every task would be quadratic in a studio's task count. */
+  function groupTasks(tasks) {
+    const groups = new Map();
+    (tasks || []).forEach(t => {
+      const projectId = t && t.row && t.row.project_id;
+      if (!projectId) return;
+      if (!groups.has(projectId)) groups.set(projectId, []);
+      groups.get(projectId).push(t);
+    });
+    return Object.freeze(Object.fromEntries([...groups].map(([id, list]) => [id, Object.freeze(list)])));
+  }
 
   /* A project as the views use it: everything by id, and its tasks as titles
      with a parallel list of ids, due dates and ticked positions (taskRows,
@@ -94,17 +111,28 @@ const projectsModel = (function () {
     return (team || []).find(member => member && member.id === project.ownerId) || null;
   }
 
-  /* The company a typed client name means: the same name, whatever its case or
-     spacing. Every company counts — one that has no contacts yet used to be
-     missed, and a second one was created beside it. */
+  /* A company name as it is compared: look-alike characters folded (full-width
+     letters, a non-breaking space), runs of spaces made one, case ignored. */
+  const companyKey = name => String(name || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+
+  /* Every company a typed client name could mean. Every company counts — one
+     with no contacts yet used to be missed, and a second one created beside it. */
+  function matchCompanies(companies, name) {
+    const wanted = companyKey(name);
+    if (!wanted) return Object.freeze([]);
+    return Object.freeze((companies || []).filter(c => c && companyKey(c.name) === wanted));
+  }
+
+  /* The company a typed name means, when exactly one does. With two of the same
+     name the choice is the person's, not the first in the alphabet's. */
   function findCompany(companies, name) {
-    const wanted = String(name || '').trim().toLowerCase();
-    if (!wanted) return null;
-    return (companies || []).find(c => c && String(c.name || '').trim().toLowerCase() === wanted) || null;
+    const matches = matchCompanies(companies, name);
+    return matches.length === 1 ? matches[0] : null;
   }
 
   return Object.freeze({
     STATUSES, STATUS_LABELS, BOARD,
-    statusValue, isActive, shortDue, shapeProject, projectById, boardColumns, ownerOf, findCompany
+    statusValue, isActive, shortDue, groupTasks, shapeProject, projectById, boardColumns, ownerOf,
+    matchCompanies, findCompany
   });
 })();

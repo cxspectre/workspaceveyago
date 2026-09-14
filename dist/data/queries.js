@@ -67,6 +67,15 @@
     return words ? words.charAt(0).toUpperCase() + words.slice(1) : '';
   }
 
+  var TASK_COLUMNS = 'id, project_id, title, status, priority, due_date, assignee:employees (full_name)';
+
+  function projectTask(r) {
+    return {
+      id: r.id, title: r.title, done: r.status === 'done', status: r.status,
+      who: r.assignee ? r.assignee.full_name : null, row: r
+    };
+  }
+
   window.workspaceData = {
     initials: initials,
     money: money,
@@ -207,15 +216,29 @@
     async projectTasks(projectId) {
       var rows = unwrap(await sb()
         .from('tasks')
-        .select('id, project_id, title, status, priority, due_date, assignee:employees (full_name)')
+        .select(TASK_COLUMNS)
         .eq('project_id', projectId)
         .order('created_at'), 'project tasks');
-      return rows.map(function (r) {
-        return {
-          id: r.id, title: r.title, done: r.status === 'done', status: r.status,
-          who: r.assignee ? r.assignee.full_name : null, row: r
-        };
-      });
+      return rows.map(projectTask);
+    },
+
+    /* Every project's tasks in one request rather than one per project — a page
+       at a time, because the API hands back at most 1000 rows per request. */
+    async allProjectTasks() {
+      var PAGE = 1000;
+      var rows = [];
+      for (var from = 0; ; from += PAGE) {
+        var page = unwrap(await sb()
+          .from('tasks')
+          .select(TASK_COLUMNS)
+          .not('project_id', 'is', null)
+          .order('created_at')
+          .order('id')
+          .range(from, from + PAGE - 1), 'project tasks');
+        rows = rows.concat(page);
+        if (page.length < PAGE) break;
+      }
+      return rows.map(projectTask);
     },
 
     /* ── CRM ─────────────────────────────────────────────────────────── */

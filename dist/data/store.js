@@ -85,8 +85,15 @@
         d.revenueSeries(12).catch(function () { return []; }),  // ditto
         d.revenueMix(1).catch(function () { return []; }),
         d.notes().catch(function () { return []; }),
-        /* Every company, contacts or not: what a typed client name is matched to. */
-        d.companies().catch(function () { return []; })
+        /* Every company, contacts or not: what a typed client name is matched to.
+           Said out loud when it fails, because matching then falls back to the
+           companies contacts happen to carry. */
+        d.companies().catch(function (err) {
+          console.error('[workspace] companies did not load:', err);
+          return [];
+        }),
+        /* Every project's tasks in one request, grouped by project below. */
+        d.allProjectTasks()
       ]);
 
       var liveTickets = results[0];
@@ -105,13 +112,11 @@
       var liveNotes = results[11];
       state.companies = results[12];
 
-      /* Every project's tasks at once, rather than one project after another. */
-      var taskLists = await Promise.all(liveProjects.map(function (p) { return d.projectTasks(p.id); }));
-      var allTasks = [].concat.apply([], taskLists);
+      var tasksByProject = projectsModel.groupTasks(results[13]);
 
       swap(tickets, liveTickets);
       swap(projects, liveProjects.map(function (p) {
-        return projectsModel.shapeProject(p, allTasks);
+        return projectsModel.shapeProject(p, tasksByProject[p.id] || []);
       }));
       swap(contacts, liveContacts);
       swap(team, liveTeam);
