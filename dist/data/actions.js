@@ -25,12 +25,21 @@
         || (err && err.context && err.context.status === 404);
   }
 
-  /* An Edge Function's own { error } body is more useful than the generic
-     "Edge Function returned a non-2xx status code" supabase-js surfaces. */
-  function readFunctionError(res) {
-    var fromBody = res.data && res.data.error;
-    if (fromBody) return fromBody;
-    return (res.error && res.error.message) || 'The reply could not be sent.';
+  /* What went wrong, in the function's own words. supabase-js answers a non-2xx
+     with { data: null, error } and the Response on error.context, so an Edge
+     Function's { error } body is only readable from there — without this, all a
+     person sees is "Edge Function returned a non-2xx status code". */
+  async function functionError(res, fallback) {
+    var context = res.error && res.error.context;
+    if (context && typeof context.json === 'function') {
+      try {
+        var body = await context.json();
+        if (body && (body.error || body.message)) return String(body.error || body.message);
+      } catch (notJson) {
+        /* A gateway page rather than our JSON: the generic message will do. */
+      }
+    }
+    return (res.data && res.data.error) || (res.error && res.error.message) || fallback;
   }
 
   function must(condition, message) {
@@ -39,6 +48,21 @@
 
   function one(res, what) {
     if (res.error) throw new Error('Could not ' + what + ': ' + res.error.message);
+    return res.data;
+  }
+
+  /* Read or starred, through update-mail-state, which changes Outlook, the
+     stored messages and the thread together. There is deliberately no fallback
+     to writing the thread row: that never reached Outlook and was undone by the
+     next sync, and a failure that merely looked like "not deployed" — a timeout,
+     the function's own 404 — would have taken it silently. This ships once
+     update-mail-state is live (veyagocloud docs/workspace-backend.md, Going
+     live). */
+  async function threadState(threadId, change) {
+    var res = await sb().functions.invoke('update-mail-state', {
+      body: Object.assign({ threadId: threadId }, change)
+    });
+    if (res.error) throw new Error(await functionError(res, 'That change did not save.'));
     return res.data;
   }
 
@@ -81,7 +105,7 @@
             : 'Saved. Sending is not deployed on this project yet, so it has not gone out.'
         };
       }
-      throw new Error(readFunctionError(res));
+      throw new Error(await functionError(res, 'The reply could not be sent.'));
     },
 
     async setTicketStatus(ticketId, status) {
@@ -230,7 +254,7 @@
 
       var status = res.error && res.error.context && res.error.context.status;
       if (status && status !== 409 && !isMissingFunction(res.error)) {
-        throw new Error(readFunctionError(res));
+        throw new Error(await functionError(res, 'The event could not be booked.'));
       }
 
       /* Local only: connection_id and external_id stay null, which is what the
@@ -282,16 +306,33 @@
       return res.data;
     },
 
+    /* Resolves to update-mail-state's answer: { ok, thread, outlook, reason }.
+       outlook false means the change is saved here but Outlook did not get it —
+       the view says so, or the next sync would quietly undo it. */
     async markThreadRead(threadId, read) {
-      return one(await sb().from('mail_threads')
-        .update({ is_read: read !== false }).eq('id', threadId).select().single(),
-        'update the thread');
+      return threadState(threadId, { read: read !== false });
     },
 
     async starThread(threadId, starred) {
-      return one(await sb().from('mail_threads')
-        .update({ is_starred: !!starred }).eq('id', threadId).select().single(),
-        'star the thread');
+      return threadState(threadId, { starred: !!starred });
+    },
+
+    /* ── Connections ─────────────────────────────────────────────────── */
+
+    /* Starts reconnecting a mailbox and resolves to Microsoft's consent page.
+       No employeeId is sent: microsoft-connect then keeps whose mailbox it is
+       and who consented to it. Only ever a Microsoft sign-in page — the page is
+       opened as it comes back, so anything else is refused rather than
+       followed. Managers only; the function says so to anyone else. */
+    async reconnectMailbox(address) {
+      must(address && String(address).trim(), 'Say which mailbox to reconnect.');
+      var res = await sb().functions.invoke('microsoft-connect', {
+        body: { provider: 'microsoft_mail', accountLabel: String(address).trim() }
+      });
+      if (res.error) throw new Error(await functionError(res, 'Reconnecting could not start.'));
+      var url = String(res.data && res.data.consentUrl || '');
+      must(/^https:\/\/login\.microsoftonline\.com\//.test(url), 'Microsoft did not send a sign-in page back.');
+      return url;
     }
   };
 })();

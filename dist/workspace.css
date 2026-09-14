@@ -62,6 +62,10 @@
 .mailbox-name small { margin-top: 2px; font-size: .6875rem; color: #7d899d; }
 .mailbox-link.selected .mailbox-name small { color: #4d7fb8; }
 .mailbox-name small.mailbox-warning, .mail-folder-foot small.mailbox-warning { color: #b45309; }
+.mailbox-connection + .mailbox-connection { margin-top: 12px; }
+.mailbox-connection small { display: block; }
+.mail-folder-foot .mailbox-reconnect { margin-top: 7px; padding: 5px 11px; font-size: .75rem; }
+.mail-folder-foot .mailbox-reconnect:disabled { opacity: .55; cursor: progress; }
 .mail-count { flex-shrink: 0; min-width: 20px; padding: 1px 6px; border-radius: 999px; background: #0071e3; color: #fff; font-size: .6875rem; text-align: center; }
 .mailbox-select { display: none; }
 .mailbox-select select { max-width: 260px; padding: 7px 10px; border: 1px solid #dce0e6; border-radius: 10px; background: #fafbfc; color: var(--ink); font-size: .8125rem; }
@@ -120,5 +124,8 @@ button.mail-message-head:hover { background: #f7faff; }
   .mailbox-switcher { display: none; }
   .mailbox-select { display: block; margin-right: 6px; }
   .mail-folder-list { display: flex; flex-wrap: wrap; gap: 6px; }
+  /* The foot is hidden here to save room — but not when it is the only place
+     a manager can reconnect a mailbox. */
+  .mail-folder-foot:has(.mailbox-reconnect) { display: block; }
 }
 @media (max-width: 760px) { .mail-workspace { grid-template-columns: 1fr; } }

@@ -41,6 +41,8 @@
   /* "Show images" is decided per message, and showing them in one message no
      longer hides them again in another. workspace.js's handler adds to this. */
   const imagesShown = id => (window.__mailShowImages || []).includes(id);
+  /* microsoft-connect is for managers, so the button is only offered to them. */
+  const canReconnect = () => Boolean(window.workspaceSession && workspaceSession.isManager && workspaceSession.isManager());
 
   /* The store's arrays are shared with every view, so a changed thread goes
      back in as a new object at the same position. */
@@ -71,6 +73,14 @@
 
   const countBadge = n => (n ? `<small class="mail-count">${n}</small>` : '');
 
+  function connectionRow(box) {
+    const button = canReconnect()
+      ? `<button type="button" class="btn mailbox-reconnect" data-mail-reconnect="${esc(box.id)}">Reconnect</button>`
+      : '';
+    return `<div class="mailbox-connection"><p>${esc(box.address)}</p>`
+      + `<small class="${box.live ? '' : 'mailbox-warning'}">${esc(syncedLabel(box))}</small>${button}</div>`;
+  }
+
   function mailboxColumn(route, boxes) {
     const all = mailboxLink(route, M.ALL,
       `<span class="mailbox-mark all">${icon('mail')}</span>`
@@ -99,8 +109,11 @@
 
     const box = boxes.find(b => b.id === route.mailbox);
     const foot = box
-      ? `<span class="eyebrow">MAILBOX</span><p>${esc(box.address)}</p><small class="${box.live ? '' : 'mailbox-warning'}">${esc(syncedLabel(box))}</small>`
-      : boxes.length ? '' : '<span class="eyebrow">MAILBOX</span><p>No mailbox connected</p><small>Mail appears here once one is.</small>';
+      ? `<span class="eyebrow">MAILBOX</span>${connectionRow(box)}`
+      : !boxes.length ? '<span class="eyebrow">MAILBOX</span><p>No mailbox connected</p><small>Mail appears here once one is.</small>'
+      /* A manager sees every mailbox's connection here, so reconnecting one —
+         to grant a permission added since, say — is a click from any view. */
+      : canReconnect() ? `<span class="eyebrow">CONNECTIONS</span>${boxes.map(connectionRow).join('')}` : '';
 
     return `<aside class="mail-folders"><div class="mailbox-switcher"><span class="eyebrow">MAILBOXES</span>${all}${each}</div>`
       /* A div, not <nav>: the sidebar's `nav a` rules would stack every folder
@@ -267,13 +280,24 @@
 
   /* A failed mark-read is not retried on every render — typing in the search
      box would send one request per keystroke. The next load clears it. */
+  /* update-mail-state saved the change here but Outlook did not get it —
+     usually a mailbox connected before Mail.ReadWrite. Said once per page
+     load: opening every conversation would otherwise repeat it. */
+  let outlookWarned = false;
+  function warnIfOutlookMissed(result) {
+    if (outlookWarned || !result || result.outlook !== false || !result.reason) return;
+    outlookWarned = true;
+    toast(result.reason);
+  }
+
   function markRead(thread) {
     if (!live() || markingRead[thread.id] || readFailed[thread.id]) return;
     markingRead = Object.freeze({ ...markingRead, [thread.id]: true });
     workspaceActions.markThreadRead(thread.id, true)
-      .then(() => {
+      .then(result => {
         replaceThread(thread.id, { unread: false, row: { is_read: true } });
         repaintWhenIdle();
+        warnIfOutlookMissed(result);
       })
       .catch(err => {
         console.error('[mail] could not mark the conversation read:', err);
@@ -295,9 +319,10 @@
     const wanted = !thread.starred;
     button.disabled = true;
     workspaceActions.starThread(thread.id, wanted)
-      .then(() => {
+      .then(result => {
         replaceThread(thread.id, { starred: wanted, row: { is_starred: wanted } });
         render();
+        warnIfOutlookMissed(result);
       })
       .catch(err => {
         button.disabled = false;
@@ -310,12 +335,13 @@
     if (!thread || !live()) return;
     button.disabled = true;
     workspaceActions.markThreadRead(thread.id, false)
-      .then(() => {
+      .then(result => {
         replaceThread(thread.id, { unread: true, row: { is_read: false } });
         const route = M.parseMailRoute(routeParts);
         /* Close it, or the open reader would mark it read again at once. */
         navigate(M.mailRoute({ mailbox: route.mailbox, folder: route.folder }));
         toast('Marked as unread');
+        warnIfOutlookMissed(result);
       })
       .catch(err => {
         button.disabled = false;
@@ -337,8 +363,46 @@
     compose(address, subject);
   }
 
+  /* Reconnecting asks Microsoft again, with the permissions the app has now: a
+     permission added since a mailbox was connected (Mail.ReadWrite) arrives
+     only with a new consent. The consent page opens in a new tab, reserved on
+     the click itself so the browser does not block it as a pop-up. Coming back
+     to this tab re-reads the mailboxes. */
+  let reconnecting = false;
+
+  function reconnect(button) {
+    const box = mailboxes().find(b => b.id === button.dataset.mailReconnect);
+    if (!box || !live()) return;
+    const tab = window.open('', '_blank');
+    if (tab) tab.document.title = 'Connecting to Microsoft…';
+    button.disabled = true;
+    workspaceActions.reconnectMailbox(box.address)
+      .then(url => {
+        reconnecting = true;
+        if (!tab) { window.location.assign(url); return; }
+        tab.opener = null;
+        tab.location.href = url;
+        toast(`Finish in the Microsoft tab. ${box.address} updates when you come back.`);
+      })
+      .catch(err => {
+        if (tab) tab.close();
+        toast(err.message || 'Reconnecting could not start.');
+      })
+      .then(() => { button.disabled = false; });
+  }
+
+  function backFromMicrosoft() {
+    if (!reconnecting || document.visibilityState !== 'visible' || !window.workspaceStore) return;
+    reconnecting = false;
+    Promise.resolve(workspaceStore.reload()).then(() => { if (page === 'mail') render(); });
+  }
+  window.addEventListener('focus', backFromMicrosoft);
+  document.addEventListener('visibilitychange', backFromMicrosoft);
+
   document.addEventListener('click', e => {
     if (page !== 'mail' || !e.target.closest) return;
+    const reconnectButton = e.target.closest('[data-mail-reconnect]');
+    if (reconnectButton) { e.preventDefault(); reconnect(reconnectButton); return; }
     const star = e.target.closest('[data-mail-star]');
     if (star) { e.preventDefault(); toggleStar(star); return; }
     const unread = e.target.closest('[data-mail-unread]');
