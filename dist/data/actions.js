@@ -198,6 +198,33 @@
         'update the project');
     },
 
+    /* The columns a project form may change. Status has its own select and
+       save, archiving has archiveProject(), and the budget is for managers
+       and arrives with its own rules — anything else in `changes` is dropped.
+       Resolves to null when there is nothing to write. */
+    async updateProject(projectId, changes) {
+      var allowed = ['name', 'description', 'company_id', 'owner_id', 'due_on'];
+      var update = allowed.reduce(function (acc, column) {
+        return changes && Object.prototype.hasOwnProperty.call(changes, column)
+          ? Object.assign({}, acc, { [column]: changes[column] })
+          : acc;
+      }, {});
+      if (!Object.keys(update).length) return null;
+      return one(await sb().from('client_projects')
+        .update(update).eq('id', projectId).select().single(), 'save the project');
+    },
+
+    /* Archived, not deleted: deleted_at is set, the row stays, and the project
+       leaves the board and every list. Owners and admins only — the database
+       refuses anyone else too (guard_soft_delete). */
+    async archiveProject(projectId) {
+      must(window.workspaceSession.isManager && window.workspaceSession.isManager(),
+        'Only an owner or admin can archive a project.');
+      return one(await sb().from('client_projects')
+        .update({ deleted_at: new Date().toISOString() }).eq('id', projectId).select().single(),
+        'archive the project');
+    },
+
     /* ── CRM ─────────────────────────────────────────────────────────── */
 
     async createCompany(fields) {

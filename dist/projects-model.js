@@ -47,6 +47,123 @@ const projectsModel = (function () {
 
   const isActive = project => Boolean(project) && !INACTIVE.includes(project.status);
 
+  const NAME_LIMIT = 200;
+  const DATE = /^\d{4}-\d{2}-\d{2}$/;
+  /* A real calendar date. 2026-13-40 is no date at all, and 2026-02-30 is
+     quietly read as March 2 — so it has to come back as what went in. */
+  const isDate = value => {
+    if (!DATE.test(value)) return false;
+    const date = new Date(`${value}T00:00:00Z`);
+    return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
+  };
+
+  /* A project's tickets: the ones filed under it, and its client's tickets that
+     are filed under no project yet — both by id. A ticket is never matched by a
+     product name that happens to look like the project's. */
+  function projectTickets(tickets, project) {
+    if (!project) return Object.freeze([]);
+    const filedHere = t => t.row.project_id === project.id;
+    const clientsUnfiled = t => !t.row.project_id && Boolean(project.companyId) && t.row.company_id === project.companyId;
+    return Object.freeze((tickets || []).filter(t => t && t.row && (filedHere(t) || clientsUnfiled(t))));
+  }
+
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  /* When a meeting is over: its end, a day after an all-day start, or its start. */
+  const endOf = row => (row.ends_at
+    ? Date.parse(row.ends_at)
+    : Date.parse(row.starts_at) + (row.all_day ? DAY_MS : 0));
+
+  /* A project's meetings that are not over yet, soonest first. One under way
+     stays on the page until it ends. */
+  function upcomingEvents(events, project, nowMs) {
+    if (!project) return Object.freeze([]);
+    return Object.freeze((events || [])
+      .filter(e => e && e.row && e.row.project_id === project.id && endOf(e.row) > nowMs)
+      .sort((a, b) => Date.parse(a.row.starts_at) - Date.parse(b.row.starts_at)));
+  }
+
+  /* What an edit changes, as client_projects columns: only fields the form
+     sent, and only where they differ from the project as it was loaded. An
+     empty text field means "none". `problem` says why nothing can be saved. */
+  function projectChanges(project, fields) {
+    const f = fields || {};
+    const was = project || {};
+    const has = key => Object.prototype.hasOwnProperty.call(f, key) && f[key] !== undefined;
+    /* Line breaks as the database keeps them: a browser may send a textarea's as CRLF. */
+    const text = value => String(value == null ? '' : value).replace(/\r\n?/g, '\n').trim();
+    const orNull = value => text(value) || null;
+    const refuse = problem => Object.freeze({ changes: Object.freeze({}), problem });
+
+    /* The form always sends the name, so it is judged only when it changed: a
+       name that is already too long must not block moving the due date. */
+    const renamed = has('name') && text(f.name) !== text(was.name);
+    if (renamed && !text(f.name)) return refuse('A project needs a name.');
+    if (renamed && text(f.name).length > NAME_LIMIT) return refuse(`A project name is at most ${NAME_LIMIT} characters long.`);
+    if (has('dueOn') && text(f.dueOn) && !isDate(text(f.dueOn))) return refuse('That due date is not a date.');
+
+    /* [form field, column, what the form says, what the project said], both
+       sides tidied the same way, so a form nobody touched changes nothing. */
+    const candidates = [
+      ['name', 'name', text(f.name), text(was.name)],
+      ['description', 'description', orNull(f.description), orNull(was.description)],
+      ['companyId', 'company_id', orNull(f.companyId), orNull(was.companyId)],
+      ['ownerId', 'owner_id', orNull(f.ownerId), orNull(was.ownerId)],
+      ['dueOn', 'due_on', orNull(f.dueOn), orNull(was.dueOn)]
+    ];
+    const changes = candidates
+      .filter(([field, , value, current]) => has(field) && value !== current)
+      .reduce((all, [, column, value]) => ({ ...all, [column]: value }), {});
+    return Object.freeze({ changes: Object.freeze(changes), problem: null });
+  }
+
+  /* A picker's options as [id, name]. The current value is kept even when the
+     list does not have it — a company list that did not load, an owner who has
+     left — so saving a form nobody touched never clears it. */
+  function choices(items, current, currentLabel) {
+    const list = (items || [])
+      .filter(item => item && item.id)
+      .map(item => Object.freeze([String(item.id), String(item.name || '')]));
+    const keep = Boolean(current) && !list.some(([id]) => id === String(current));
+    return Object.freeze(keep ? [Object.freeze([String(current), currentLabel || 'Current']), ...list] : list);
+  }
+
+  /* ── Meetings ──────────────────────────────────────────────────────── */
+
+  const WORKING_DAY = Object.freeze({ first: 9, last: 17, morning: 10 });
+  const TIME = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+  /* The time a meeting dialog suggests first: the next whole hour, or 10:00
+     when that falls outside the working day. */
+  function suggestedStart(now) {
+    const next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours() + 1);
+    const inDay = next.getDate() === now.getDate()
+      && next.getHours() >= WORKING_DAY.first && next.getHours() <= WORKING_DAY.last;
+    if (inDay) return next;
+    const nextDay = now.getHours() >= WORKING_DAY.first ? 1 : 0;
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate() + nextDay, WORKING_DAY.morning);
+  }
+
+  /* A meeting form's day and times as moments on this clock, or why they cannot
+     be booked, with `field` naming the input to point at. A meeting already
+     under way may be put on record; one that is over would never be listed. */
+  function meetingTimes(values, now) {
+    const v = values || {};
+    const day = String(v.day || '');
+    const start = TIME.exec(String(v.start || ''));
+    const end = TIME.exec(String(v.end || ''));
+    if (!isDate(day) || !start || !end) {
+      return Object.freeze({ startsAt: null, endsAt: null, problem: 'Pick the day and the times again.', field: 'day' });
+    }
+    const [year, month, date] = day.split('-').map(Number);
+    const at = time => new Date(year, month - 1, date, Number(time[1]), Number(time[2]));
+    const startsAt = at(start);
+    const endsAt = at(end);
+    const refuse = (problem, field) => Object.freeze({ startsAt, endsAt, problem, field });
+    if (endsAt <= startsAt) return refuse('A meeting ends after it starts.', 'end');
+    if (endsAt <= now) return refuse('That time has already passed.', 'start');
+    return Object.freeze({ startsAt, endsAt, problem: null, field: null });
+  }
+
   /* Every project's tasks from one list, by project id, in the list's order. A
      task without a project belongs to none. Built in place here: copying the
      groups for every task would be quadratic in a studio's task count. */
@@ -132,7 +249,9 @@ const projectsModel = (function () {
 
   return Object.freeze({
     STATUSES, STATUS_LABELS, BOARD,
+    NAME_LIMIT,
     statusValue, isActive, shortDue, groupTasks, shapeProject, projectById, boardColumns, ownerOf,
-    matchCompanies, findCompany
+    matchCompanies, findCompany, projectTickets, upcomingEvents, projectChanges, choices,
+    suggestedStart, meetingTimes
   });
 })();

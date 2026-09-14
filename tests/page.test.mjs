@@ -32,6 +32,8 @@ test('the models load before the views that use them', () => {
   assert.ok(at('mail-model.js') < at('mail-compose.js'));
   assert.ok(at('mail-compose.js') < at('mail.js'), 'mail.js renders with the composer as soon as it runs');
   assert.ok(at('projects-model.js') < at('workspace.js'));
+  assert.ok(at('projects-model.js') < at('projects-ui.js'));
+  assert.ok(at('workspace.js') < at('projects-ui.js'), 'the project page is drawn by workspace.js, its actions added by projects-ui.js');
   assert.ok(at('data/mail-html.js') < at('mail-compose.js'));
 });
 

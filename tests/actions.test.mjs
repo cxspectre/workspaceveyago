@@ -45,13 +45,17 @@ const USER = 'a0000000-0000-4000-8000-000000000001';
 /* answer(name, options): what functions.invoke resolves to.
    storage(bucket): the stand-in for sb().storage.from(bucket).
    purify: the stand-in for DOMPurify. */
-function workspace(answer, { storage, purify } = {}) {
+function workspace(answer, { storage, purify, manager = true } = {}) {
   const invoked = [];
   const written = [];
   const record = (table, what) => (change, options) => {
-    written.push({ table, what, change: { ...change }, ...(options ? { options: { ...options } } : {}) });
+    const index = written.push({ table, what, change: { ...change }, ...(options ? { options: { ...options } } : {}) }) - 1;
     const chain = {
-      eq: () => chain,
+      /* Which rows a write is aimed at: without this, a write to the wrong row passes. */
+      eq: (column, value) => {
+        written[index] = { ...written[index], where: [...(written[index].where || []), [column, value]] };
+        return chain;
+      },
       select: () => chain,
       single: async () => ({ data: { id: 'new-row', ...change }, error: null })
     };
@@ -67,7 +71,10 @@ function workspace(answer, { storage, purify } = {}) {
     from: (table) => ({ update: record(table, 'update'), insert: record(table, 'insert'), upsert: record(table, 'upsert') }),
     storage: { from: (bucket) => (storage ? storage(bucket) : {}) }
   };
-  const session = { client, employee: { id: 'emp-1' }, session: { user: { id: USER } } };
+  const session = {
+    client, employee: { id: 'emp-1' }, session: { user: { id: USER } },
+    isManager: () => manager
+  };
   const context = vm.createContext({
     console,
     window: { workspaceSession: session, DOMPurify: purify, crypto: globalThis.crypto }
@@ -182,6 +189,42 @@ test('reconnecting needs a mailbox to reconnect', async () => {
   const ws = workspace(async () => ({ data: { consentUrl: CONSENT }, error: null }));
   await assert.rejects(ws.actions.reconnectMailbox(''), /mailbox/i);
   assert.equal(ws.invoked.length, 0);
+});
+
+/* ── Projects ─────────────────────────────────────────────────────────── */
+
+test('editing a project writes only the columns a project form may change', async () => {
+  const ws = workspace(async () => ({}));
+  await ws.actions.updateProject('p1', {
+    name: 'New name', due_on: null, owner_id: 'e2',
+    deleted_at: '2026-09-14T00:00:00Z', budget: 100000, status: 'completed'
+  });
+  assert.deepEqual(ws.written, [{
+    table: 'client_projects', what: 'update',
+    change: { name: 'New name', due_on: null, owner_id: 'e2' },
+    where: [['id', 'p1']]
+  }], 'the budget is managers\' business and archiving has its own action; neither rides along on an edit');
+});
+
+test('an edit with nothing in it writes nothing', async () => {
+  const ws = workspace(async () => ({}));
+  assert.equal(await ws.actions.updateProject('p1', {}), null);
+  assert.equal(await ws.actions.updateProject('p1', { budget: 5 }), null);
+  assert.equal(ws.written.length, 0);
+});
+
+test('archiving a project is for owners and admins, and keeps the project', async () => {
+  const manager = workspace(async () => ({}), { manager: true });
+  await manager.actions.archiveProject('p1');
+  assert.equal(manager.written.length, 1);
+  assert.equal(manager.written[0].table, 'client_projects');
+  assert.deepEqual(Object.keys(manager.written[0].change), ['deleted_at'], 'archived, not deleted: the row stays');
+  assert.deepEqual(manager.written[0].where, [['id', 'p1']], 'that project, and no other');
+  assert.ok(!Number.isNaN(Date.parse(manager.written[0].change.deleted_at)));
+
+  const staff = workspace(async () => ({}), { manager: false });
+  await assert.rejects(staff.actions.archiveProject('p1'), /owner or admin/);
+  assert.equal(staff.written.length, 0);
 });
 
 /* ── Sending ──────────────────────────────────────────────────────────── */

@@ -93,7 +93,12 @@
           return [];
         }),
         /* Every project's tasks in one request, grouped by project below. */
-        d.allProjectTasks()
+        d.allProjectTasks(),
+        /* Meetings booked on projects, from today on — not only this week's. */
+        d.upcomingProjectEvents().catch(function (err) {
+          console.error('[workspace] project meetings did not load:', err);
+          return [];
+        })
       ]);
 
       var liveTickets = results[0];
@@ -111,6 +116,7 @@
       state.revenueMix = results[10];
       var liveNotes = results[11];
       state.companies = results[12];
+      state.projectEvents = results[14];
 
       var tasksByProject = projectsModel.groupTasks(results[13]);
 

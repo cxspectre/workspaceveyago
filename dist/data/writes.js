@@ -240,6 +240,15 @@
         var hit = contacts.filter(function (c) { return lower(c.name) === lower(n); })[0];
         return hit ? hit.row.id : null;
       };
+      /* Whose ticket it is, by id: the named contact's company, or the one
+         company with exactly that name. It puts the ticket on that client's
+         project pages until someone files it under a project. */
+      var ticketCompany = function (n) {
+        var hit = contacts.filter(function (c) { return lower(c.name) === lower(n); })[0];
+        if (hit && hit.row && hit.row.company && hit.row.company.id) return hit.row.company.id;
+        var company = projectsModel.findCompany(companies(), n);
+        return company ? company.id : null;
+      };
 
       var work;
       if (kind === 'tickets') {
@@ -247,7 +256,7 @@
         var priority = { Low: 'low', Medium: 'normal', High: 'high' }[String(d.get('priority'))] || 'normal';
         work = A.createTicket({
           subject: name, product: context, priority: priority,
-          contactId: contactNamed(context)
+          contactId: contactNamed(context), companyId: ticketCompany(context)
         }).then(function (ticket) {
           /* The description becomes the opening message, so the thread reads
              from the beginning rather than starting with our reply. */

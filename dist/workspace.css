@@ -234,6 +234,14 @@ body.mail-mode .reader-compose .composer-editor { flex: 1; min-height: 240px; ma
 /* The role chip is painted in once someone has signed in. */
 .demo-label:empty { display: none; }
 
+/* ── A project's own actions and dialogs ───────────────────────────────── */
+/* The buttons are items of the heading's own row, beside the status pill, so
+   on a narrow screen they wrap together rather than stack next to it. */
+.project-actions { display: contents; }
+.heading-actions:has(.project-actions) { flex-wrap: wrap; }
+.form-row { display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 12px; }
+@media (max-width: 520px) { .form-row { grid-template-columns: 1fr; gap: 0; } }
+
 /* ── Compose, after review ─────────────────────────────────────────────── */
 /* Whatever is pasted stays inside the editor's box, however it is styled. */
 .composer-editor { contain: layout paint; }

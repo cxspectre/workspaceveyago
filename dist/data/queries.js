@@ -131,11 +131,32 @@
       });
     },
 
+    /* Meetings booked against a project, from today on. A project page lists
+       them whatever week the agenda happens to be showing. */
+    async upcomingProjectEvents() {
+      var from = new Date(new Date().setHours(0, 0, 0, 0)).toISOString();
+      var rows = unwrap(await sb()
+        .from('calendar_events')
+        .select('id, title, starts_at, ends_at, all_day, status, project_id')
+        .not('project_id', 'is', null)
+        .neq('status', 'cancelled')
+        .gte('starts_at', from)
+        .order('starts_at')
+        .limit(500), 'project meetings');
+      return rows.map(function (r) {
+        return {
+          id: r.id, title: r.title,
+          when: shortDate(r.starts_at) + (r.all_day ? '' : ' · ' + clockTime(r.starts_at)),
+          row: r
+        };
+      });
+    },
+
     /* ── Tickets ─────────────────────────────────────────────────────── */
     async tickets() {
       var rows = unwrap(await sb()
         .from('support_tickets')
-        .select('id, number, subject, product, priority, status, created_at, ' +
+        .select('id, number, subject, product, priority, status, created_at, project_id, company_id, contact_id, ' +
                 'contact:crm_contacts (full_name), company:crm_companies (name), ' +
                 'assignee:employees (full_name), ' +
                 /* The queue view shows the opening message under each row, and
