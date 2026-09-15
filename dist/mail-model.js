@@ -94,6 +94,35 @@ const mailModel = (function () {
       t.folder === 'inbox' && t.unread && (!mailbox || mailbox === ALL || t.mailboxId === mailbox)).length;
   }
 
+  /* Whether a mailbox's folder hit queries.js's per-folder cap: the list is
+     not everything that folder holds, and neither is a count taken from it.
+     `truncated` is store.js's state.mailTruncated, each entry a "box|folder"
+     key (`box` is a connection id, or the literal "all" when the mailbox list
+     itself failed to load and threads were fetched with no connection filter
+     at all — RLS decided what came back, and it can still be more than the
+     cap). `folders` is which folders the caller's count draws from: Starred
+     spans inbox, sent and starred, so a cut inbox already puts its starred
+     count in doubt too. */
+  function isTruncated(truncated, mailbox, folders) {
+    const keys = truncated || [];
+    const wanted = folders || [];
+    return keys.some(key => {
+      const [box, folder] = String(key).split('|');
+      return wanted.includes(folder) && (mailbox === ALL || box === 'all' || box === mailbox);
+    });
+  }
+
+  /* An unread badge counts only what loaded. Past the cap, an older unread
+     thread is not being counted at all — `atLeast` says the number is a
+     floor, not the true count. A true one needs the database to count what
+     was never fetched, which is outside what this file can do. */
+  function unreadCountInfo(threads, mailbox, truncated) {
+    return Object.freeze({
+      count: unreadCount(threads, mailbox),
+      atLeast: isTruncated(truncated, mailbox, ['inbox'])
+    });
+  }
+
   function recipientLine(list) {
     const all = (list || []).filter(Boolean).map(String);
     if (all.length <= RECIPIENTS_SHOWN) return all.join(', ');
@@ -183,11 +212,15 @@ const mailModel = (function () {
   }
 
   /* One address as people paste it, with quotes, a mailto: and stray angle
-     brackets taken off. */
-  const bareAddress = token => String(token || '').trim()
-    .replace(/^mailto:/i, '')
-    .replace(/^["'<\s]+|["'>\s]+$/g, '')
-    .trim();
+     brackets taken off — and, for a mailto: link specifically, its own
+     ?subject=/?body=/… query string, which names the message the link
+     wants started, not part of who it goes to. */
+  const bareAddress = token => {
+    const trimmed = String(token || '').trim();
+    const mailto = trimmed.match(/^mailto:([^?]*)/i);
+    const body = mailto ? mailto[1] : trimmed;
+    return body.replace(/^["'<\s]+|["'>\s]+$/g, '').trim();
+  };
 
   /* What someone typed or pasted into an address field. A named address comes
      out whole first, because its name may hold a comma ("Lima, Ana <ana@…>"):
@@ -311,7 +344,8 @@ const mailModel = (function () {
   }
 
   return Object.freeze({
-    ALL, FOLDERS, mailboxesFor, mailboxNote, parseMailRoute, mailRoute, folderForThread, visibleThreads, unreadCount, recipientLine,
+    ALL, FOLDERS, mailboxesFor, mailboxNote, parseMailRoute, mailRoute, folderForThread, visibleThreads, unreadCount,
+    isTruncated, unreadCountInfo, recipientLine,
     LIMITS, PURIFY_CONFIG, isAddress, subjectFor, answerFor, parseAddresses, storageName, attachmentProblem,
     signatureFor, sendProblem, addressBook
   });

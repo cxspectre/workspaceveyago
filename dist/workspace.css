@@ -37,6 +37,17 @@
   .mail-workspace > .conversation-list,
   .mail-workspace > .reader { overflow: visible; }
   .conversation-list .mail-list-heading { position: static; }
+
+  /* Stacked in DOM order, an opened conversation sat below the mailbox
+     picker, the folders, Connections AND the whole list — several screens
+     down on a phone. `order` alone moves it without touching the markup:
+     the reader first (open or being written), the list next, the folders
+     and Connections last, since picking a different mailbox or folder is
+     the least of what someone does once something is already open. Nothing
+     changes when the reader is empty — there is nothing worth promoting yet,
+     and the list stays exactly where it already was. */
+  .mail-workspace:has(> .reader[data-thread-id], > .reader-compose) > .reader { order: -1; }
+  .mail-workspace:has(> .reader[data-thread-id], > .reader-compose) > .mail-folders { order: 1; }
 }
 
 /* Mini month: the spill from the months either side fills out whole weeks,

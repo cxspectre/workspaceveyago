@@ -76,11 +76,23 @@
       + `${selected ? ' aria-current="true"' : ''} title="${esc(title)}">${inner}</a>`;
   }
 
-  const countBadge = n => (n ? `<small class="mail-count">${n}</small>` : '');
+  /* An unread count as a screen reader can use it too: the number stays the
+     visible content, "unread" (and, past the cap, "or more") rides along as
+     text a sighted person never sees rather than only living in a colour. */
+  function unreadBadge(info, className) {
+    if (!info.count) return '';
+    const cls = className ? ` class="${className}"` : '';
+    const word = info.atLeast ? ' unread, or more' : ' unread';
+    return `<small${cls}>${info.count}${info.atLeast ? '+' : ''}<span class="sr-only">${word}</span></small>`;
+  }
 
   function connectionRow(box) {
+    /* Every Reconnect button said only "Reconnect": fine with one on screen,
+       indistinguishable read out one after another when Connections lists
+       several. The visible word stays short; the name a screen reader gets
+       says which mailbox. */
     const button = canReconnect(box)
-      ? `<button type="button" class="btn mailbox-reconnect" data-mail-reconnect="${esc(box.id)}">Reconnect</button>`
+      ? `<button type="button" id="mail-reconnect-${esc(box.id)}" class="btn mailbox-reconnect" data-mail-reconnect="${esc(box.id)}" aria-label="Reconnect ${esc(box.address)}">Reconnect</button>`
       : '';
     /* Why a mailbox is in trouble — or what a working one went on without —
        rather than "Not syncing" alone. */
@@ -92,16 +104,17 @@
   }
 
   function mailboxColumn(route, boxes) {
+    const truncated = (live() && workspaceStore.state.mailTruncated) || [];
     const all = mailboxLink(route, M.ALL,
       `<span class="mailbox-mark all">${icon('mail')}</span>`
       + `<span class="mailbox-name"><strong>All mailboxes</strong><small>${boxes.length} connected</small></span>`
-      + countBadge(M.unreadCount(mails, M.ALL)), 'All mailboxes');
+      + unreadBadge(M.unreadCountInfo(mails, M.ALL, truncated), 'mail-count'), 'All mailboxes');
 
     const each = boxes.map(b => mailboxLink(route, b.id,
       `<span class="mailbox-mark ${b.kind}">${esc(b.address.charAt(0).toUpperCase())}</span>`
       + `<span class="mailbox-name"><strong>${esc(b.address)}</strong>`
       + `<small class="${b.live ? '' : 'mailbox-warning'}">${esc(b.live ? b.kindLabel : syncedLabel(b))}</small></span>`
-      + countBadge(M.unreadCount(mails, b.id)), b.address)).join('');
+      + unreadBadge(M.unreadCountInfo(mails, b.id, truncated), 'mail-count'), b.address)).join('');
 
     /* Below 1050px the column becomes a row, and a select fits where a list
        of addresses does not. */
@@ -111,18 +124,25 @@
       + '</select></label>';
 
     const folders = M.FOLDERS.map(folder => {
-      const unread = folder === 'inbox' ? M.unreadCount(mails, route.mailbox) : 0;
+      const info = folder === 'inbox' ? M.unreadCountInfo(mails, route.mailbox, truncated) : { count: 0, atLeast: false };
       const mark = folder === 'starred' ? '<span class="folder-star" aria-hidden="true">★</span>' : icon(folder === 'sent' ? 'arrow' : 'mail');
       return `<a href="#${M.mailRoute({ mailbox: route.mailbox, folder })}" class="folder-link ${route.folder === folder ? 'selected' : ''}">`
-        + `${mark}<span>${FOLDER_LABELS[folder]}</span>${unread ? `<small>${unread}</small>` : ''}</a>`;
+        + `${mark}<span>${FOLDER_LABELS[folder]}</span>${unreadBadge(info)}</a>`;
     }).join('');
 
     const box = boxes.find(b => b.id === route.mailbox);
+    /* Losing the mailbox LIST is not the same as there being no mailbox: the
+       first tries again by itself, and the second is fixed by connecting
+       one. Conflating them used to send someone to Connect a mailbox that was
+       already connected — only its list had failed to load. */
+    const mailboxesFailed = live() && Boolean(workspaceStore.state.mailboxesFailed);
     const foot = box
       ? `<span class="eyebrow">MAILBOX</span>${connectionRow(box)}`
-      : !boxes.length ? (live() && !workspaceStore.has('mail')
-        ? '<span class="eyebrow">MAILBOX</span><p>Mail did not load</p><small>It tries again by itself.</small>'
-        : '<span class="eyebrow">MAILBOX</span><p>No mailbox connected</p><small>Mail appears here once one is.</small>')
+      : !boxes.length ? (mailboxesFailed
+        ? '<span class="eyebrow">MAILBOX</span><p>Mailboxes did not load</p><small>It tries again by itself.</small>'
+        : live() && !workspaceStore.has('mail')
+          ? '<span class="eyebrow">MAILBOX</span><p>Mail did not load</p><small>It tries again by itself.</small>'
+          : '<span class="eyebrow">MAILBOX</span><p>No mailbox connected</p><small>Mail appears here once one is.</small>')
       /* Every mailbox this person may reconnect shows its connection here, so
          reconnecting one — to grant a permission added since, say — is a click
          from any view. */
@@ -151,14 +171,11 @@
   /* Each mailbox's folders load up to a limit (queries.js). When the one on
      screen hit it, say so, rather than let the list pass for everything. */
   function truncatedNote(route) {
-    const keys = (live() && workspaceStore.state.mailTruncated) || [];
+    const truncated = (live() && workspaceStore.state.mailTruncated) || [];
     /* Starred is drawn from all three loads, the filed-and-starred one among them. */
     const folders = route.folder === 'starred' ? ['inbox', 'sent', 'starred'] : [route.folder];
-    const cut = keys.some(key => {
-      const [box, folder] = key.split('|');
-      return folders.includes(folder) && (route.mailbox === M.ALL || box === 'all' || box === route.mailbox);
-    });
-    return cut ? '<div class="mail-list-truncated">Showing the most recent conversations only.</div>' : '';
+    return M.isTruncated(truncated, route.mailbox, folders)
+      ? '<div class="mail-list-truncated">Showing the most recent conversations only.</div>' : '';
   }
 
   function threadList(route, list, boxes, shownId) {
@@ -166,9 +183,14 @@
     const tagMailbox = route.mailbox === M.ALL && boxes.length > 1;
     const items = list.map(t => {
       const selected = t.id === shownId;
-      return `<a href="#${M.mailRoute({ ...route, threadId: t.id })}" class="thread-item${selected ? ' selected' : ''}${t.unread ? ' unread' : ''}"${selected ? ' aria-current="true"' : ''}>`
-        + `<div class="mail-item-header"><strong>${t.unread ? '<span class="unread-dot" aria-label="Unread"></span>' : ''}${esc(t.sender)}</strong><small>${esc(t.time)}</small></div>`
-        + `<h3>${t.starred ? '<span class="thread-star" aria-label="Starred">★</span> ' : ''}${esc(t.subject)}</h3>`
+      /* Unread and starred were said only in colour — a dot and a filled
+         star. One sr-only phrase ahead of the sender says both in words, so
+         the icons themselves can stay decorative (aria-hidden). */
+      const states = [t.unread && 'Unread', t.starred && 'Starred'].filter(Boolean);
+      const stateText = states.length ? `<span class="sr-only">${states.join('. ')}. </span>` : '';
+      return `<a id="mail-thread-${esc(t.id)}" href="#${M.mailRoute({ ...route, threadId: t.id })}" class="thread-item${selected ? ' selected' : ''}${t.unread ? ' unread' : ''}"${selected ? ' aria-current="true"' : ''}>`
+        + `<div class="mail-item-header"><strong>${stateText}${t.unread ? '<span class="unread-dot" aria-hidden="true"></span>' : ''}${esc(t.sender)}</strong><small>${esc(t.time)}</small></div>`
+        + `<h3>${t.starred ? '<span class="thread-star" aria-hidden="true">★</span> ' : ''}${esc(t.subject)}</h3>`
         + `<p>${esc(t.preview)}</p>${tagMailbox ? `<span class="thread-mailbox">${esc(addressOf(t.mailboxId))}</span>` : ''}</a>`;
     }).join('');
     const where = route.mailbox === M.ALL ? 'All mailboxes' : addressOf(route.mailbox);
@@ -194,8 +216,13 @@
   function messageCard(message, open, newest, threadId) {
     const when = (message.date === 'Today' ? '' : esc(message.date) + ' · ') + esc(message.time);
     const avatar = `<div class="avatar${message.outbound ? ' owner' : ''}">${esc(message.initial)}</div>`;
+    /* An id, not just data-mail-expand: this button's own attribute is not
+       one repaintKeepingFocus knows to look for (shell-model.js FOCUS_
+       ATTRIBUTES is a peer file, not this batch's to add to), but every
+       element it checks starts with a plain id when one is there. */
+    const expandId = `mail-expand-${esc(message.id)}`;
     if (!open) {
-      return `<button type="button" class="mail-message collapsed" data-mail-expand="${esc(message.id)}" aria-expanded="false">`
+      return `<button type="button" id="${expandId}" class="mail-message collapsed" data-mail-expand="${esc(message.id)}" aria-expanded="false">`
         + `${avatar}<span class="mail-message-summary"><span class="mail-message-line"><strong>${esc(message.sender)}</strong><small>${when}</small></span>`
         + `<span class="mail-message-snippet">${esc(snippet(message))}</span></span></button>`;
     }
@@ -206,7 +233,7 @@
     /* The newest message is always open; an older one can be folded again. */
     const header = newest
       ? `<div class="mail-message-head">${head}</div>`
-      : `<button type="button" class="mail-message-head" data-mail-expand="${esc(message.id)}" aria-expanded="true">${head}</button>`;
+      : `<button type="button" id="${expandId}" class="mail-message-head" data-mail-expand="${esc(message.id)}" aria-expanded="true">${head}</button>`;
     /* Answer this message — not whichever came in last, which may be an
        out-of-office or a bounce. */
     const answers = [['reply', 'Reply'], ['replyAll', 'Reply all'], ['forward', 'Forward']].map(([mode, label]) =>
@@ -221,7 +248,7 @@
        for a while, then "no messages yet", which was not true. */
     if (workspaceStore.threadFailed(thread.id)) {
       return `<div class="mail-load-failed"><p>This conversation did not load.</p>`
-        + `<button class="btn" data-mail-retry="${esc(thread.id)}">Try again</button></div>`;
+        + `<button id="mail-retry-${esc(thread.id)}" class="btn" data-mail-retry="${esc(thread.id)}">Try again</button></div>`;
     }
     const messages = workspaceStore.threadBody(thread.id);
     if (!messages) return '<p class="quiet-text mail-loading">Loading the conversation…</p>';
@@ -248,8 +275,18 @@
 
   function expandButton(expanded) {
     const label = expanded ? 'Show folders and conversations' : 'Use the full width';
-    return `<button class="icon-btn" data-mail-expand-reader aria-pressed="${expanded ? 'true' : 'false'}"`
+    return `<button id="mail-expand-reader" class="icon-btn" data-mail-expand-reader aria-pressed="${expanded ? 'true' : 'false'}"`
       + ` title="${label}" aria-label="${label}">${expanded ? '⤡' : '⤢'}</button>`;
+  }
+
+  /* A failed mark-as-read used to leave the thread bold with nothing said:
+     no error, no way to try again short of a reload. Said the way the whole
+     conversation's own load failure is (mail-load-note), with a retry that
+     asks again just for this. */
+  function readFailedNote(thread) {
+    if (!readFailed[thread.id]) return '';
+    return '<div class="mail-load-note"><span role="status">Could not mark this conversation as read.</span>'
+      + `<button type="button" id="mail-retry-read-${esc(thread.id)}" class="text-btn" data-mail-retry-read="${esc(thread.id)}">Retry</button></div>`;
   }
 
   function reader(thread, boxes, listLength, expanded) {
@@ -270,9 +307,9 @@
     const starLabel = thread.starred ? 'Unstar conversation' : 'Star conversation';
     return `<div class="reader" data-thread-id="${esc(thread.id)}"><div class="reader-toolbar">`
       + `<span>${box ? pill(box.address, box.kind === 'personal' ? 'purple' : 'blue') : ''}</span><div class="reader-tools">${expandButton(expanded)}`
-      + `<button class="icon-btn" data-mail-unread="${esc(thread.id)}" title="Mark as unread" aria-label="Mark as unread">${icon('mail')}</button>`
-      + `<button class="icon-btn${thread.starred ? ' starred' : ''}" data-mail-star="${esc(thread.id)}" aria-pressed="${thread.starred ? 'true' : 'false'}" title="${starLabel}" aria-label="${starLabel}">${thread.starred ? '★' : '☆'}</button>`
-      + `</div></div><div class="reader-content"><h2>${esc(thread.subject)}</h2>`
+      + `<button id="mail-unread-${esc(thread.id)}" class="icon-btn" data-mail-unread="${esc(thread.id)}" title="Mark as unread" aria-label="Mark as unread">${icon('mail')}</button>`
+      + `<button id="mail-star-${esc(thread.id)}" class="icon-btn${thread.starred ? ' starred' : ''}" data-mail-star="${esc(thread.id)}" aria-pressed="${thread.starred ? 'true' : 'false'}" title="${starLabel}" aria-label="${starLabel}">${thread.starred ? '★' : '☆'}</button>`
+      + `</div></div><div class="reader-content">${readFailedNote(thread)}<h2>${esc(thread.subject)}</h2>`
       + (thread.count > 1 ? `<small class="mail-thread-count">${thread.count} messages</small>` : '')
       /* An answer being written sits above the conversation, where it is seen. */
       + (mailComposer.threadId() === thread.id ? '<div data-composer-slot></div>' : '')
@@ -326,6 +363,20 @@
       reader: pane ? pane.scrollTop : 0,
       thread: pane ? pane.dataset.threadId : null
     };
+    /* Mail draws no page heading — the one thing workspace.js's own
+       after-navigate rule (focusNewPage) has to land keyboard focus on, and
+       it explicitly skips that rule for a route change within Mail besides,
+       since opening a thread, starring one or marking one unread are all
+       exactly that: a route change inside the same page. Left alone, the
+       keyboard fell to <body> on every one of those. Every call to render()
+       while on this page passes through here, whoever asked for it, so
+       focus is saved and restored here the same way repaintKeepingFocus does
+       it (app.js) — reused directly: it is a plain top-level const there,
+       and this file already relies on classic scripts sharing one scope. */
+    const active = document.activeElement;
+    const key = typeof focusKey === 'function' ? focusKey(active) : null;
+    const selection = key && active && typeof active.selectionStart === 'number'
+      ? [active.selectionStart, active.selectionEnd] : null;
     mailComposer.beforeRender();
     try {
       baseRender();
@@ -336,6 +387,16 @@
     const nextPane = document.querySelector('.reader');
     if (nextList) nextList.scrollTop = before.list;
     if (nextPane && before.thread && nextPane.dataset.threadId === before.thread) nextPane.scrollTop = before.reader;
+    if (key) {
+      const next = document.querySelectorAll(key.selector)[key.index];
+      if (next && next !== document.activeElement) {
+        if (key.heading) next.setAttribute('tabindex', '-1');
+        next.focus({ preventScroll: true });
+        if (selection && next.setSelectionRange) {
+          try { next.setSelectionRange(selection[0], selection[1]); } catch (noCaret) { /* not every field has a caret to put back */ }
+        }
+      }
+    }
   };
 
   /* ── Writes ────────────────────────────────────────────────────────── */
@@ -358,20 +419,37 @@
     workspaceActions.markThreadRead(thread.id, true)
       .then(result => {
         replaceThread(thread.id, { unread: false, row: { is_read: true } });
-        repaintWhenIdle();
         warnIfOutlookMissed(result);
       })
       .catch(err => {
         console.error('[mail] could not mark the conversation read:', err);
         readFailed = Object.freeze({ ...readFailed, [thread.id]: true });
+        /* Silent before this: the thread stayed bold with nothing said, and
+           the only way back was a full reload. */
+        toast(err.message || 'Could not mark the conversation as read.');
       })
       .then(() => {
         const { [thread.id]: _finished, ...rest } = markingRead;
         markingRead = Object.freeze(rest);
+        /* Always, success or failure: a failure needs the retry note drawn,
+           which repaintWhenIdle used to run only on success. */
+        repaintWhenIdle();
       });
   }
 
   document.body.addEventListener('workspace:loaded', () => { readFailed = Object.freeze({}); });
+
+  /* A disabled button loses focus to <body> at once, in every browser — well
+     before the write it disabled itself for has even answered — so by the
+     time render() runs, there is nothing left for its own focus-preservation
+     to have captured. Found by hand-tracing this file's disable-then-await
+     pattern: nothing here was ever a unit test's business, since jsdom-free
+     node has no such thing as browser focus at all. Put back explicitly, by
+     id, once the button (or its stand-in after a route change) exists again. */
+  function refocusMailControl(id) {
+    const el = document.getElementById(id);
+    if (el && typeof el.focus === 'function') el.focus({ preventScroll: true });
+  }
 
   /* Not optimistic, like the rest of the workspace: the star changes when the
      database says it did. */
@@ -379,15 +457,18 @@
     const thread = threadById(button.dataset.mailStar);
     if (!thread || !live()) return;
     const wanted = !thread.starred;
+    const id = button.id;
     button.disabled = true;
     workspaceActions.starThread(thread.id, wanted)
       .then(result => {
         replaceThread(thread.id, { starred: wanted, row: { is_starred: wanted } });
         render();
+        refocusMailControl(id);
         warnIfOutlookMissed(result);
       })
       .catch(err => {
         button.disabled = false;
+        button.focus({ preventScroll: true });
         toast(err.message || 'That did not save.');
       });
   }
@@ -402,11 +483,16 @@
         const route = M.parseMailRoute(routeParts);
         /* Close it, or the open reader would mark it read again at once. */
         navigate(M.mailRoute({ mailbox: route.mailbox, folder: route.folder }));
+        /* The button itself is gone once the reader closes: the keyboard
+           goes to the conversation's own row in the list, now shown bold
+           again, rather than falling to the page. */
+        refocusMailControl(`mail-thread-${thread.id}`);
         toast('Marked as unread');
         warnIfOutlookMissed(result);
       })
       .catch(err => {
         button.disabled = false;
+        button.focus({ preventScroll: true });
         toast(err.message || 'That did not save.');
       });
   }
@@ -456,7 +542,12 @@
     }
     if (!live()) { toast('Mail is still loading.'); return; }
     const boxes = mailboxes();
-    if (!boxes.length) { toast('Connect a mailbox to send mail from the workspace.'); return; }
+    if (!boxes.length) {
+      toast(workspaceStore.state.mailboxesFailed
+        ? 'Your mailboxes did not load. Try again in a moment.'
+        : 'Connect a mailbox to send mail from the workspace.');
+      return;
+    }
     const route = M.parseMailRoute(page === 'mail' ? routeParts : []);
     const from = boxes.find(b => b.id === route.mailbox) || boxes[0];
     const opened = mailComposer.open({
@@ -556,8 +647,28 @@
   window.addEventListener('focus', backFromMicrosoft);
   document.addEventListener('visibilitychange', backFromMicrosoft);
 
+  /* An address inside a message: opened in the composer, not a new browser
+     tab (mail-html.js sets no target/rel on a mailto: link precisely so
+     there is nothing else that would open it). Split on the first "?" before
+     anything else: a mailto: may name more than one address, comma-separated
+     ("mailto:a@x,b@y?subject=…"), and letting M.parseAddresses see the whole
+     href would leave the query string stuck to the LAST one only — the
+     comma splits it away from the "mailto:" prefix its own stripping looks
+     for. compose() re-parses `to` itself, so a plain address string is all
+     it needs here. */
+  function mailtoClicked(link) {
+    const href = String(link.getAttribute('href') || '');
+    const [addresses, ...queryParts] = href.split('?');
+    const to = addresses.replace(/^mailto:/i, '');
+    if (!M.parseAddresses(to).valid.length) return;
+    const params = new URLSearchParams(queryParts.join('?'));
+    compose(to, params.get('subject') || '', params.get('body') || '');
+  }
+
   document.addEventListener('click', e => {
     if (page !== 'mail' || !e.target.closest) return;
+    const mailto = e.target.closest('.mail-body a[href^="mailto:" i]');
+    if (mailto) { e.preventDefault(); mailtoClicked(mailto); return; }
     const reconnectButton = e.target.closest('[data-mail-reconnect]');
     if (reconnectButton) { e.preventDefault(); reconnect(reconnectButton); return; }
     const star = e.target.closest('[data-mail-star]');
@@ -578,6 +689,17 @@
     }
     const retry = e.target.closest('[data-mail-retry]');
     if (retry) { e.preventDefault(); workspaceStore.retryThread(retry.dataset.mailRetry); render(); return; }
+    const retryRead = e.target.closest('[data-mail-retry-read]');
+    if (retryRead) {
+      e.preventDefault();
+      const id = retryRead.dataset.mailRetryRead;
+      const { [id]: _cleared, ...rest } = readFailed;
+      readFailed = Object.freeze(rest);
+      const thread = threadById(id);
+      if (thread) markRead(thread);
+      render();
+      return;
+    }
     const toggle = e.target.closest('[data-mail-expand]');
     if (toggle) {
       e.preventDefault();
@@ -604,6 +726,35 @@
     const route = M.parseMailRoute(routeParts);
     navigate(M.mailRoute({ mailbox: select.value, folder: route.folder }));
   });
+
+  /* workspace.js's own [data-query] handler (redrawPreservingFocus) rebuilds
+     the whole page on every keystroke, with no pause between them — fine for
+     the CRM or a project list, not for a mailbox that can hold hundreds of
+     conversations. That handler is shared by four searches and is not this
+     batch's to change, so mail's own is caught here first — registered on
+     the capture phase, which runs before the bubble-phase listener workspace.js
+     added earlier — and stopImmediatePropagation keeps that other handler from
+     ever seeing the keystroke at all. The other three searches are untouched. */
+  let mailSearchDebounce = null;
+  const MAIL_SEARCH_DEBOUNCE_MS = 200;
+  document.addEventListener('input', e => {
+    if (!e.target.matches || !e.target.matches('[data-query="mail"]')) return;
+    e.stopImmediatePropagation();
+    const input = e.target;
+    const value = input.value;
+    clearTimeout(mailSearchDebounce);
+    mailSearchDebounce = setTimeout(() => {
+      mailSearchDebounce = null;
+      queries.mail = value;
+      const start = input.selectionStart;
+      render();
+      const next = document.querySelector('[data-query="mail"]');
+      if (next) {
+        next.focus();
+        if (next.setSelectionRange) { try { next.setSelectionRange(start, start); } catch (noCaret) { /* not focused, or not that kind of field */ } }
+      }
+    }, MAIL_SEARCH_DEBOUNCE_MS);
+  }, true);
 
   /* workspace.js navigates to the starting route before this file runs, so a
      link straight to mail was painted by the old view. Paint it with this one. */
