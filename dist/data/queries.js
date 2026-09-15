@@ -624,7 +624,7 @@
         var q = sb()
           .from('mail_threads')
           .select('id, connection_id, subject, snippet, folder, is_read, is_starred, message_count, ' +
-                  'last_message_at, last_from_name, last_from_email, ticket_id, contact_id, ' +
+                  'last_message_at, other_party_name, other_party_email, ticket_id, contact_id, ' +
                   'contact:crm_contacts (full_name, email)');
         /* Starred reaches past the folders listed: a conversation filed away in
            Outlook (0045) with a flag on it is still one you marked to come back
@@ -650,17 +650,19 @@
         .sort(function (a, b) { return String(b.last_message_at || '').localeCompare(String(a.last_message_at || '')); });
 
       var threads = rows.map(function (r) {
-        /* Who wrote, in decreasing order of how much we know about them. The
-           subject is NOT a fallback here — it was, and the list showed a
-           column of subject lines under a heading meant for names. */
+        /* Who the OTHER party is, in decreasing order of how much we know
+           about them — never whoever sent the newest message (0055: that was
+           "last_from_name", and showed our own name on a thread we replied
+           to). The subject is NOT a fallback here — it was, and the list
+           showed a column of subject lines under a heading meant for names. */
         var who = (r.contact && r.contact.full_name)
-               || r.last_from_name
-               || r.last_from_email
+               || r.other_party_name
+               || r.other_party_email
                || 'Unknown sender';
         var day = shortDate(r.last_message_at);
         return {
           id: r.id, sender: who, initial: initials(who),
-          email: (r.contact && r.contact.email) || r.last_from_email || '',
+          email: (r.contact && r.contact.email) || r.other_party_email || '',
           subject: r.subject || '(no subject)', preview: r.snippet || '',
           /* A clock time only for today's mail. "09:14" on a thread from last
              week reads as this morning. */
@@ -681,8 +683,15 @@
     async mailMessages(threadId) {
       var rows = unwrap(await sb()
         .from('mail_messages')
-        .select('id, external_id, direction, from_name, from_email, to_emails, cc_emails, ' +
-                'subject, body_text, body_html, sent_at')
+        .select('id, external_id, direction, from_name, from_email, to_emails, cc_emails, bcc_emails, ' +
+                'subject, body_text, body_html, sent_at, importance, ' +
+                /* One embed rather than a second round trip per message
+                   (0055) — mail_attachments is metadata only: name, kind,
+                   size and, for an inline image, its cid. There is nowhere to
+                   fetch the bytes from yet, so an inline <img src="cid:…">
+                   still will not render; a named, sized attachment list is
+                   what this makes possible today. */
+                'mail_attachments (id, name, content_type, size, is_inline, content_id)')
         .eq('thread_id', threadId)
         .order('sent_at'), 'the conversation');
       /* body_html rides along, but ONLY data/mail-html.js may render it — it is
@@ -694,7 +703,15 @@
           email: r.from_email || '', subject: r.subject || '',
           body: r.body_text || '', bodyHtml: r.body_html || '',
           time: clockTime(r.sent_at), date: shortDate(r.sent_at),
-          to: r.to_emails || [], cc: r.cc_emails || [],
+          to: r.to_emails || [], cc: r.cc_emails || [], bcc: r.bcc_emails || [],
+          importance: r.importance || 'normal',
+          attachments: (r.mail_attachments || []).map(function (a) {
+            return {
+              id: a.id, name: a.name || 'attachment', size: a.size || 0,
+              contentType: a.content_type || 'application/octet-stream',
+              isInline: Boolean(a.is_inline), contentId: a.content_id || null
+            };
+          }),
           outbound: r.direction === 'outbound', row: r
         };
       });
@@ -716,6 +733,26 @@
         ? query.or('employee_id.is.null,employee_id.eq.' + me.id)
         : query.is('employee_id', null);
       return unwrap(await query.order('account_label'), 'mailboxes');
+    },
+
+    /* Every message this person could already open, not only the folders and
+       200-per-page loaded on screen (mailThreads above) — a word search_mail
+       (0055) finds in a subject, a sender, or a message body. A blank query
+       is not asked at all: the database already answers nothing for one, and
+       skipping the round trip is one less place a slow network shows. */
+    async searchMail(q) {
+      var query = String(q || '').trim();
+      if (!query) return [];
+      var res = await sb().rpc('search_mail', { p_query: query, p_limit: 30 });
+      if (res.error) throw new Error('Could not search mail: ' + res.error.message);
+      return (res.data || []).map(function (r) {
+        var day = shortDate(r.sent_at);
+        return {
+          threadId: r.thread_id, mailboxId: r.connection_id,
+          subject: r.subject || '(no subject)', preview: r.snippet || '',
+          time: day === 'Today' ? clockTime(r.sent_at) : day, row: r
+        };
+      });
     },
 
     /* The signed-in person's own signatures: one per mailbox, and at most one
