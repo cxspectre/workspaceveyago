@@ -71,6 +71,11 @@ function workspace(answer, { storage, purify, manager = true, rows, fail } = {})
         written[index] = { ...written[index], where: [...(written[index].where || []), [column, { in: [...values] }]] };
         return chain;
       },
+      /* not('col', 'is', null) — "column is not null" — the negation of is(). */
+      not: (column, op, value) => {
+        written[index] = { ...written[index], where: [...(written[index].where || []), [column, { not: [op, value] }]] };
+        return chain;
+      },
       /* supabase-js hands rows back only to a write that asked for them. */
       select: () => { selected = true; return chain; },
       single: async () => (error ? { data: null, error } : { data: { id: 'new-row', ...change }, error: null }),
@@ -101,7 +106,7 @@ function workspace(answer, { storage, purify, manager = true, rows, fail } = {})
     console,
     window: { workspaceSession: session, DOMPurify: purify, crypto: globalThis.crypto }
   });
-  for (const file of ['mail-model.js', 'projects-model.js', 'data/actions.js']) {
+  for (const file of ['mail-model.js', 'projects-model.js', 'tickets-model.js', 'data/actions.js']) {
     vm.runInContext(readFileSync(new URL(`../dist/${file}`, import.meta.url), 'utf8'), context);
   }
   return { actions: context.window.workspaceActions, invoked, written };
@@ -377,6 +382,159 @@ test('a ticket\'s priority, owner and status are written to that ticket, and "Un
     { table: 'support_tickets', what: 'update', change: { assignee_id: null }, where: [['id', TICKET]] },
     { table: 'support_tickets', what: 'update', change: { status: 'waiting' }, where: [['id', TICKET]] }
   ]);
+});
+
+test('assigning a ticket also tells the new owner; Unassigned tells nobody, and a failure there does not undo the save', async () => {
+  const given = workspace(async (name) => ({ data: { ok: true }, error: null }), { rows: () => [{ id: TICKET, assignee_id: 'e2' }] });
+  const row = await given.actions.assignTicket(TICKET, 'e2');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(row.assignee_id, 'e2');
+  assert.deepEqual(given.invoked.map((i) => [i.name, i.body]), [['notify-ticket', { ticket_id: TICKET, event: 'assigned' }]]);
+
+  const cleared = workspace(async () => ({ data: { ok: true }, error: null }), { rows: () => [{ id: TICKET, assignee_id: null }] });
+  await cleared.actions.assignTicket(TICKET, '');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(cleared.invoked, [], 'Unassigned tells nobody — there is no one to tell');
+
+  const notifyFails = workspace(async () => { throw new Error('network blip'); }, { rows: () => [{ id: TICKET, assignee_id: 'e2' }] });
+  const savedAnyway = await notifyFails.actions.assignTicket(TICKET, 'e2');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(savedAnyway.assignee_id, 'e2', 'the reassignment itself is not undone by a notification failure');
+});
+
+test('a new ticket carries a sender\'s raw address when the CRM has no contact for them', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: 'new-row' }] });
+  await ws.actions.createTicket({ subject: 'A question', requesterEmail: 'guest@example.invalid', requesterName: 'A Guest' });
+  assert.deepEqual(ws.written[0].change.requester_email, 'guest@example.invalid');
+  assert.deepEqual(ws.written[0].change.requester_name, 'A Guest');
+});
+
+test('an edit to a ticket sends only what changed, against when it was opened; nothing changed or an empty subject is a refusal', async () => {
+  const STAMP = '2026-09-15T08:00:00.123456+00:00';
+  const saved = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: TICKET, subject: 'Renamed' }] });
+  const row = await saved.actions.updateTicket(TICKET, { subject: 'Renamed', contact_id: 'c1' }, STAMP);
+  assert.equal(row.subject, 'Renamed');
+  assert.deepEqual(saved.written[0].where, [['id', TICKET], ['updated_at', STAMP]]);
+  assert.deepEqual(saved.written[0].change, { subject: 'Renamed', contact_id: 'c1' });
+
+  const unstamped = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: TICKET }] });
+  await unstamped.actions.updateTicket(TICKET, { product: 'Kept' });
+  assert.deepEqual(unstamped.written[0].where, [['id', TICKET]], 'with no stamp to go by, the ticket as it is');
+
+  const refused = workspace(async () => ({ data: null, error: null }), { rows: () => [] });
+  await assert.rejects(refused.actions.updateTicket(TICKET, { subject: 'Renamed' }, STAMP),
+    { message: 'The ticket was not saved: it was changed since this was opened, or you may not change it. Close this and open the ticket again.' });
+
+  const sneaky = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: TICKET }] });
+  await assert.rejects(sneaky.actions.updateTicket(TICKET, { assignee_id: 'e2', subject: 'Renamed' }),
+    { message: 'Only a ticket’s subject, contact, company, project and product can be changed here.' });
+  await assert.rejects(sneaky.actions.updateTicket(TICKET, {}), { message: 'Nothing was changed.' });
+  await assert.rejects(sneaky.actions.updateTicket(TICKET, { subject: '  ' }), { message: 'A ticket needs a subject.' });
+});
+
+test('deleting a ticket is a manager-only soft delete, and one already deleted is a refusal', async () => {
+  const deleted = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: TICKET }] });
+  await deleted.actions.deleteTicket(TICKET);
+  assert.equal(deleted.written[0].table, 'support_tickets');
+  assert.ok('deleted_at' in deleted.written[0].change);
+  assert.deepEqual(deleted.written[0].where, [['id', TICKET], ['deleted_at', { is: null }]]);
+
+  const staff = workspace(async () => ({ data: null, error: null }), { manager: false });
+  await assert.rejects(staff.actions.deleteTicket(TICKET), { message: 'Only an owner or admin can delete a ticket.' });
+  assert.equal(staff.written.length, 0, 'refused before it reaches the database');
+
+  const already = workspace(async () => ({ data: null, error: null }), { rows: () => [] });
+  await assert.rejects(already.actions.deleteTicket(TICKET),
+    { message: 'The ticket was not deleted: it has been removed already, or only an owner or admin can remove one.' });
+});
+
+test('restoring a ticket is by its number, manager-only, and a ticket that was not deleted is a refusal', async () => {
+  const restored = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: TICKET }] });
+  await restored.actions.restoreTicket(142);
+  assert.deepEqual(restored.written[0].change, { deleted_at: null });
+  assert.deepEqual(restored.written[0].where, [['number', 142], ['deleted_at', { not: ['is', null] }]]);
+
+  const staff = workspace(async () => ({ data: null, error: null }), { manager: false });
+  await assert.rejects(staff.actions.restoreTicket(142), { message: 'Only an owner or admin can restore a ticket.' });
+
+  const notNumber = workspace(async () => ({ data: null, error: null }));
+  await assert.rejects(notNumber.actions.restoreTicket(NaN), { message: 'That is not a ticket number.' });
+  assert.equal(notNumber.written.length, 0);
+
+  const notDeleted = workspace(async () => ({ data: null, error: null }), { rows: () => [] });
+  await assert.rejects(notDeleted.actions.restoreTicket(142),
+    { message: 'No deleted ticket has that number, or only an owner or admin can restore one.' });
+});
+
+test('a ticket attachment is stored before it is recorded, and taken away again if the record fails to save', async () => {
+  const uploaded = [];
+  const removedFromStorage = [];
+  const storage = bucket => ({
+    upload: async (path, file, opts) => { uploaded.push({ bucket, path, opts }); return { error: null }; },
+    remove: async paths => { removedFromStorage.push({ bucket, paths }); return { error: null }; }
+  });
+  const file = { name: 'shot.png', size: 1024, type: 'image/png' };
+
+  const ok = workspace(async () => ({ data: null, error: null }), { storage });
+  await ok.actions.uploadTicketAttachment(TICKET, file);
+  assert.equal(uploaded.length, 1);
+  assert.equal(uploaded[0].bucket, 'ticket-attachments');
+  assert.match(uploaded[0].path, new RegExp('^' + TICKET + '/'));
+  assert.equal(ok.written[0].table, 'ticket_attachments');
+  assert.equal(ok.written[0].change.name, 'shot.png');
+  assert.equal(ok.written[0].change.size_bytes, 1024);
+
+  const failing = workspace(async () => ({ data: null, error: null }),
+    { storage, fail: table => (table === 'ticket_attachments' ? { message: 'permission denied' } : null) });
+  await assert.rejects(failing.actions.uploadTicketAttachment(TICKET, file), { message: 'Could not add "shot.png" to the ticket: permission denied' });
+  assert.equal(removedFromStorage.length, 1, 'the stored file is taken away again when its record does not save');
+
+  const empty = workspace(async () => ({ data: null, error: null }), { storage });
+  await assert.rejects(empty.actions.uploadTicketAttachment(TICKET, { name: 'x.png', size: 0 }), /is empty/);
+  const tooBig = workspace(async () => ({ data: null, error: null }), { storage });
+  await assert.rejects(tooBig.actions.uploadTicketAttachment(TICKET, { name: 'x.png', size: 30 * 1024 * 1024 }), /larger than 25 MB/);
+});
+
+test('removing an attachment takes the file from storage first, then its record; a refusal is said as one', async () => {
+  const storage = () => ({ remove: async () => ({ error: null }) });
+  const removed = workspace(async () => ({ data: null, error: null }), { storage, rows: () => [{ id: 'a1' }] });
+  await removed.actions.removeTicketAttachment({ id: 'a1', name: 'shot.png', storagePath: 'u1/a1/shot.png' });
+  assert.deepEqual(removed.written[0], { table: 'ticket_attachments', what: 'delete', change: {}, where: [['id', 'a1']] });
+
+  const refused = workspace(async () => ({ data: null, error: null }), { storage, rows: () => [] });
+  await assert.rejects(refused.actions.removeTicketAttachment({ id: 'a1', name: 'shot.png', storagePath: 'u1/a1/shot.png' }),
+    { message: 'Only whoever uploaded it, or an owner or admin, can remove this attachment.' });
+});
+
+test('a signed download link must be one Supabase actually gave back', async () => {
+  const storage = () => ({ createSignedUrl: async () => ({ data: { signedUrl: 'https://x.supabase.co/sign/a1' }, error: null }) });
+  const ws = workspace(async () => ({ data: null, error: null }), { storage });
+  assert.equal(await ws.actions.ticketAttachmentLink('u1/a1/shot.png', 'shot.png'), 'https://x.supabase.co/sign/a1');
+
+  const untrusted = workspace(async () => ({ data: null, error: null }), { storage: () => ({ createSignedUrl: async () => ({ data: { signedUrl: 'javascript:alert(1)' }, error: null }) }) });
+  await assert.rejects(untrusted.actions.ticketAttachmentLink('u1/a1/shot.png', 'shot.png'), { message: 'Could not open the file.' });
+});
+
+test('merging calls merge_tickets(keep, drop) and hands back an error in its own words', async () => {
+  const calls = [];
+  const context = vm.createContext({
+    console,
+    window: {
+      workspaceSession: {
+        client: { rpc: (name, args) => { calls.push([name, { ...args }]); return Promise.resolve({ data: 'kept-id', error: null }); } }
+      }
+    }
+  });
+  for (const file of ['mail-model.js', 'projects-model.js', 'data/actions.js']) {
+    vm.runInContext(readFileSync(new URL(`../dist/${file}`, import.meta.url), 'utf8'), context);
+  }
+  const kept = await context.window.workspaceActions.mergeTickets('u-keep', 'u-drop');
+  assert.equal(kept, 'kept-id');
+  assert.deepEqual(calls, [['merge_tickets', { p_keep: 'u-keep', p_drop: 'u-drop' }]]);
+
+  context.window.workspaceSession.client.rpc = () => Promise.resolve({ data: null, error: { message: 'A ticket cannot be merged into itself' } });
+  await assert.rejects(context.window.workspaceActions.mergeTickets('u-keep', 'u-keep'),
+    { message: 'Could not merge the tickets: A ticket cannot be merged into itself' });
 });
 
 /* ── Booking ──────────────────────────────────────────────────────────── */

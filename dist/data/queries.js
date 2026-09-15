@@ -401,29 +401,36 @@
     async tickets() {
       var rows = unwrap(await sb()
         .from('support_tickets')
-        .select('id, number, subject, product, priority, status, source, created_at, first_response_at, resolved_at, ' +
-                'project_id, company_id, contact_id, assignee_id, ' +
+        .select('id, number, subject, product, priority, status, source, created_at, updated_at, ' +
+                'first_response_at, resolved_at, first_response_due_at, resolve_due_at, ' +
+                'project_id, company_id, contact_id, assignee_id, merged_into_id, ' +
+                'requester_name, requester_email, ' +
                 'contact:crm_contacts (full_name, email), company:crm_companies (name), ' +
                 'assignee:employees (full_name), ' +
-                /* The queue view shows the opening message under each row, and
-                   the detail view the whole thread: who wrote each message, and
-                   whether a reply reached the customer (0033). Both come from
-                   this one embed rather than a second round trip per ticket. */
-                'ticket_messages (id, body, direction, created_at, delivered_at, delivery_error, ' +
-                'author:employees (full_name), sender:crm_contacts (full_name))')
+                /* Enough of each message to know whether the conversation
+                   changed since it was last read — its id, direction and
+                   delivery — never its words or who wrote it: that used to
+                   come with every ticket on every load (audit #12), the
+                   heaviest part of a row that mostly goes unread. The whole
+                   conversation is a separate call (ticketMessages), asked for
+                   once a ticket's page actually needs it, the same way a mail
+                   thread's body is kept apart from its list. */
+                'ticket_messages (id, direction, created_at, delivered_at, delivery_error)')
         .is('deleted_at', null)
         .order('created_at', { ascending: false }), 'tickets');
       return rows.map(function (r) {
-        var client = (r.contact && r.contact.full_name)
-                  || (r.company && r.company.name) || 'Unknown';
-        var thread = (r.ticket_messages || []).map(function (m) {
-          return Object.assign({}, m, {
-            who: (m.author && m.author.full_name) || (m.sender && m.sender.full_name) || ''
-          });
-        }).sort(function (a, b) {
+        var messages = (r.ticket_messages || []).slice().sort(function (a, b) {
           return String(a.created_at).localeCompare(String(b.created_at));
         });
-        var opening = thread.filter(function (m) { return m.direction === 'inbound'; })[0];
+        var lastOutbound = messages.filter(function (m) { return m.direction === 'outbound'; }).pop();
+        var client = (r.contact && r.contact.full_name)
+                  || (r.company && r.company.name)
+                  /* A sender no CRM contact matched (audit #1) is still someone
+                     to answer: routing (route_mail_to_ticket) and manual
+                     creation both keep the raw name and address they arrived
+                     with, so the ticket is never just "Unknown" with nowhere
+                     for a reply to go. */
+                  || r.requester_name || r.requester_email || 'Unknown';
         return {
           id: r.number, uuid: r.id, title: r.subject, client: client,
           product: r.product || '—',
@@ -432,44 +439,63 @@
           /* "Assigned to me" is this id — it was a set of initials. */
           assigneeId: r.assignee_id || null,
           assigneeName: r.assignee ? r.assignee.full_name : '',
-          contactEmail: (r.contact && r.contact.email) || '',
+          contactEmail: (r.contact && r.contact.email) || r.requester_email || '',
           date: shortDate(r.created_at),
-          body: opening ? opening.body : '',
-          thread: thread, row: r
+          /* How many messages the conversation has, and when the last one
+             arrived: what tells the store's cached copy of the whole
+             conversation (data/store.js askTicketThread) from one worth
+             asking for again, without carrying every message's words here to
+             find out. */
+          messageCount: messages.length,
+          lastMessageAt: messages.length ? messages[messages.length - 1].created_at : null,
+          /* Whether the most recent reply reached the customer — shown in the
+             queue so a failed send is found without opening the ticket. */
+          deliveryFailed: Boolean(lastOutbound && lastOutbound.delivery_error && !lastOutbound.delivered_at),
+          mergedIntoId: r.merged_into_id || null,
+          /* Not loaded with the list (see the embed's comment above); asked
+             for by the ticket's page through workspaceStore.askTicketThread. */
+          thread: null, row: r
         };
       });
     },
 
-    /* A ticket with its whole thread, oldest first — the order you read it in. */
-    async ticket(uuid) {
-      var head = await sb()
-        .from('support_tickets')
-        .select('*, contact:crm_contacts (full_name, email), company:crm_companies (name), ' +
-                'assignee:employees (full_name), project:client_projects (name)')
-        .eq('id', uuid).maybeSingle();
-      if (head.error) throw new Error('Could not load the ticket: ' + head.error.message);
-      if (!head.data) return null;
-
-      var messages = unwrap(await sb()
+    /* A ticket's whole conversation, oldest first, with who wrote each
+       message — asked for once a ticket's page is open (data/store.js), not
+       with every ticket on every load (audit #12). */
+    async ticketMessages(ticketId) {
+      var rows = unwrap(await sb()
         .from('ticket_messages')
-        .select('id, direction, body, created_at, author_employee:employees (full_name), ' +
-                'author_contact:crm_contacts (full_name)')
-        .eq('ticket_id', uuid)
-        .order('created_at'), 'the ticket thread');
+        .select('id, body, direction, created_at, delivered_at, delivery_error, ' +
+                'author:employees (full_name), sender:crm_contacts (full_name)')
+        .eq('ticket_id', ticketId)
+        .order('created_at'), 'the ticket\'s conversation');
+      return rows.slice().sort(function (a, b) {
+        return String(a.created_at).localeCompare(String(b.created_at));
+      }).map(function (m) {
+        return Object.assign({}, m, {
+          who: (m.author && m.author.full_name) || (m.sender && m.sender.full_name) || ''
+        });
+      });
+    },
 
-      return {
-        ticket: head.data,
-        messages: messages.map(function (m) {
-          var who = (m.author_employee && m.author_employee.full_name)
-                 || (m.author_contact && m.author_contact.full_name)
-                 || (m.direction === 'inbound' ? 'Customer' : 'Veyago');
-          return {
-            id: m.id, who: who, initial: initials(who), body: m.body,
-            direction: m.direction, internal: m.direction === 'internal',
-            when: shortDate(m.created_at), row: m
-          };
-        })
-      };
+    /* A ticket's attachments, newest first — audit #11. Most come with a
+       message (message_id set, from an incoming email); one added straight to
+       the ticket has none. */
+    async ticketAttachments(ticketId) {
+      var rows = unwrap(await sb()
+        .from('ticket_attachments')
+        .select('id, message_id, storage_path, name, size_bytes, content_type, uploaded_by, created_at, ' +
+                'uploader:employees (full_name)')
+        .eq('ticket_id', ticketId)
+        .order('created_at', { ascending: false }), 'the ticket\'s attachments');
+      return rows.map(function (r) {
+        return {
+          id: r.id, name: r.name, sizeBytes: r.size_bytes, contentType: r.content_type,
+          storagePath: r.storage_path, messageId: r.message_id,
+          uploadedBy: r.uploaded_by || null, uploaderName: r.uploader ? r.uploader.full_name : '',
+          createdAt: r.created_at
+        };
+      });
     },
 
     /* ── Projects ────────────────────────────────────────────────────── */

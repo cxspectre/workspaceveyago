@@ -31,7 +31,10 @@ const CAL = { loadFrom: '2026-09-14T00:00:00.000Z', loadTo: '2026-09-21T00:00:00
               onChange() {}, contains() { return true; } };
 `;
 
-const ticket = (over = {}) => ({ id: 1, uuid: 't1', title: 'Broken login', status: 'Open', priority: 'High', ...over });
+const ticket = (over = {}) => ({
+  id: 1, uuid: 't1', title: 'Broken login', status: 'Open', priority: 'High',
+  messageCount: 0, lastMessageAt: null, thread: null, ...over
+});
 const projectRow = () => ({
   id: 'a1000000-0000-4000-8000-000000000001', name: 'Northline site', client: 'Northline', initial: 'N',
   style: 'client', progress: 0, due: '', status: 'In progress', description: '',
@@ -57,6 +60,8 @@ function answers(over = {}) {
     mailboxes: async () => [],
     mailThreads: async () => ({ threads: [], truncated: [] }),
     mailMessages: async () => [{ body: 'hello', bodyHtml: '' }],
+    ticketMessages: async () => [],
+    ticketAttachments: async () => [],
     overview: async () => ({ tickets_open: 1 }),
     revenueSeries: async () => [],
     revenueMix: async () => [],
@@ -841,6 +846,93 @@ test('a conversation fetched while a new message arrived is fetched again, not k
   await tick();
   assert.equal(fetches, 2, 'asked again for the thread as it is now');
   assert.equal(s.store.threadBody('th1').length, 3, 'two messages were never kept for a thread of three');
+});
+
+/* ── A ticket's conversation and attachments (audit #12) ─────────────────
+   The list embeds only a message count and the last one's time (queries.js),
+   never every message's words — so a ticket's whole conversation is asked for
+   apart, kept while the count and the last message's time say nothing has
+   changed, and asked again the moment they do. */
+
+test('a ticket\'s conversation is fetched once it is asked for, and kept through a refresh that did not touch it', async () => {
+  let count = 2, last = '2026-09-14T09:00:00Z', fetches = 0;
+  const s = start(answers({
+    tickets: async () => [ticket({ messageCount: count, lastMessageAt: last })],
+    ticketMessages: async () => { fetches++; return [{ id: 'm1', body: 'Broken', direction: 'inbound', who: 'Ana Lima' }]; }
+  }));
+  await s.store.load();
+  assert.equal(s.store.askTicketThread(s.read('tickets')[0]).state, 'loading', 'not there yet');
+  await tick();
+  assert.equal(fetches, 1);
+  assert.equal(s.store.askTicketThread(s.read('tickets')[0]).state, 'ready');
+  assert.equal(s.store.askTicketThread(s.read('tickets')[0]).messages[0].body, 'Broken');
+
+  await s.store.load({ quiet: true });
+  assert.equal(s.store.askTicketThread(s.read('tickets')[0]).state, 'ready', 'still there after a refresh that changed nothing');
+  await tick();
+  assert.equal(fetches, 1, 'not asked again');
+
+  count = 3; last = '2026-09-14T10:00:00Z';
+  await s.store.load({ quiet: true });
+  assert.equal(s.store.askTicketThread(s.read('tickets')[0]).state, 'loading', 'a new message means the cached copy no longer answers for it');
+  await tick();
+  assert.equal(fetches, 2, 'asked again because the count and the last message moved on');
+});
+
+test('a ticket\'s conversation that did not load says so, and is tried again once asked or once a load works', async () => {
+  let fail = true;
+  const s = start(answers({ ticketMessages: async () => { if (fail) throw new Error('offline'); return []; } }));
+  await s.store.load();
+  const t = s.read('tickets')[0];
+  s.store.askTicketThread(t);
+  await tick();
+  assert.equal(s.store.askTicketThread(t).state, 'failed');
+
+  s.store.retryTicketThread(t.uuid);
+  assert.equal(s.store.askTicketThread(t).state, 'loading', 'asked again as soon as someone asks');
+  await tick();
+  assert.equal(s.store.askTicketThread(t).state, 'failed', 'still offline');
+
+  fail = false;
+  await s.store.load({ quiet: true });
+  assert.equal(s.store.askTicketThread(t).state, 'loading', 'a working load gives it a fresh try by itself');
+  await tick();
+  assert.equal(s.store.askTicketThread(t).state, 'ready');
+});
+
+test('every save anywhere does not reload an open ticket\'s conversation — only its own change does', async () => {
+  let fetches = 0;
+  const s = start(answers({ ticketMessages: async () => { fetches++; return []; } }));
+  await s.store.load();
+  const t = s.read('tickets')[0];
+  s.store.askTicketThread(t);
+  await tick();
+  assert.equal(fetches, 1);
+  /* after() is what every write in the workspace calls once it has landed —
+     a project's status, a note, anything — not only a change to this ticket. */
+  await s.store.after(Promise.resolve());
+  assert.equal(s.store.askTicketThread(s.read('tickets')[0]).state, 'ready', 'kept: nothing about this ticket changed');
+  await tick();
+  assert.equal(fetches, 1, 'the conversation is not pulled again for a save that has nothing to do with it');
+});
+
+test('a ticket\'s attachments load once its page asks, and are asked again after a write', async () => {
+  let files = [{ id: 'a1', name: 'shot.png' }];
+  let fetches = 0;
+  const s = start(answers({ ticketAttachments: async () => { fetches++; return files; } }));
+  await s.store.load();
+  const t = s.read('tickets')[0];
+  assert.equal(s.store.askTicketAttachments(t.uuid).state, 'loading');
+  await tick();
+  assert.equal(fetches, 1);
+  assert.deepEqual(s.store.askTicketAttachments(t.uuid).files.map(f => f.id), ['a1']);
+
+  files = [{ id: 'a1', name: 'shot.png' }, { id: 'a2', name: 'log.txt' }];
+  await s.store.after(Promise.resolve());
+  assert.equal(s.store.askTicketAttachments(t.uuid).state, 'loading', 'a write anywhere may have added or removed one');
+  await tick();
+  assert.equal(fetches, 2);
+  assert.deepEqual(s.store.askTicketAttachments(t.uuid).files.map(f => f.id), ['a1', 'a2']);
 });
 
 test('activity entries keep who, when and what they are about — thirty of them', async () => {

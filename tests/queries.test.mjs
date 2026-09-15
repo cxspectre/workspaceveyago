@@ -133,30 +133,91 @@ test('Starred reaches conversations filed away in Outlook, and Inbox and Sent st
 
 /* ── Tickets ──────────────────────────────────────────────────────────── */
 
-test('a ticket arrives with its owner by id, the customer\'s address, and who wrote each message', async () => {
+/* The list embeds only enough of each message to know whether the
+   conversation changed (id, direction, created_at, delivered_at,
+   delivery_error) — never its body or who wrote it, which used to come with
+   every ticket on every load (audit #12). The whole conversation, worded and
+   attributed, is a separate call (ticketMessages), asked for once a ticket's
+   page actually needs it — the same reason mail keeps a thread's body apart
+   from its list (queries.mailThreads / mailMessages). */
+test('the list asks for enough to know a ticket changed, never a message\'s words', async () => {
   const { data, queries } = loadTables(table => (table !== 'support_tickets' ? [] : [{
     id: 'u142', number: 142, subject: 'Checkout', product: null, priority: 'urgent', status: 'in_progress',
-    created_at: '2026-09-10T09:00:00Z', assignee_id: 'e-me',
+    created_at: '2026-09-10T09:00:00Z', updated_at: '2026-09-10T10:00:00Z', assignee_id: 'e-me',
+    merged_into_id: null, first_response_due_at: '2026-09-10T13:00:00Z', resolve_due_at: '2026-09-11T09:00:00Z',
     contact: { full_name: 'Ana Lima', email: 'ana@northline.example' }, company: null, assignee: { full_name: 'Sam Rivera' },
     ticket_messages: [
-      { id: 'm2', body: 'On it', direction: 'outbound', created_at: '2026-09-10T10:00:00Z',
-        delivered_at: null, delivery_error: 'refused', author: { full_name: 'Sam Rivera' }, sender: null },
-      { id: 'm1', body: 'Broken', direction: 'inbound', created_at: '2026-09-10T09:00:00Z',
-        author: null, sender: { full_name: 'Ana Lima' } }
+      { id: 'm2', direction: 'outbound', created_at: '2026-09-10T10:00:00Z', delivered_at: null, delivery_error: 'refused' },
+      { id: 'm1', direction: 'inbound', created_at: '2026-09-10T09:00:00Z', delivered_at: null, delivery_error: null }
     ]
   }]));
   const [t] = await data.tickets();
   const select = queries[0].calls.find(([method]) => method === 'select')[1];
   for (const part of ['assignee_id', 'contact:crm_contacts (full_name, email)', 'delivered_at', 'delivery_error',
-                      'author:employees (full_name)', 'sender:crm_contacts (full_name)', 'first_response_at']) {
+                      'first_response_at', 'updated_at', 'merged_into_id', 'first_response_due_at', 'resolve_due_at']) {
     assert.ok(select.includes(part), `the query asks for ${part}`);
   }
+  assert.doesNotMatch(select, /\bbody\b/, 'a message\'s words are not in the list query');
+  assert.doesNotMatch(select, /author:employees|sender:crm_contacts/, 'nor who wrote it — that comes with ticketMessages');
   assert.equal(t.assigneeId, 'e-me');
   assert.equal(t.assigneeName, 'Sam Rivera');
   assert.equal(t.contactEmail, 'ana@northline.example');
   assert.equal(t.status, 'In progress');
-  assert.deepEqual([...t.thread.map(m => `${m.id}:${m.who}`)], ['m1:Ana Lima', 'm2:Sam Rivera'], 'oldest first, with who wrote it');
-  assert.equal(t.body, 'Broken');
+  assert.equal(t.thread, null, 'not loaded with the list; store.js asks for it lazily');
+  assert.equal(t.messageCount, 2);
+  assert.equal(t.lastMessageAt, '2026-09-10T10:00:00Z');
+  assert.equal(t.deliveryFailed, true, 'the latest outbound message never delivered');
+  assert.equal(t.mergedIntoId, null);
+});
+
+test('a fallback address stands in for the client and the reply-to address when there is no CRM contact', async () => {
+  const { data } = loadTables(table => (table !== 'support_tickets' ? [] : [{
+    id: 'u143', number: 143, subject: 'A question', product: null, priority: 'normal', status: 'open',
+    created_at: '2026-09-10T09:00:00Z', requester_email: 'guest@example.invalid', requester_name: 'A Guest',
+    contact: null, company: null, assignee: null, ticket_messages: []
+  }]));
+  const [t] = await data.tickets();
+  assert.equal(t.client, 'A Guest', 'the raw sender name, when the CRM has no contact for them');
+  assert.equal(t.contactEmail, 'guest@example.invalid', 'so a reply still has somewhere to go (audit #1)');
+});
+
+test('a delivered reply, or one with nothing sent yet, is not flagged as failed', async () => {
+  const sent = (over) => loadTables(table => (table !== 'support_tickets' ? [] : [Object.assign({
+    id: 'u1', number: 1, subject: 'x', product: null, priority: 'normal', status: 'open',
+    created_at: '2026-09-10T09:00:00Z', contact: null, company: null, assignee: null
+  }, over)]));
+  const delivered = await sent({ ticket_messages: [{ id: 'm1', direction: 'outbound', created_at: '2026-09-10T10:00:00Z', delivered_at: '2026-09-10T10:00:02Z', delivery_error: null }] }).data.tickets();
+  assert.equal(delivered[0].deliveryFailed, false);
+  const none = await sent({ ticket_messages: [] }).data.tickets();
+  assert.equal(none[0].deliveryFailed, false);
+});
+
+test('a ticket\'s whole conversation, oldest first, with who wrote each message', async () => {
+  const { data, queries } = loadTables(table => (table !== 'ticket_messages' ? [] : [
+    { id: 'm2', body: 'On it', direction: 'outbound', created_at: '2026-09-10T10:00:00Z',
+      delivered_at: null, delivery_error: 'refused', author: { full_name: 'Sam Rivera' }, sender: null },
+    { id: 'm1', body: 'Broken', direction: 'inbound', created_at: '2026-09-10T09:00:00Z',
+      author: null, sender: { full_name: 'Ana Lima' } }
+  ]));
+  const thread = await data.ticketMessages('u142');
+  const call = queries.find(q => q.table === 'ticket_messages');
+  const select = call.calls.find(([method]) => method === 'select')[1];
+  for (const part of ['body', 'delivered_at', 'delivery_error', 'author:employees (full_name)', 'sender:crm_contacts (full_name)']) {
+    assert.ok(select.includes(part), `asks for ${part}`);
+  }
+  assert.deepEqual(call.calls.find(([method]) => method === 'eq'), ['eq', 'ticket_id', 'u142']);
+  assert.deepEqual([...thread.map(m => `${m.id}:${m.who}`)], ['m1:Ana Lima', 'm2:Sam Rivera'], 'oldest first, with who wrote it');
+});
+
+test('a ticket\'s attachments, newest first', async () => {
+  const { data, queries } = loadTables(table => (table !== 'ticket_attachments' ? [] : [
+    { id: 'a1', name: 'screenshot.png', size_bytes: 2048, content_type: 'image/png', storage_path: 'u142/a1/screenshot.png', created_at: '2026-09-10T09:00:00Z' }
+  ]));
+  const files = await data.ticketAttachments('u142');
+  const call = queries.find(q => q.table === 'ticket_attachments');
+  assert.deepEqual(call.calls.find(([method]) => method === 'eq'), ['eq', 'ticket_id', 'u142']);
+  assert.equal(files[0].name, 'screenshot.png');
+  assert.equal(files[0].sizeBytes, 2048);
 });
 
 /* ── Agenda and tasks ─────────────────────────────────────────────────── */
