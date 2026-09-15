@@ -866,14 +866,21 @@
     /* Views call this after a write so the screen and the database agree. A
        refusal is said in a toast — unless the view says it itself, where it
        happened, and asks for none with { toast: false }: a dialog's error
-       line (dialog-forms.js), which a screen reader would otherwise hear twice. */
+       line (dialog-forms.js), which a screen reader would otherwise hear
+       twice. options.only names the parts a write can only ever change — a
+       CRM save touches contacts and companies, never mail or invoices — so
+       only those are asked for again, quietly, rather than the whole
+       workspace every single time; left out, a write's effect on parts
+       nobody named is not missed, at the cost of asking for all of them. */
     async after(promise, options) {
+      var only = options && Array.isArray(options.only) && options.only.length ? options.only : null;
+      var reload = only ? { quiet: true, only: only } : undefined;
       try {
         var out = await promise;
         pastMeetingsBy = {};
         eventsAskedFor = {};
         inviteesAskedFor = {};
-        await load();
+        await load(reload);
         return out;
       } catch (err) {
         pastMeetingsBy = {};
@@ -883,7 +890,7 @@
         /* A write that failed may still have changed something — a row saved
            before a later step was refused — so the page is brought back to
            what the database has, and a second try starts from the truth. */
-        load({ quiet: true });
+        load(reload || { quiet: true });
         throw err;
       }
     },
