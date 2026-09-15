@@ -156,6 +156,13 @@
         var href = safeHref(a.getAttribute('href'));
         if (!href) { a.removeAttribute('href'); return; }
         a.setAttribute('href', href);
+        /* A mailto: link is not a page to leave the workspace for: mail.js's
+           own click handler catches it and opens the address in the
+           composer instead. target/rel are for the tabs a web link opens —
+           ALLOWED_ATTR above already keeps DOMPurify from letting either in
+           on its own, but a plain link with no target is the correct result
+           either way, not merely an unlabelled one. */
+        if (/^mailto:/i.test(href)) return;
         a.setAttribute('target', '_blank');
         a.setAttribute('rel', 'noopener noreferrer');
       });

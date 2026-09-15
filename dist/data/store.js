@@ -48,7 +48,11 @@
     failed: [], notice: null,
     overview: null, revenue: [], revenueMix: [], companies: [], projectEvents: [],
     projectMembers: [], projectContacts: [], projectFiles: [], projectBudgets: [],
-    mailboxes: [], mailTruncated: []
+    /* mailboxesFailed: the mailbox LIST itself did not load — different from
+       there being none. Threads still load (loadMail falls back to no
+       connection filter at all), so `mail` still "arrives"; this is the only
+       place that failure survives to be shown. */
+    mailboxes: [], mailboxesFailed: false, mailTruncated: []
   };
 
   /* When each part last arrived, and what it looked like then. */
@@ -172,15 +176,19 @@
       function (rows) { swap(workspaceActivity, rows); }),
     part('mail', 'mail', loadMail, applyMail, {
       /* A mailbox's sync time moves every few minutes with nothing new to show:
-         not a change worth a repaint, but kept for the next one. */
+         not a change worth a repaint, but kept for the next one. Whether the
+         mailbox list itself is currently failing is not, on its own, either —
+         mailboxesFailed is kept the same way — but IS part of the signature,
+         so recovering from a failure (even onto the same empty list) repaints. */
       sign: function (value) {
         return {
           threads: value.threads,
           truncated: value.truncated,
+          mailboxesFailed: value.mailboxesFailed,
           mailboxes: value.mailboxes.map(function (b) { return Object.assign({}, b, { last_synced_at: null }); })
         };
       },
-      keep: function (value) { state.mailboxes = value.mailboxes; }
+      keep: function (value) { state.mailboxes = value.mailboxes; state.mailboxesFailed = Boolean(value.mailboxesFailed); }
     }),
     part('overview', 'the overview figures',
       function (d) { return d.overview(); },
@@ -636,17 +644,26 @@
   /* The mailboxes first, then each mailbox's own inbox, sent and starred: one
      shared limit let a busy hello@ push a personal mailbox out of the load.
      Losing the mailbox list degrades to one query per folder across
-     everything, rather than taking mail down with it. */
+     everything (RLS decides what comes back), rather than taking mail down
+     with it — but that IS a failure, and mail.js must not read it as "no
+     mailbox connected": the caller gets mailboxesFailed alongside the empty
+     list, rather than the error being swallowed into indistinguishable rows. */
   function loadMail(d) {
     return d.mailboxes()
-      .catch(function (err) {
-        console.error('[workspace] could not load the mailboxes:', err);
-        return [];
-      })
-      .then(function (boxes) {
-        var ids = boxes.map(function (b) { return b.id; });
+      .then(
+        function (boxes) { return { boxes: boxes, failed: false }; },
+        function (err) {
+          console.error('[workspace] could not load the mailboxes:', err);
+          return { boxes: [], failed: true };
+        }
+      )
+      .then(function (mailboxes) {
+        var ids = mailboxes.boxes.map(function (b) { return b.id; });
         return d.mailThreads(['inbox', 'sent', 'starred'], ids).then(function (result) {
-          return { mailboxes: boxes, threads: result.threads, truncated: result.truncated };
+          return {
+            mailboxes: mailboxes.boxes, mailboxesFailed: mailboxes.failed,
+            threads: result.threads, truncated: result.truncated
+          };
         });
       });
   }
@@ -685,6 +702,7 @@
     Object.keys(bodies).forEach(function (id) { if (!present[id]) delete bodies[id]; });
     swap(mails, result.threads);
     state.mailboxes = result.mailboxes;
+    state.mailboxesFailed = Boolean(result.mailboxesFailed);
     state.mailTruncated = result.truncated;
   }
 
@@ -1000,6 +1018,24 @@
      come back to the tab, and as soon as the connection is back. */
   setInterval(refreshIfDue, CHECK_EVERY_MS);
   document.addEventListener('visibilitychange', refreshIfDue);
+
+  /* Mail was otherwise read again only after a write, a send or a date
+     change — someone reading their inbox waited up to two minutes (the whole
+     workspace's own clock) for new mail to show, or for a "Synced … ago"
+     label to stop lying. Asked for on its own, more often, but only while
+     Mail is the page open and someone is looking at it: everywhere else the
+     two-minute clock above already carries it. */
+  var MAIL_REFRESH_MS = 45 * 1000;
+
+  function refreshMailIfOpen() {
+    if (!authed || running) return;
+    if (typeof page === 'undefined' || page !== 'mail') return;
+    if (document.visibilityState === 'hidden') return;
+    if (arrivedAt.mail != null && Date.now() - arrivedAt.mail < MAIL_REFRESH_MS) return;
+    load({ quiet: true, only: ['mail'] });
+  }
+  setInterval(refreshMailIfOpen, MAIL_REFRESH_MS);
+  document.addEventListener('visibilitychange', refreshMailIfOpen);
   window.addEventListener('online', function () {
     if (!authed) return;
     /* Even with a load running: it may be the one that is failing, and the
