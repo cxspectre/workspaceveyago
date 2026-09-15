@@ -793,12 +793,36 @@
     return entry;
   }
 
-  /* Past meetings, events and invitees a page asked for that did not load: a load that
-     works tries them again, as everything else is tried again by itself.
-     Answers whether any were let go. */
+  /* A person's phone and notes (employee_private(), 0043), asked for by their
+     page and kept by id until a write, as events asked for are — companyModel
+     reads a missing answer, whatever the reason, the same way it reads one it
+     was never entitled to: not shown, never "none on file". */
+  var employeePrivateAskedFor = {};
+
+  function loadEmployeePrivate(id) {
+    var entry = { state: 'loading', details: null };
+    employeePrivateAskedFor[id] = entry;
+    Promise.resolve()
+      .then(function () { return window.workspaceData.employeePrivate(id); })
+      .then(function (details) {
+        if (employeePrivateAskedFor[id] !== entry) return;
+        employeePrivateAskedFor[id] = { state: 'ready', details: details };
+        repaint(true);
+      }, function (err) {
+        if (employeePrivateAskedFor[id] !== entry) return;
+        console.error('[workspace] their phone and notes did not load:', err);
+        employeePrivateAskedFor[id] = { state: 'failed', details: null };
+        repaint(true);
+      });
+    return entry;
+  }
+
+  /* Past meetings, events, invitees and phone/notes a page asked for that did
+     not load: a load that works tries them again, as everything else is
+     tried again by itself. Answers whether any were let go. */
   function clearFailedAsks() {
     var cleared = false;
-    [pastMeetingsBy, eventsAskedFor, inviteesAskedFor].forEach(function (asks) {
+    [pastMeetingsBy, eventsAskedFor, inviteesAskedFor, employeePrivateAskedFor].forEach(function (asks) {
       Object.keys(asks).forEach(function (id) {
         if (asks[id].state === 'failed') { delete asks[id]; cleared = true; }
       });
@@ -884,6 +908,18 @@
       return inviteesAskedFor[key] || loadInvitees(key);
     },
 
+    /* A person's phone and notes (company-forms.js, workspace.js personDetail),
+       by their employee id: the row employee_private() answered, or null while
+       it is on its way, was refused, or is not this person's to see —
+       companyModel.personDetails() treats every one of those the same way. */
+    askEmployeePrivate: function (id) {
+      var key = String(id == null ? '' : id).toLowerCase();
+      if (!UUID_TEXT.test(key) || !state.loaded || !window.workspaceData
+          || typeof window.workspaceData.employeePrivate !== 'function') return null;
+      var entry = employeePrivateAskedFor[key] || loadEmployeePrivate(key);
+      return entry.state === 'ready' ? entry.details : null;
+    },
+
     /* Views call this after a write so the screen and the database agree. A
        refusal is said in a toast — unless the view says it itself, where it
        happened, and asks for none with { toast: false }: a dialog's error
@@ -894,12 +930,14 @@
         pastMeetingsBy = {};
         eventsAskedFor = {};
         inviteesAskedFor = {};
+        employeePrivateAskedFor = {};
         await load();
         return out;
       } catch (err) {
         pastMeetingsBy = {};
         eventsAskedFor = {};
         inviteesAskedFor = {};
+        employeePrivateAskedFor = {};
         if (typeof toast === 'function' && !(options && options.toast === false)) toast(err.message);
         /* A write that failed may still have changed something — a row saved
            before a later step was refused — so the page is brought back to
