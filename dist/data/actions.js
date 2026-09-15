@@ -608,6 +608,22 @@
       return threadState(threadId, { starred: !!starred });
     },
 
+    /* ── Notifications ───────────────────────────────────────────────── */
+
+    /* Marks one bell item seen (notification_dismissals, 0061) — a plain
+       insert; there is nothing to change about a dismissal once it exists.
+       Dismissing the same key twice is a harmless repeat, not an error the
+       person needs to see: the table's own primary key catches it (23505). */
+    async dismissNotification(key) {
+      must(key && String(key).trim(), 'Nothing to dismiss.');
+      must(me(), 'You need to be signed in as a team member to dismiss this.');
+      var res = await sb().from('notification_dismissals')
+        .insert({ employee_id: me().id, notif_key: String(key) });
+      if (res.error && res.error.code !== '23505') {
+        throw new Error('Could not dismiss that: ' + res.error.message);
+      }
+    },
+
     /* ── Connections ─────────────────────────────────────────────────── */
 
     /* Starts reconnecting a mailbox and resolves to Microsoft's consent page.

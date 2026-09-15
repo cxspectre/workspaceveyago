@@ -427,6 +427,36 @@ test('a priority the database does not know is refused before anything is writte
   assert.equal(ws.written.length, 0);
 });
 
+/* ── Notifications ────────────────────────────────────────────────────── */
+
+test('dismissing a notification inserts one row, under the signed-in person\'s own id', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }));
+  await ws.actions.dismissNotification('ticket:t1');
+  assert.deepEqual(ws.written, [{ table: 'notification_dismissals', what: 'insert',
+    change: { employee_id: 'emp-1', notif_key: 'ticket:t1' } }]);
+});
+
+test('dismissing the same key twice is a harmless repeat, not an error', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }), {
+    fail: () => ({ code: '23505', message: 'duplicate key value violates unique constraint' })
+  });
+  await ws.actions.dismissNotification('events:today');
+  assert.equal(ws.written.length, 1, 'still attempted — the constraint is what makes it a no-op');
+});
+
+test('any other failure to dismiss is said, not swallowed', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }), {
+    fail: () => ({ code: '42501', message: 'permission denied' })
+  });
+  await assert.rejects(ws.actions.dismissNotification('mail:unread'), { message: 'Could not dismiss that: permission denied' });
+});
+
+test('nothing is written for a blank key', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }));
+  await assert.rejects(ws.actions.dismissNotification(''), /Nothing to dismiss/);
+  assert.equal(ws.written.length, 0);
+});
+
 /* ── Reconnecting a mailbox ───────────────────────────────────────────── */
 
 const CONSENT = 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=x&state=y';

@@ -67,6 +67,9 @@ function answers(over = {}) {
     projectFiles: async () => [],
     projectBudgets: async () => [],
     notes: async () => [],
+    integrations: async () => [],
+    studioProfile: async () => [],
+    notificationDismissals: async () => [],
     ...over
   };
 }
@@ -859,4 +862,38 @@ test('activity entries keep who, when and what they are about — thirty of them
   assert.equal(entry.entityType, 'ticket');
   assert.equal(entry.entityId, 't1');
   assert.equal(asked, 30);
+});
+
+/* ── Company: connections, the studio profile, dismissed notifications ──── */
+
+test('the Company page\'s own parts land in state, and a database from before 0061 leaves them empty rather than failing', async () => {
+  const s = start(answers({
+    integrations: async () => [{ id: 'c1', provider: 'microsoft_mail', status: 'connected' }],
+    studioProfile: async () => [{ key: 'studio_name', value: 'Northline Studio' }],
+    notificationDismissals: async () => ['ticket:t1']
+  }));
+  await s.store.load();
+  assert.deepEqual([...s.store.state.integrations.map(c => c.id)], ['c1']);
+  assert.deepEqual([...s.store.state.studioProfile.map(r => r.key)], ['studio_name']);
+  assert.deepEqual([...s.store.state.dismissedNotifications], ['ticket:t1']);
+
+  /* A database that predates 0061 answers PGRST205/42P01 for the table and
+     function alike; queries.js turns that into a thrown error the same way
+     any other missing-table failure already is, so these three parts fail
+     quietly (state.failed) rather than blocking the workspace, which does not
+     wait on them — they are outside CORE, unlike tickets, projects, contacts
+     and companies. */
+  const missing = start(answers({
+    integrations: async () => { throw new Error('Could not load integrations: relation does not exist'); },
+    studioProfile: async () => { throw new Error('Could not load the studio profile: function does not exist'); },
+    notificationDismissals: async () => { throw new Error('Could not load dismissed notifications: relation does not exist'); }
+  }));
+  await missing.store.load();
+  assert.equal(missing.store.state.loaded, true, 'CORE still loaded; these three are not among it');
+  assert.deepEqual([...missing.store.state.integrations], []);
+  assert.deepEqual([...missing.store.state.studioProfile], []);
+  assert.deepEqual([...missing.store.state.dismissedNotifications], []);
+  assert.ok(missing.store.state.failed.includes('integrations'));
+  assert.ok(missing.store.state.failed.includes('the studio profile'));
+  assert.ok(missing.store.state.failed.includes('dismissed notifications'));
 });

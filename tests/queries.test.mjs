@@ -159,6 +159,20 @@ test('a ticket arrives with its owner by id, the customer\'s address, and who wr
   assert.equal(t.body, 'Broken');
 });
 
+test('every ticket loads, past the thousand rows the API hands back at once', async () => {
+  let served = 0;
+  const ticket = i => ({ id: `t${i}`, number: i, subject: `Ticket ${i}`, status: 'open', priority: 'normal', ticket_messages: [] });
+  const { data, queries } = loadTables(table => {
+    if (table !== 'support_tickets') return [];
+    served += 1;
+    return served === 1 ? Array.from({ length: 1000 }, (_, i) => ticket(i)) : [ticket(1000)];
+  });
+  const list = await data.tickets();
+  assert.equal(list.length, 1001);
+  assert.deepEqual(queries.map(q => q.calls.filter(([method]) => method === 'range').map(call => call.slice(1).join('-'))), [['0-999'], ['1000-1999']]);
+  assert.ok(queries[0].calls.some(call => call.join(' ') === 'order id'), 'pages in a fixed order do not overlap');
+});
+
 /* ── Agenda and tasks ─────────────────────────────────────────────────── */
 
 /* agendaModel.loadRange() for the week of Monday 14 September 2026, in Berlin. */
@@ -335,6 +349,20 @@ test('a note whose author\'s row is gone is a former team member\'s, never the s
   assert.doesNotMatch(notes.map(n => n.who).join(' '), /Veyago/);
 });
 
+test('every note loads, past the thousand rows the API hands back at once', async () => {
+  let served = 0;
+  const note = i => ({ id: `n${i}`, entity_type: 'project', entity_id: 'p1', body: `Note ${i}`, created_at: '2026-09-01T09:00:00Z', author_id: null, author: null });
+  const { data, queries } = loadTables(table => {
+    if (table !== 'workspace_notes') return [];
+    served += 1;
+    return served === 1 ? Array.from({ length: 1000 }, (_, i) => note(i)) : [note(1000)];
+  });
+  const list = await data.notes();
+  assert.equal(list.length, 1001);
+  assert.deepEqual(queries.map(q => q.calls.filter(([method]) => method === 'range').map(call => call.slice(1).join('-'))), [['0-999'], ['1000-1999']]);
+  assert.ok(queries[0].calls.some(call => call.join(' ') === 'order id'), 'pages in a fixed order do not overlap');
+});
+
 test('a task arrives with its details, who made it, and when it was made and finished', async () => {
   const { data, queries } = loadTables(table => (table !== 'tasks' ? [] : [{
     id: 'task-1', project_id: 'p1', title: 'Wireframes', details: 'Home and checkout', status: 'done', priority: 'high',
@@ -435,6 +463,67 @@ test('a company arrives with its owner', async () => {
   const [co] = await data.companies();
   assert.ok(queries[0].calls.find(([method]) => method === 'select')[1].split(/,\s*/).includes('owner_id'));
   assert.equal(co.row.owner_id, 'e-sam');
+});
+
+/* ── Finance ──────────────────────────────────────────────────────────── */
+
+test('every invoice loads, past the thousand rows the API hands back at once', async () => {
+  let served = 0;
+  const invoice = i => ({ id: `inv${i}`, number: `INV-${i}`, client: 'Northline', amount: 100, currency: 'USD', status: 'sent' });
+  const { data, queries } = loadTables(table => {
+    if (table !== 'finance_invoices') return [];
+    served += 1;
+    return served === 1 ? Array.from({ length: 1000 }, (_, i) => invoice(i)) : [invoice(1000)];
+  });
+  const list = await data.invoices();
+  assert.equal(list.length, 1001);
+  assert.deepEqual(queries.map(q => q.calls.filter(([method]) => method === 'range').map(call => call.slice(1).join('-'))), [['0-999'], ['1000-1999']]);
+  assert.ok(queries[0].calls.some(call => call.join(' ') === 'order id'), 'pages in a fixed order do not overlap');
+});
+
+/* ── Company ──────────────────────────────────────────────────────────── */
+
+test('the team is ordered by name, not by the spelling of the role, and carries what a person\'s page needs', async () => {
+  const { data, queries } = loadTables(table => (table !== 'employees' ? [] : [{
+    id: 'e1', user_id: 'u1', full_name: 'Ana Lima', email: 'ana@veyago.cloud', role: 'owner',
+    title: null, status: 'active', start_date: '2026-01-05', created_at: '2026-01-05T09:00:00Z', updated_at: '2026-01-05T09:00:00Z'
+  }]));
+  const [member] = await data.team();
+  const select = queries[0].calls.find(([method]) => method === 'select')[1].split(/,\s*/).map(s => s.trim());
+  for (const column of ['user_id', 'email', 'start_date', 'created_at', 'updated_at']) {
+    assert.ok(select.includes(column), `the query asks for ${column}`);
+  }
+  assert.ok(!select.includes('phone') && !select.includes('notes'), 'phone and notes stay behind employee_private()');
+  assert.deepEqual(queries[0].calls.filter(([method]) => method === 'order'), [['order', 'full_name'], ['order', 'id']]);
+  assert.equal(member.row.user_id, 'u1', 'the row travels whole, for companyModel to read');
+  assert.equal(member.name, 'Ana Lima');
+});
+
+test('a person\'s phone and notes are asked for by their id, and nobody such is null', async () => {
+  const q = load((name, args) => (name === 'employee_private' && args.p_employee_id === 'e1'
+    ? { data: [{ phone: '+1 555 0100', notes: 'Founder' }], error: null }
+    : { data: [], error: null }));
+  assert.deepEqual(await q.data.employeePrivate('e1'), { phone: '+1 555 0100', notes: 'Founder' });
+  assert.equal(await q.data.employeePrivate('gone'), null);
+});
+
+test('the studio\'s profile comes from studio_profile(), empty for anyone it does not answer', async () => {
+  const q = load(() => ({ data: [{ key: 'studio_name', value: 'Northline' }, { key: 'base_currency', value: 'eur' }], error: null }));
+  const rows = await q.data.studioProfile();
+  assert.equal(q.calls[0].name, 'studio_profile');
+  assert.deepEqual(rows.map(r => r.key), ['studio_name', 'base_currency']);
+
+  const empty = load(() => ({ data: [], error: null }));
+  assert.deepEqual(await empty.data.studioProfile(), []);
+});
+
+/* ── Notifications ────────────────────────────────────────────────────── */
+
+test('dismissed notifications come back as their bare keys, RLS already limiting them to this person\'s own', async () => {
+  const { data, queries } = loadTables(table => (table === 'notification_dismissals'
+    ? [{ notif_key: 'ticket:t1' }, { notif_key: 'events:today' }] : []));
+  assert.deepEqual(await data.notificationDismissals(), ['ticket:t1', 'events:today']);
+  assert.deepEqual(queries[0].calls.find(([method]) => method === 'select'), ['select', 'notif_key']);
 });
 
 test('an amount is written in its currency, and a code Intl cannot format goes beside it rather than throwing', () => {

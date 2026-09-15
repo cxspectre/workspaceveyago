@@ -48,7 +48,11 @@
     failed: [], notice: null,
     overview: null, revenue: [], revenueMix: [], companies: [], projectEvents: [],
     projectMembers: [], projectContacts: [], projectFiles: [], projectBudgets: [],
-    mailboxes: [], mailTruncated: []
+    mailboxes: [], mailTruncated: [],
+    /* The Company page's own parts: connections (companyModel.connectionRows),
+       the studio's public profile (companyModel.studioProfile) and which bell
+       items this person has already dismissed. */
+    integrations: [], studioProfile: [], dismissedNotifications: []
   };
 
   /* When each part last arrived, and what it looked like then. */
@@ -194,7 +198,24 @@
       function (rows) { state.projectBudgets = rows; }),
     part('notes', 'notes',
       function (d) { return d.notes(); },
-      function (rows) { lastNotes = rows; })
+      function (rows) { lastNotes = rows; }),
+    /* The studio's and this person's own connections (0044), for the
+       Company/Studio integrations panel. */
+    part('integrations', 'integrations',
+      function (d) { return d.integrations(); },
+      function (rows) { state.integrations = rows; }),
+    /* The studio's public profile (studio_profile(), 0061): [] for a database
+       from before 0061 or for anyone it answers nothing to — either way
+       companyModel.studioProfile() reads that as the studio's own defaults. */
+    part('studioProfile', 'the studio profile',
+      function (d) { return d.studioProfile(); },
+      function (rows) { state.studioProfile = rows; }),
+    /* Which bell items this person has already dismissed (0061): [] for a
+       database from before 0061, which the bell then shows everything on, as
+       it always has. */
+    part('dismissedNotifications', 'dismissed notifications',
+      function (d) { return d.notificationDismissals(); },
+      function (rows) { state.dismissedNotifications = rows; })
   ];
 
   /* A load asked for while one is running is queued, not dropped: the running

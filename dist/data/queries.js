@@ -398,21 +398,29 @@
     },
 
     /* ── Tickets ─────────────────────────────────────────────────────── */
+    /* Every open and closed ticket, a page at a time (everyRow): the API's own
+       row cap used to cut this off in silence past a thousand, and a studio
+       with more tickets than that would have quietly stopped seeing its
+       oldest ones. */
     async tickets() {
-      var rows = unwrap(await sb()
-        .from('support_tickets')
-        .select('id, number, subject, product, priority, status, source, created_at, first_response_at, resolved_at, ' +
-                'project_id, company_id, contact_id, assignee_id, ' +
-                'contact:crm_contacts (full_name, email), company:crm_companies (name), ' +
-                'assignee:employees (full_name), ' +
-                /* The queue view shows the opening message under each row, and
-                   the detail view the whole thread: who wrote each message, and
-                   whether a reply reached the customer (0033). Both come from
-                   this one embed rather than a second round trip per ticket. */
-                'ticket_messages (id, body, direction, created_at, delivered_at, delivery_error, ' +
-                'author:employees (full_name), sender:crm_contacts (full_name))')
-        .is('deleted_at', null)
-        .order('created_at', { ascending: false }), 'tickets');
+      var rows = await everyRow(function (from, to) {
+        return sb()
+          .from('support_tickets')
+          .select('id, number, subject, product, priority, status, source, created_at, first_response_at, resolved_at, ' +
+                  'project_id, company_id, contact_id, assignee_id, ' +
+                  'contact:crm_contacts (full_name, email), company:crm_companies (name), ' +
+                  'assignee:employees (full_name), ' +
+                  /* The queue view shows the opening message under each row, and
+                     the detail view the whole thread: who wrote each message, and
+                     whether a reply reached the customer (0033). Both come from
+                     this one embed rather than a second round trip per ticket. */
+                  'ticket_messages (id, body, direction, created_at, delivered_at, delivery_error, ' +
+                  'author:employees (full_name), sender:crm_contacts (full_name))')
+          .is('deleted_at', null)
+          .order('created_at', { ascending: false })
+          .order('id')
+          .range(from, to);
+      }, 'tickets');
       return rows.map(function (r) {
         var client = (r.contact && r.contact.full_name)
                   || (r.company && r.company.name) || 'Unknown';
@@ -561,11 +569,19 @@
     },
 
     /* ── Finance (managers only — RLS returns [] for everyone else) ──── */
+    /* A page at a time (everyRow), as tickets and contacts are: a studio with
+       more than a thousand invoices was silently missing its oldest. Ties on
+       issued_on (same day, or both unissued) break on id, so a page ends the
+       same way every time it is asked for. */
     async invoices() {
-      var rows = unwrap(await sb()
-        .from('finance_invoices')
-        .select('id, number, client, client_email, amount, currency, status, issued_on, due_on, paid_on, notes')
-        .order('issued_on', { ascending: false, nullsFirst: false }), 'invoices');
+      var rows = await everyRow(function (from, to) {
+        return sb()
+          .from('finance_invoices')
+          .select('id, number, client, client_email, amount, currency, status, issued_on, due_on, paid_on, notes')
+          .order('issued_on', { ascending: false, nullsFirst: false })
+          .order('id')
+          .range(from, to);
+      }, 'invoices');
       return rows.map(function (r) {
         return {
           id: r.number, uuid: r.id, client: r.client,
@@ -586,19 +602,49 @@
     },
 
     /* ── Company ─────────────────────────────────────────────────────── */
+    /* Ordered by name, not by the spelling of the role — that put the owner
+       last, alphabetically after admin and assistant (companyModel.teamCards
+       re-sorts anyway: owners, then admins, then the rest, each group by
+       name). user_id, email, start_date and the two timestamps are what
+       companyModel needs for a person's page and the invite/role rules
+       (0043's own grant); every column it is not manager-only for. Still only
+       active and invited members: the deactivated are excluded here, as
+       before, because this one array is also the picker every other page
+       assigns work from (project teams, task assignees, ticket owners), and
+       none of those wants a former employee offered back. */
     async team() {
       var rows = unwrap(await sb()
         .from('employees')
-        .select('id, full_name, role, title, status')
+        .select('id, user_id, full_name, email, role, title, status, start_date, created_at, updated_at')
         .neq('status', 'inactive')
-        .order('role'), 'the team');
+        .order('full_name')
+        .order('id'), 'the team');
       return rows.map(function (r) {
         return {
           id: r.id, name: r.full_name, initial: initials(r.full_name),
-          role: r.title || label(r.role), focus: '',
+          role: r.title || label(r.role),
           tag: label(r.role), row: r
         };
       });
+    },
+
+    /* A person's phone (owners, admins and themself) and notes (owners and
+       admins only), by their id (employee_private(), 0043). null for nobody
+       such, or nothing this viewer may see — companyModel.personDetails()
+       reads that as "not shown", never as "none on file". */
+    async employeePrivate(id) {
+      var rows = unwrap(await sb().rpc('employee_private', { p_employee_id: id }), 'their phone and notes');
+      return rows[0] || null;
+    },
+
+    /* The studio's own profile — name, tagline, location, contact address,
+       website, base currency — for any signed-in member of staff
+       (studio_profile(), 0061). [] for anyone else, and for the rest of
+       workspace_settings (bank details among them), which stays behind
+       "managers read settings" (0016); companyModel.studioProfile() reads an
+       empty answer as the studio's own public defaults. */
+    async studioProfile() {
+      return unwrap(await sb().rpc('studio_profile'), 'the studio profile');
     },
 
     /* ── Mail ────────────────────────────────────────────────────────── */
@@ -736,14 +782,20 @@
       return (await rpcInZone('revenue_mix', { p_months: months || 1 }, 'the revenue mix')) || [];
     },
 
-    /* Every note in one query. The panels are keyed by record, but fetching
-       per record would be one round trip per open detail view; there are never
-       many notes, so the store groups them once. */
+    /* Every note, a page at a time (everyRow). The panels are keyed by
+       record, but fetching per record would be one round trip per open
+       detail view, so the store groups them once instead — which used to mean
+       a studio with more than a thousand notes silently lost its oldest ones
+       from every panel at once. Ties on created_at break on id. */
     async notes() {
-      var rows = unwrap(await sb()
-        .from('workspace_notes')
-        .select('id, entity_type, entity_id, body, created_at, author_id, author:employees (full_name)')
-        .order('created_at'), 'notes');
+      var rows = await everyRow(function (from, to) {
+        return sb()
+          .from('workspace_notes')
+          .select('id, entity_type, entity_id, body, created_at, author_id, author:employees (full_name)')
+          .order('created_at')
+          .order('id')
+          .range(from, to);
+      }, 'notes');
       return rows.map(function (r) {
         /* Only the employee signed in writes a note (0032's insert policy),
            and a note keeps no author once theirs is deleted (on delete set
@@ -766,6 +818,17 @@
         .from('integration_status')
         .select('*')
         .order('provider'), 'integrations');
+    },
+
+    /* ── Notifications (the bell) ────────────────────────────────────── */
+    /* Which attention items (shellModel.attention() keys, e.g. "ticket:<uuid>")
+       this person has already dismissed (notification_dismissals, 0061). RLS
+       hands back only their own rows. */
+    async notificationDismissals() {
+      var rows = unwrap(await sb()
+        .from('notification_dismissals')
+        .select('notif_key'), 'dismissed notifications');
+      return rows.map(function (r) { return r.notif_key; });
     }
   };
 })();

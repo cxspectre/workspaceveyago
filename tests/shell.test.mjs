@@ -162,6 +162,37 @@ test('the bell lists what needs someone, each leading to it', () => {
   assert.equal(items[3].detail, 'Kickoff');
 });
 
+test('a dismissed item is left out, whichever kind it is', () => {
+  const items = model.attention({
+    tickets: [
+      { id: 7, uuid: 't7', client: 'Ana', priority: 'High', status: 'Open' },
+      { id: 8, uuid: 't8', client: 'Bo', priority: 'Urgent', status: 'Open' }
+    ],
+    invoices: [{ id: 'INV-1', uuid: 'i1', client: 'Northline', amount: '$1,200', status: 'Overdue' }],
+    unreadMail: 3, eventsToday: [{ title: 'Kickoff' }], isManager: true,
+    dismissed: ['ticket:t7', 'invoice:i1', 'mail:unread']
+  });
+  assert.deepEqual([...items.map(i => i.key)], ['ticket:t8', 'events:today']);
+});
+
+test('a dismissed ticket frees its slot for the one after it, rather than just shortening the list', () => {
+  const tickets = Array.from({ length: 6 }, (_, i) => (
+    { id: i + 1, uuid: 't' + (i + 1), client: 'Client', priority: 'High', status: 'Open' }));
+  const items = model.attention({
+    tickets, invoices: [], unreadMail: 0, eventsToday: [], isManager: true, dismissed: ['ticket:t1']
+  });
+  assert.deepEqual([...items.map(i => i.key)], ['ticket:t2', 'ticket:t3', 'ticket:t4', 'ticket:t5', 'ticket:t6']);
+});
+
+test('with nothing dismissed, or the option left out entirely, everything shows as before', () => {
+  const facts = {
+    tickets: [{ id: 7, uuid: 't7', client: 'Ana', priority: 'High', status: 'Open' }],
+    invoices: [], unreadMail: 0, eventsToday: [], isManager: true
+  };
+  assert.deepEqual([...model.attention(facts).map(i => i.key)], ['ticket:t7']);
+  assert.deepEqual([...model.attention({ ...facts, dismissed: [] }).map(i => i.key)], ['ticket:t7']);
+});
+
 test('someone who cannot read Finance is not told about invoices', () => {
   const items = model.attention({
     tickets: [], invoices: [{ id: 'INV-1', client: 'N', amount: '$1', status: 'Overdue' }],
