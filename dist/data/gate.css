@@ -15,9 +15,13 @@
     var(--bg);
 }
 .gate[hidden] { display: none !important; }
+/* .btn sets display, which would otherwise beat the hidden attribute on the
+   gate's own button. */
+.gate [hidden] { display: none !important; }
 
 /* The shell stays in the DOM while the gate is up so a sign-in does not cause
-   a full re-layout flash — it is just not readable underneath. */
+   a full re-layout flash — it is just not readable underneath, and gate.js
+   makes it inert so it cannot be reached with the keyboard either. */
 .app.locked { filter: blur(7px); pointer-events: none; user-select: none; }
 
 .gate-card {
@@ -84,6 +88,16 @@
   padding: 4px;
 }
 
+.gate-link {
+  display: block;
+  margin: 12px auto 0;
+  border: 0;
+  background: transparent;
+  color: var(--teal);
+  font-size: .8125rem;
+  padding: 4px;
+}
+
 /* Who is signed in, in the header, replacing the static demo avatar. */
 .session-chip {
   display: flex;
@@ -111,6 +125,16 @@
 }
 .session-signout:hover { background: #eef1f6; color: var(--ink); }
 .session-signout svg { width: 15px; height: 15px; }
+.session-account {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  color: #86868b;
+}
+.session-account:hover { background: #eef1f6; color: var(--ink); }
+.session-account svg { width: 15px; height: 15px; }
 
 @media (max-width: 760px) {
   .session-chip > span.session-name { display: none; }

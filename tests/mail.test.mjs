@@ -140,6 +140,27 @@ test('search matches sender, address, subject and preview, ignoring case', () =>
   assert.deepEqual(ids('   '), ['t1', 't2', 't4'], 'blank search shows everything');
 });
 
+test('Starred reaches a conversation filed away in Outlook, which Inbox and Sent do not show', () => {
+  const filed = [thread({ id: 't9', folder: 'archive', starred: true }), thread({ id: 't10', folder: 'archive' })];
+  const ids = folder => [...model.visibleThreads(filed, { mailbox: 'all', folder, query: '' }).map(t => t.id)];
+  assert.deepEqual(ids('starred'), ['t9']);
+  assert.deepEqual(ids('inbox'), []);
+  assert.deepEqual(ids('sent'), []);
+  assert.equal(model.unreadCount([thread({ id: 't11', folder: 'archive', unread: true })], 'all'), 0,
+    'filed mail is not waiting for anyone');
+});
+
+test('a conversation filed away in Outlook opens under Starred when starred, and otherwise where the person is', () => {
+  assert.equal(model.folderForThread(thread({ folder: 'sent' }), 'inbox'), 'sent');
+  assert.equal(model.folderForThread(thread({ folder: 'archive', starred: true }), 'inbox'), 'starred');
+  assert.equal(model.folderForThread(thread({ folder: 'archive' }), 'sent'), 'sent',
+    'a route to archive would land on an empty inbox, with the draft nowhere on screen');
+  assert.equal(model.folderForThread(thread({ folder: 'trash' }), 'nonsense'), 'inbox');
+  assert.equal(model.folderForThread(null, 'starred'), 'starred');
+  assert.equal(model.folderForThread(thread({ folder: 'inbox', starred: true }), 'starred'), 'starred',
+    'opened from Starred, a starred conversation stays there');
+});
+
 test('visibleThreads does not reorder or change the list it is given', () => {
   const before = JSON.stringify(threads);
   model.visibleThreads(threads, { mailbox: 'all', folder: 'starred', query: 'x' });
@@ -410,4 +431,15 @@ test('suggestions come from the CRM first, then from conversations, each address
     { name: 'Ana Lima', email: 'ana@northline.example' },
     { name: 'Ben', email: 'ben@northline.example' }
   ]);
+});
+
+test('a mailbox says what went wrong in a sentence the column fits, and keeps the whole of it', () => {
+  const [box] = model.mailboxesFor([connection({
+    last_error: 'Some mail filed away in Outlook may still show in this inbox until the daily check. inbox: Graph has not confirmed whether 1 message(s) left the inbox (Graph → 503: busy)'
+  })], ME);
+  assert.equal(model.mailboxNote(box), 'Some mail filed away in Outlook may still show in this inbox until the daily check.');
+  assert.match(box.lastError, /Graph → 503/, 'the whole of it stays for a closer look');
+  assert.equal(model.mailboxNote({ lastError: null }), null);
+  assert.equal(model.mailboxNote({ lastError: 'Graph → 503: Service Unavailable' }), 'Graph → 503: Service Unavailable');
+  assert.equal(model.mailboxNote({ lastError: 'x'.repeat(400) }).length, 160);
 });

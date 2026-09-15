@@ -22,6 +22,33 @@
     return res.data || [];
   }
 
+  /* Every row a list has, a page at a time. The API hands back at most PAGE
+     rows per request (Supabase's max rows) and cuts a list off there without a
+     word, so a full page asks for the next. `ask(from, to)` builds one page's
+     request, in an order that ends on the id, so pages do not overlap. A row
+     added ahead of the next page while the list is read pushes the last one
+     into it: a row met twice is kept once. These are pages by place, not a
+     snapshot: a row removed ahead of the next page moves one past it unread
+     until the next load, and a project whose Max rows is set below PAGE would
+     be cut off at its first page. */
+  var PAGE = 1000;
+  async function everyRow(ask, what) {
+    var rows = [];
+    var seen = Object.create(null);
+    var fresh = function (row) {
+      var id = row && row.id;
+      if (id == null) return true;
+      if (seen[id]) return false;
+      seen[id] = true;
+      return true;
+    };
+    for (var from = 0; ; from += PAGE) {
+      var page = unwrap(await ask(from, from + PAGE - 1), what);
+      rows = rows.concat(page.filter(fresh));
+      if (page.length < PAGE) return rows;
+    }
+  }
+
   function initials(name) {
     var parts = String(name || '').trim().split(/\s+/)
       .filter(function (w) { return /^[\p{L}]/u.test(w); });
@@ -51,11 +78,61 @@
     return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
   }
 
-  function money(amount, currency) {
+  /* The day a meeting is on, as a page says it: an all-day meeting stored at
+     midnight UTC is that date wherever the viewer is (agenda-model.js reads it
+     so), any other the viewer's own day. Today and yesterday by name, but a day
+     in another year says which year — never "Yesterday" with a year after it. */
+  function meetingDay(value, allDay) {
+    var d = new Date(value);
+    if (!value || isNaN(d.getTime())) return '';
+    var utc = Boolean(allDay) && d.getUTCHours() === 0 && d.getUTCMinutes() === 0 && d.getUTCSeconds() === 0;
+    var year = utc ? d.getUTCFullYear() : d.getFullYear();
+    var month = utc ? d.getUTCMonth() : d.getMonth();
+    var date = utc ? d.getUTCDate() : d.getDate();
+    var today = new Date();
+    if (year !== today.getFullYear()) return MONTHS[month] + ' ' + date + ', ' + year;
+    var same = function (other) { return other.getFullYear() === year && other.getMonth() === month && other.getDate() === date; };
+    if (same(today)) return 'Today';
+    var yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    if (same(yesterday)) return 'Yesterday';
+    return MONTHS[month] + ' ' + date;
+  }
+
+  /* A moment as a filter compares it, or null when it is not one: only a
+     timestamp goes into a filter, never text that could add a condition. */
+  function isoTime(value) {
+    if (!value) return null;
+    var d = new Date(value);
+    return isNaN(d.getTime()) ? null : d.toISOString();
+  }
+
+  /* An id as an or() filter takes it: a uuid, and nothing else — any other
+     text could add a condition of its own. */
+  var UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  function uuids(list, most) {
+    return (Array.isArray(list) ? list : []).filter(function (id) { return UUID.test(String(id)); }).slice(0, most);
+  }
+
+  /* A code Intl can format as a currency: three letters, any case. A blank is
+     USD, the database's default; anything else — "US$", a typo — is null. */
+  function currencyCode(value) {
+    var code = String(value == null ? '' : value).trim().toUpperCase();
+    if (!code) return 'USD';
+    return /^[A-Z]{3}$/.test(code) ? code : null;
+  }
+
+  /* An amount in its currency. A code Intl cannot format used to throw a
+     RangeError out of the page being drawn, and the Overview and Finance
+     stayed blank until the record was fixed; it is written beside the number
+     instead. { compact: true } for the chart's axis: "$62K". */
+  function money(amount, currency, options) {
     if (amount === null || amount === undefined) return null;
-    return new Intl.NumberFormat('en-US', {
-      style: 'currency', currency: currency || 'USD', maximumFractionDigits: 0
-    }).format(Number(amount));
+    var style = { maximumFractionDigits: 0 };
+    if (options && options.compact) style.notation = 'compact';
+    var code = currencyCode(currency);
+    if (!code) return new Intl.NumberFormat('en-US', style).format(Number(amount)) + ' ' + String(currency).trim();
+    return new Intl.NumberFormat('en-US', Object.assign({ style: 'currency', currency: code }, style)).format(Number(amount));
   }
 
   /* Sentence case, not Title Case. The views match these strings exactly —
@@ -67,17 +144,84 @@
     return words ? words.charAt(0).toUpperCase() + words.slice(1) : '';
   }
 
-  var TASK_COLUMNS = 'id, project_id, title, status, priority, due_date, assignee:employees (full_name)';
+  /* The viewer's IANA time zone: the Overview's "today" and "this month" are
+     theirs, not UTC's (0041). */
+  function timeZone() {
+    try {
+      return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    } catch (err) {
+      return 'UTC';
+    }
+  }
+
+  /* The RPCs that turned out not to take p_tz: asked without it from then on,
+     rather than twice on every refresh. */
+  var withoutZone = {};
+
+  /* An RPC that counts days and months, asked in the viewer's time zone. A
+     database from before 0041 has no p_tz and answers PGRST202 ("no such
+     function"); it is asked again without it, so the workspace and the
+     database can go live in either order — and the console says, once, that
+     its days are UTC's. */
+  async function rpcInZone(name, args, what) {
+    var fail = function (error) { return new Error('Could not load ' + what + ': ' + error.message); };
+    if (withoutZone[name]) {
+      var plainOnly = await sb().rpc(name, Object.assign({}, args));
+      if (plainOnly.error) throw fail(plainOnly.error);
+      return plainOnly.data;
+    }
+    var zoned = await sb().rpc(name, Object.assign({}, args, { p_tz: timeZone() }));
+    if (!zoned.error) return zoned.data;
+    if (zoned.error.code !== 'PGRST202') throw fail(zoned.error);
+    var plain = await sb().rpc(name, Object.assign({}, args));
+    /* Missing both ways, the first answer is the one that names what is missing. */
+    if (plain.error) throw fail(plain.error.code === 'PGRST202' ? zoned.error : plain.error);
+    withoutZone[name] = true;
+    console.warn('[workspace] ' + name + ' does not take a time zone yet (migration 0041), so it counts UTC days.');
+    return plain.data;
+  }
+
+  /* A task with what its page shows and its rules read (tasks-model.js): its
+     details, who made it, and when it was made and finished (0005). */
+  var TASK_COLUMNS = 'id, project_id, title, details, status, priority, due_date, assignee_id, created_by, created_at, completed_at, ' +
+    'assignee:employees (full_name)';
+
+  /* updated_at: what a change made here is made against, so one someone made
+     meanwhile is refused rather than overwritten (actions.updateEvent). */
+  var EVENT_COLUMNS = 'id, title, detail, location, starts_at, ends_at, all_day, kind, status, project_id, company_id, contact_id, updated_at';
+  /* What a list of events brings for each one's page: who may change it
+     (connection_id, created_by). Who is invited (attendees, 0026: [{name,
+     email, response}]) is the largest column an event has and only its page
+     reads it, so it comes with one event asked for by its id (event,
+     eventInvitees) rather than with every week, project meeting and past
+     meeting, which are loaded again every two minutes. */
+  var EVENT_LIST_COLUMNS = EVENT_COLUMNS + ', connection_id, created_by';
+  var EVENT_PAGE_COLUMNS = EVENT_LIST_COLUMNS + ', attendees';
+
+  function agendaEvent(r) {
+    return {
+      id: r.id, title: r.title,
+      time: r.all_day ? 'All day' : clockTime(r.starts_at),
+      end: r.ends_at ? clockTime(r.ends_at) : '',
+      detail: r.detail || r.location || '',
+      type: label(r.kind),
+      day: new Date(r.starts_at).getDate(),
+      /* When, in words: what a project's or a company's page lists it by. */
+      when: meetingDay(r.starts_at, r.all_day) + (r.all_day ? '' : ' · ' + clockTime(r.starts_at)),
+      row: r
+    };
+  }
 
   function projectTask(r) {
     return {
       id: r.id, title: r.title, done: r.status === 'done', status: r.status,
-      who: r.assignee ? r.assignee.full_name : null, row: r
+      who: r.assignee ? r.assignee.full_name : null, assigneeId: r.assignee_id || null, row: r
     };
   }
 
   window.workspaceData = {
     initials: initials,
+    currencyCode: currencyCode,
     money: money,
     shortDate: shortDate,
 
@@ -85,9 +229,7 @@
        One RPC rather than five counts, so the tiles cannot disagree with
        each other. revenue_month is null for non-managers by design. */
     async overview() {
-      var res = await sb().rpc('workspace_overview');
-      if (res.error) throw new Error('Could not load the overview: ' + res.error.message);
-      return res.data;
+      return rpcInZone('workspace_overview', {}, 'the overview');
     },
 
     async activity(limit) {
@@ -100,7 +242,7 @@
         var who = r.actor ? r.actor.full_name : 'Veyago';
         return {
           id: r.id, who: who, initial: initials(who), text: r.summary,
-          when: shortDate(r.created_at), verb: r.verb,
+          when: shortDate(r.created_at), createdAt: r.created_at, verb: r.verb,
           entityType: r.entity_type, entityId: r.entity_id, row: r
         };
       });
@@ -112,63 +254,173 @@
       var to = toISO || new Date(Date.now() + 7 * 86400000).toISOString();
       var rows = unwrap(await sb()
         .from('calendar_events')
-        .select('id, title, detail, location, starts_at, ends_at, all_day, kind, status, project_id')
+        .select(EVENT_COLUMNS)
         .neq('status', 'cancelled')
         /* End-exclusive: `to` is the midnight AFTER the last day shown, and an
            event starting on it belongs to a day no grid draws. */
         .gte('starts_at', from).lt('starts_at', to)
         .order('starts_at'), 'the agenda');
-      return rows.map(function (r) {
-        return {
-          id: r.id, title: r.title,
-          time: r.all_day ? 'All day' : clockTime(r.starts_at),
-          end: r.ends_at ? clockTime(r.ends_at) : '',
-          detail: r.detail || r.location || '',
-          type: label(r.kind),
-          day: new Date(r.starts_at).getDate(),
-          row: r
-        };
-      });
+      return rows.map(agendaEvent);
+    },
+
+    /* The events a week can draw, for the range agendaModel.loadRange() gives
+       it: the ones that start before the week ends and end after `since`, the
+       day before it begins — or, with no end, start from then on. Asking only
+       for events that start inside the week left out one that began before it
+       and runs into it. connection_id and created_by decide who may change or
+       remove an event (0048): a synced event is the sync's, and one entered
+       here its maker's or a manager's. A range that is not two timestamps asks
+       for nothing. */
+    async eventsOverlapping(range) {
+      var to = isoTime(range && range.to);
+      var since = isoTime(range && range.since);
+      if (!to || !since) return [];
+      var rows = unwrap(await sb()
+        .from('calendar_events')
+        .select(EVENT_LIST_COLUMNS)
+        .neq('status', 'cancelled')
+        .lt('starts_at', to)
+        .or('ends_at.gt."' + since + '",and(ends_at.is.null,starts_at.gte."' + since + '")')
+        .order('starts_at'), 'the agenda');
+      return rows.map(agendaEvent);
     },
 
     /* Meetings booked against a project, from today on. A project page lists
        them whatever week the agenda happens to be showing. */
     async upcomingProjectEvents() {
       var from = new Date(new Date().setHours(0, 0, 0, 0)).toISOString();
+      /* Every column the agenda's own events have: a meeting outside the weeks
+         loaded opens its page from this row, which had no brief, place, kind,
+         calendar or creator — and so no Remove button. */
       var rows = unwrap(await sb()
         .from('calendar_events')
-        .select('id, title, starts_at, ends_at, all_day, status, project_id')
+        .select(EVENT_LIST_COLUMNS)
         .not('project_id', 'is', null)
         .neq('status', 'cancelled')
         .gte('starts_at', from)
         .order('starts_at')
         .limit(500), 'project meetings');
-      return rows.map(function (r) {
-        return {
-          id: r.id, title: r.title,
-          when: shortDate(r.starts_at) + (r.all_day ? '' : ' · ' + clockTime(r.starts_at)),
-          row: r
-        };
-      });
+      return rows.map(agendaEvent);
+    },
+
+    /* A client's history: meetings that started before `before`, filed under a
+       company, its projects or its people — or under one person — the most
+       recent first — ties by id, so a page of them is the same each time —
+       which the weeks the agenda loads do not reach back to. At most `limit`
+       (20 unless given, 100 at most), and one more is asked for, to tell
+       whether there are more. Only ids that are uuids go into the filter, at
+       most 50 projects and 50 people, so the address stays a size a server
+       takes; `capped` says when some were left out. With no id, or no day,
+       nothing is asked. */
+    async pastMeetings(filter) {
+      var f = filter || {};
+      var before = isoTime(f.before);
+      var conditions = [];
+      if (uuids([f.companyId], 1).length) conditions.push('company_id.eq.' + f.companyId);
+      var allProjects = uuids(f.projectIds, Infinity);
+      var allContacts = uuids(f.contactIds, Infinity);
+      var projectIds = allProjects.slice(0, 50);
+      var contactIds = allContacts.slice(0, 50);
+      if (projectIds.length) conditions.push('project_id.in.(' + projectIds.join(',') + ')');
+      if (contactIds.length) conditions.push('contact_id.in.(' + contactIds.join(',') + ')');
+      if (!before || !conditions.length) return { meetings: [], more: false };
+      var limit = Math.min(Math.max(Math.floor(Number(f.limit)) || 20, 1), 100);
+      var rows = unwrap(await sb()
+        .from('calendar_events')
+        .select(EVENT_LIST_COLUMNS)
+        .neq('status', 'cancelled')
+        .lt('starts_at', before)
+        .or(conditions.join(','))
+        .order('starts_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(limit + 1), 'past meetings');
+      return {
+        meetings: rows.slice(0, limit).map(agendaEvent),
+        more: rows.length > limit,
+        capped: allProjects.length > 50 || allContacts.length > 50
+      };
+    },
+
+    /* One event by its id, for a page the weeks loaded do not reach — a
+       client's past meeting, or a link to one. null when there is none, or it
+       is not this person's to see; only a uuid is asked for. */
+    async event(id) {
+      if (!uuids([id], 1).length) return null;
+      var rows = unwrap(await sb()
+        .from('calendar_events')
+        .select(EVENT_PAGE_COLUMNS)
+        .eq('id', id)
+        .limit(1), 'the event');
+      return rows.length ? agendaEvent(rows[0]) : null;
+    },
+
+    /* Who is invited to one event, by its id, for the page of one that came
+       from a list — which leaves that column out. null when there is no such
+       event, or it is not this person's to see; nobody when the column holds
+       nothing. Only a uuid is asked for. */
+    async eventInvitees(id) {
+      if (!uuids([id], 1).length) return null;
+      var rows = unwrap(await sb()
+        .from('calendar_events')
+        .select('id, attendees')
+        .eq('id', id)
+        .limit(1), 'who is invited');
+      if (!rows.length) return null;
+      return Array.isArray(rows[0].attendees) ? rows[0].attendees : [];
+    },
+
+    /* ── A project's team, client people, files and budget (0039) ─────── */
+    /* Small tables, loaded whole and shaped by projects-model.js. RLS decides
+       what comes back: files only for the projects this person may open,
+       budgets only for owners and admins. */
+
+    async projectMembers() {
+      return unwrap(await sb().from('project_members')
+        .select('project_id, employee_id, created_at')
+        .order('created_at'), 'project teams');
+    },
+
+    async projectContacts() {
+      return unwrap(await sb().from('project_contacts')
+        .select('project_id, contact_id, role, created_at')
+        .order('created_at'), 'project contacts');
+    },
+
+    async projectFiles() {
+      return unwrap(await sb().from('project_files')
+        .select('id, project_id, storage_path, name, size_bytes, content_type, uploaded_by, created_at')
+        .order('created_at', { ascending: false }), 'project files');
+    },
+
+    async projectBudgets() {
+      return unwrap(await sb().from('project_budgets')
+        .select('project_id, amount, currency, updated_at'), 'project budgets');
     },
 
     /* ── Tickets ─────────────────────────────────────────────────────── */
     async tickets() {
       var rows = unwrap(await sb()
         .from('support_tickets')
-        .select('id, number, subject, product, priority, status, created_at, project_id, company_id, contact_id, ' +
-                'contact:crm_contacts (full_name), company:crm_companies (name), ' +
+        .select('id, number, subject, product, priority, status, source, created_at, first_response_at, resolved_at, ' +
+                'project_id, company_id, contact_id, assignee_id, ' +
+                'contact:crm_contacts (full_name, email), company:crm_companies (name), ' +
                 'assignee:employees (full_name), ' +
                 /* The queue view shows the opening message under each row, and
-                   the detail view shows the whole thread. Both come from this
-                   one embed rather than a second round trip per ticket. */
-                'ticket_messages (id, body, direction, created_at)')
+                   the detail view the whole thread: who wrote each message, and
+                   whether a reply reached the customer (0033). Both come from
+                   this one embed rather than a second round trip per ticket. */
+                'ticket_messages (id, body, direction, created_at, delivered_at, delivery_error, ' +
+                'author:employees (full_name), sender:crm_contacts (full_name))')
         .is('deleted_at', null)
         .order('created_at', { ascending: false }), 'tickets');
       return rows.map(function (r) {
         var client = (r.contact && r.contact.full_name)
                   || (r.company && r.company.name) || 'Unknown';
-        var thread = (r.ticket_messages || []).slice().sort(function (a, b) {
+        var thread = (r.ticket_messages || []).map(function (m) {
+          return Object.assign({}, m, {
+            who: (m.author && m.author.full_name) || (m.sender && m.sender.full_name) || ''
+          });
+        }).sort(function (a, b) {
           return String(a.created_at).localeCompare(String(b.created_at));
         });
         var opening = thread.filter(function (m) { return m.direction === 'inbound'; })[0];
@@ -177,6 +429,10 @@
           product: r.product || '—',
           priority: label(r.priority), status: label(r.status),
           owner: r.assignee ? initials(r.assignee.full_name) : '—',
+          /* "Assigned to me" is this id — it was a set of initials. */
+          assigneeId: r.assignee_id || null,
+          assigneeName: r.assignee ? r.assignee.full_name : '',
+          contactEmail: (r.contact && r.contact.email) || '',
           date: shortDate(r.created_at),
           body: opening ? opening.body : '',
           thread: thread, row: r
@@ -243,33 +499,35 @@
       return rows.map(projectTask);
     },
 
-    /* Every project's tasks in one request rather than one per project — a page
-       at a time, because the API hands back at most 1000 rows per request. */
+    /* Every project's tasks in one request rather than one per project, a page
+       at a time (everyRow). */
     async allProjectTasks() {
-      var PAGE = 1000;
-      var rows = [];
-      for (var from = 0; ; from += PAGE) {
-        var page = unwrap(await sb()
+      var rows = await everyRow(function (from, to) {
+        return sb()
           .from('tasks')
           .select(TASK_COLUMNS)
           .not('project_id', 'is', null)
           .order('created_at')
           .order('id')
-          .range(from, from + PAGE - 1), 'project tasks');
-        rows = rows.concat(page);
-        if (page.length < PAGE) break;
-      }
+          .range(from, to);
+      }, 'project tasks');
       return rows.map(projectTask);
     },
 
     /* ── CRM ─────────────────────────────────────────────────────────── */
+    /* Every contact, a page at a time (everyRow): the list used to stop at the
+       thousandth without a word. */
     async contacts() {
-      var rows = unwrap(await sb()
-        .from('crm_contacts')
-        .select('id, full_name, email, title, notes, ' +
-                'company:crm_companies (id, name, stage, value, currency)')
-        .is('deleted_at', null)
-        .order('full_name'), 'contacts');
+      var rows = await everyRow(function (from, to) {
+        return sb()
+          .from('crm_contacts')
+          .select('id, full_name, email, phone, title, notes, ' +
+                  'company:crm_companies (id, name, stage, value, currency)')
+          .is('deleted_at', null)
+          .order('full_name')
+          .order('id')
+          .range(from, to);
+      }, 'contacts');
       return rows.map(function (r) {
         var co = r.company;
         return {
@@ -282,12 +540,17 @@
       });
     },
 
+    /* Every company, a page at a time (everyRow), as contacts are. */
     async companies() {
-      var rows = unwrap(await sb()
-        .from('crm_companies')
-        .select('id, name, domain, kind, stage, value, currency, notes')
-        .is('deleted_at', null)
-        .order('name'), 'companies');
+      var rows = await everyRow(function (from, to) {
+        return sb()
+          .from('crm_companies')
+          .select('id, name, domain, kind, stage, value, currency, owner_id, notes')
+          .is('deleted_at', null)
+          .order('name')
+          .order('id')
+          .range(from, to);
+      }, 'companies');
       return rows.map(function (r) {
         return {
           id: r.id, name: r.name, domain: r.domain || '',
@@ -301,14 +564,13 @@
     async invoices() {
       var rows = unwrap(await sb()
         .from('finance_invoices')
-        .select('id, number, client, amount, currency, status, issued_on, due_on, notes')
+        .select('id, number, client, client_email, amount, currency, status, issued_on, due_on, paid_on, notes')
         .order('issued_on', { ascending: false, nullsFirst: false }), 'invoices');
       return rows.map(function (r) {
         return {
           id: r.number, uuid: r.id, client: r.client,
           description: r.notes || '', amount: money(r.amount, r.currency),
-          status: label(r.status),
-          date: r.issued_on ? shortDate(r.issued_on) : '', row: r
+          status: label(r.status), row: r
         };
       });
     },
@@ -353,16 +615,21 @@
       var boxes = mailboxIds && mailboxIds.length ? mailboxIds : [null];
 
       function threadQuery(box, folder) {
+        /* Deliberately NO message bodies. Embedding them made this query 16MB
+           for 189 threads — every HTML email in the mailbox, fetched on every
+           reload, to render a list that shows a sender, a subject and a
+           snippet. Bodies load per thread when one is opened. */
         var q = sb()
           .from('mail_threads')
           .select('id, connection_id, subject, snippet, folder, is_read, is_starred, message_count, ' +
                   'last_message_at, last_from_name, last_from_email, ticket_id, contact_id, ' +
-                  'contact:crm_contacts (full_name, email)')
-          /* Deliberately NO message bodies. Embedding them made this query 16MB
-             for 189 threads — every HTML email in the mailbox, fetched on every
-             reload, to render a list that shows a sender, a subject and a
-             snippet. Bodies load per thread when one is opened. */
-          .eq('folder', folder);
+                  'contact:crm_contacts (full_name, email)');
+        /* Starred reaches past the folders listed: a conversation filed away in
+           Outlook (0045) with a flag on it is still one you marked to come back
+           to. Inbox and Sent load as themselves, so they are left out here. */
+        q = folder === 'starred'
+          ? q.eq('is_starred', true).not('folder', 'in', '(inbox,sent)')
+          : q.eq('folder', folder);
         if (box) q = q.eq('connection_id', box);
         return q
           .order('last_message_at', { ascending: false, nullsFirst: false })
@@ -432,9 +699,9 @@
     },
 
     /* What the mail switcher offers: the studio's mailboxes and this person's
-       own. RLS lets any member of staff list every connection — colleagues'
-       addresses and last errors included — so the filter is here, in the
-       query, rather than only in the view that would have hidden them again.
+       own. Since 0044 that is all RLS returns; before it any member of staff
+       could list every connection — colleagues' addresses and last errors
+       included — so the filter stays in the query, and
        mailModel.mailboxesFor() applies the same rule a second time. */
     async mailboxes() {
       var me = window.workspaceSession.employee;
@@ -461,16 +728,12 @@
     /* Monthly income for the Overview chart. Summed in the database so it
        agrees with the Revenue tile; empty for a non-manager, by RLS. */
     async revenueSeries(months) {
-      var res = await sb().rpc('revenue_series', { p_months: months || 12 });
-      if (res.error) throw new Error('Could not load revenue: ' + res.error.message);
-      return res.data || [];
+      return (await rpcInZone('revenue_series', { p_months: months || 12 }, 'revenue')) || [];
     },
 
     /* This month's income by category, for the Finance mix panel. */
     async revenueMix(months) {
-      var res = await sb().rpc('revenue_mix', { p_months: months || 1 });
-      if (res.error) throw new Error('Could not load the revenue mix: ' + res.error.message);
-      return res.data || [];
+      return (await rpcInZone('revenue_mix', { p_months: months || 1 }, 'the revenue mix')) || [];
     },
 
     /* Every note in one query. The panels are keyed by record, but fetching
@@ -479,12 +742,18 @@
     async notes() {
       var rows = unwrap(await sb()
         .from('workspace_notes')
-        .select('id, entity_type, entity_id, body, created_at, author:employees (full_name)')
+        .select('id, entity_type, entity_id, body, created_at, author_id, author:employees (full_name)')
         .order('created_at'), 'notes');
       return rows.map(function (r) {
-        var who = r.author ? r.author.full_name : 'Veyago';
+        /* Only the employee signed in writes a note (0032's insert policy),
+           and a note keeps no author once theirs is deleted (on delete set
+           null): a note with none is a former team member's, never the
+           studio's. */
+        var who = r.author ? r.author.full_name : 'Former team member';
         return {
           id: r.id, entityType: r.entity_type, entityId: r.entity_id,
+          /* Who wrote it, by id: only they change it (0032). */
+          authorId: r.author_id || null,
           body: r.body, who: who, initial: initials(who),
           time: shortDate(r.created_at), row: r
         };

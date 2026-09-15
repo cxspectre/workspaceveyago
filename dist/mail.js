@@ -43,8 +43,11 @@
   /* "Show images" is decided per message, and showing them in one message no
      longer hides them again in another. workspace.js's handler adds to this. */
   const imagesShown = id => (window.__mailShowImages || []).includes(id);
-  /* microsoft-connect is for managers, so the button is only offered to them. */
-  const canReconnect = () => Boolean(window.workspaceSession && workspaceSession.isManager && workspaceSession.isManager());
+  /* Who may reconnect a mailbox, as microsoft-connect decides it: owners and
+     admins the studio's, and anyone their own. mailboxesFor() lists no
+     colleague's, so a personal mailbox here is this person's own. */
+  const canReconnect = box => (Boolean(box) && box.kind === 'personal')
+    || Boolean(window.workspaceSession && workspaceSession.isManager && workspaceSession.isManager());
 
   /* The store's arrays are shared with every view, so a changed thread goes
      back in as a new object at the same position. */
@@ -76,11 +79,16 @@
   const countBadge = n => (n ? `<small class="mail-count">${n}</small>` : '');
 
   function connectionRow(box) {
-    const button = canReconnect()
+    const button = canReconnect(box)
       ? `<button type="button" class="btn mailbox-reconnect" data-mail-reconnect="${esc(box.id)}">Reconnect</button>`
       : '';
+    /* Why a mailbox is in trouble — or what a working one went on without —
+       rather than "Not syncing" alone. */
+    const note = M.mailboxNote(box);
     return `<div class="mailbox-connection"><p>${esc(box.address)}</p>`
-      + `<small class="${box.live ? '' : 'mailbox-warning'}">${esc(syncedLabel(box))}</small>${button}</div>`;
+      + `<small class="${box.live ? '' : 'mailbox-warning'}">${esc(syncedLabel(box))}</small>`
+      + (note ? `<small class="mailbox-note" title="${esc(box.lastError)}">${esc(note)}</small>` : '')
+      + `${button}</div>`;
   }
 
   function mailboxColumn(route, boxes) {
@@ -112,10 +120,14 @@
     const box = boxes.find(b => b.id === route.mailbox);
     const foot = box
       ? `<span class="eyebrow">MAILBOX</span>${connectionRow(box)}`
-      : !boxes.length ? '<span class="eyebrow">MAILBOX</span><p>No mailbox connected</p><small>Mail appears here once one is.</small>'
-      /* A manager sees every mailbox's connection here, so reconnecting one —
-         to grant a permission added since, say — is a click from any view. */
-      : canReconnect() ? `<span class="eyebrow">CONNECTIONS</span>${boxes.map(connectionRow).join('')}` : '';
+      : !boxes.length ? (live() && !workspaceStore.has('mail')
+        ? '<span class="eyebrow">MAILBOX</span><p>Mail did not load</p><small>It tries again by itself.</small>'
+        : '<span class="eyebrow">MAILBOX</span><p>No mailbox connected</p><small>Mail appears here once one is.</small>')
+      /* Every mailbox this person may reconnect shows its connection here, so
+         reconnecting one — to grant a permission added since, say — is a click
+         from any view. */
+      : boxes.some(canReconnect)
+        ? `<span class="eyebrow">CONNECTIONS</span>${boxes.filter(canReconnect).map(connectionRow).join('')}` : '';
 
     const newMessage = `<button class="btn btn-primary mail-new" data-action="compose">${icon('plus')}`
       + `${mailComposer.isOpen() ? 'Continue draft' : 'New message'}</button>`;
@@ -127,11 +139,21 @@
 
   /* ── The conversation list ─────────────────────────────────────────── */
 
+  /* Mail mode hides the context bar, where the workspace says a part did not
+     load or refresh — so the same words go at the top of the list. */
+  function loadNote() {
+    const notice = window.workspaceStore && workspaceStore.state.notice;
+    if (!notice || notice.kind === 'blocked') return '';
+    return `<div class="mail-list-truncated mail-load-note"><span role="status">${esc(notice.text)}</span>`
+      + '<button type="button" class="text-btn" data-load-retry>Retry</button></div>';
+  }
+
   /* Each mailbox's folders load up to a limit (queries.js). When the one on
      screen hit it, say so, rather than let the list pass for everything. */
   function truncatedNote(route) {
     const keys = (live() && workspaceStore.state.mailTruncated) || [];
-    const folders = route.folder === 'starred' ? ['inbox', 'sent'] : [route.folder];
+    /* Starred is drawn from all three loads, the filed-and-starred one among them. */
+    const folders = route.folder === 'starred' ? ['inbox', 'sent', 'starred'] : [route.folder];
     const cut = keys.some(key => {
       const [box, folder] = key.split('|');
       return folders.includes(folder) && (route.mailbox === M.ALL || box === 'all' || box === route.mailbox);
@@ -151,7 +173,7 @@
     }).join('');
     const where = route.mailbox === M.ALL ? 'All mailboxes' : addressOf(route.mailbox);
     return `<div class="conversation-list"><div class="mail-list-heading"><h2>${FOLDER_LABELS[route.folder]}</h2>`
-      + `<small class="mail-list-where">${esc(where)}</small>${queryInput('mail', 'Search mail')}</div>`
+      + `<small class="mail-list-where">${esc(where)}</small>${queryInput('mail', 'Search mail')}</div>${loadNote()}`
       + (items || empty('No conversations', queries.mail.trim() ? 'Nothing matches that search.' : 'This folder is empty.'))
       + `<div class="mail-list-count">${list.length} conversation${list.length === 1 ? '' : 's'}</div>${truncatedNote(route)}</div>`;
   }
@@ -210,10 +232,10 @@
 
   function related(thread) {
     const ticket = thread.ticketId ? tickets.find(t => t.uuid === thread.ticketId) : null;
-    const c = thread.contactId ? contacts.findIndex(x => x.id === thread.contactId) : -1;
-    if (c < 0 && !ticket) return '';
+    const contact = thread.contactId ? contacts.find(x => x.id === thread.contactId) : null;
+    if (!contact && !ticket) return '';
     return '<div class="reader-related"><span class="eyebrow">CONNECTED TO THIS CONVERSATION</span>'
-      + (c >= 0 ? link('crm/' + c, contacts[c].company || contacts[c].name, 'crm', 'related-chip') : '')
+      + (contact ? link('crm/' + contact.id, contact.company || contact.name, 'crm', 'related-chip') : '')
       + (ticket ? link('tickets/' + ticket.id, 'VYG-' + ticket.id, 'tickets', 'related-chip') : '')
       + '</div>';
   }
@@ -401,7 +423,7 @@
     return {
       boxes: mailboxes(),
       book: M.addressBook(contacts, mails, ownAddresses()),
-      canReconnect: canReconnect(),
+      canReconnect,
       onSent: afterSend,
       onClose: () => { if (page === 'mail') render(); }
     };
@@ -414,7 +436,7 @@
     const thread = mailComposer.threadId() ? threadById(mailComposer.threadId()) : null;
     navigate(M.mailRoute({
       mailbox: route.mailbox,
-      folder: thread ? thread.folder : route.folder,
+      folder: thread ? M.folderForThread(thread, route.folder) : route.folder,
       threadId: thread ? thread.id : null
     }));
     /* After the render has put the draft on screen. Not requestAnimationFrame:
@@ -484,11 +506,15 @@
         render();
         return;
       }
-      navigate(M.mailRoute({ mailbox: M.parseMailRoute(routeParts).mailbox, folder: thread.folder, threadId: thread.id }));
+      const here = M.parseMailRoute(routeParts);
+      navigate(M.mailRoute({ mailbox: here.mailbox, folder: M.folderForThread(thread, here.folder), threadId: thread.id }));
     });
   }
 
   window.addEventListener('beforeunload', e => {
+    /* The session ended and the gate is reloading the page: the draft cannot be
+       sent from here any more, and the prompt would only hold a locked page open. */
+    if (window.workspaceGate && window.workspaceGate.leaving) return;
     if (!mailComposer.hasContent()) return;
     e.preventDefault();
     e.returnValue = '';

@@ -12,10 +12,11 @@
  * day — repaint, re-select, reload the week's events — subscribes with
  * CAL.onChange.
  *
- * Day-of-month numbers stay the key the views use for events. They are unique
- * inside the window a snapshot covers (at most nine days in a row), which is
- * why that window is bounded, and why anything crossing a month boundary —
- * the mini month, labels — works from Date objects instead.
+ * The agenda places events by date — agenda-model.js's day keys, such as
+ * "2026-09-18" — not by day-of-month number. What still takes a number (the
+ * date in the header: CAL.full(CAL.today)) asks only about a day inside the
+ * window a snapshot covers, at most nine days in a row, where a number is
+ * unique; anything crossing a month boundary works from Date objects instead.
  */
 function createCalendar(clock) {
   const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July',

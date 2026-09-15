@@ -100,6 +100,13 @@ const projectsModel = (function () {
     if (renamed && !text(f.name)) return refuse('A project needs a name.');
     if (renamed && text(f.name).length > NAME_LIMIT) return refuse(`A project name is at most ${NAME_LIMIT} characters long.`);
     if (has('dueOn') && text(f.dueOn) && !isDate(text(f.dueOn))) return refuse('That due date is not a date.');
+    if (has('startsOn') && text(f.startsOn) && !isDate(text(f.startsOn))) return refuse('That start date is not a date.');
+    /* Judged when a date changed, like the name: dates that were already the
+       wrong way round must not block renaming the project. */
+    const startsOn = has('startsOn') ? orNull(f.startsOn) : orNull(was.startsOn);
+    const dueOn = has('dueOn') ? orNull(f.dueOn) : orNull(was.dueOn);
+    const redated = startsOn !== orNull(was.startsOn) || dueOn !== orNull(was.dueOn);
+    if (redated && startsOn && dueOn && startsOn > dueOn) return refuse('The start date is after the due date.');
 
     /* [form field, column, what the form says, what the project said], both
        sides tidied the same way, so a form nobody touched changes nothing. */
@@ -108,6 +115,7 @@ const projectsModel = (function () {
       ['description', 'description', orNull(f.description), orNull(was.description)],
       ['companyId', 'company_id', orNull(f.companyId), orNull(was.companyId)],
       ['ownerId', 'owner_id', orNull(f.ownerId), orNull(was.ownerId)],
+      ['startsOn', 'starts_on', orNull(f.startsOn), orNull(was.startsOn)],
       ['dueOn', 'due_on', orNull(f.dueOn), orNull(was.dueOn)]
     ];
     const changes = candidates
@@ -125,6 +133,202 @@ const projectsModel = (function () {
       .map(item => Object.freeze([String(item.id), String(item.name || '')]));
     const keep = Boolean(current) && !list.some(([id]) => id === String(current));
     return Object.freeze(keep ? [Object.freeze([String(current), currentLabel || 'Current']), ...list] : list);
+  }
+
+  /* ── The team (0039) ───────────────────────────────────────────────── */
+
+  const FORMER_MEMBER = 'Former team member';
+  const membersOf = (project, memberRows) =>
+    (memberRows || []).filter(m => m && project && m.project_id === project.id);
+
+  /* Who runs a project's team, as can_manage_project() decides: owners and
+     admins, and the project's own owner. */
+  function canManageProject(project, meId, manager) {
+    return Boolean(manager) || (Boolean(meId) && Boolean(project) && project.ownerId === meId);
+  }
+
+  /* Who opens a project's files, as can_open_project_files() decides: whoever
+     runs its team, and its members. */
+  function canOpenFiles(project, memberRows, meId, manager) {
+    return canManageProject(project, meId, manager)
+      || (Boolean(meId) && membersOf(project, memberRows).some(m => m.employee_id === meId));
+  }
+
+  /* A project's team: its owner first, then its members in the order they
+     joined, each once. Someone who has left the team is still named as such. */
+  function projectTeam(project, memberRows, team) {
+    if (!project) return Object.freeze([]);
+    const entry = (employeeId, owner) => {
+      const person = (team || []).find(m => m && m.id === employeeId);
+      return Object.freeze({
+        employeeId,
+        owner,
+        name: person ? person.name : FORMER_MEMBER,
+        initial: person ? person.initial : '?'
+      });
+    };
+    const owner = project.ownerId ? [entry(project.ownerId, true)] : [];
+    const members = membersOf(project, memberRows)
+      .filter(m => m.employee_id !== project.ownerId)
+      .map(m => entry(m.employee_id, false));
+    return Object.freeze([...owner, ...members]);
+  }
+
+  /* Who can still join, as [id, name]: the team's people who are neither the
+     project's owner nor a member of it already. */
+  function teamCandidates(project, memberRows, team) {
+    if (!project) return Object.freeze([]);
+    const taken = new Set([project.ownerId, ...membersOf(project, memberRows).map(m => m.employee_id)]);
+    return Object.freeze((team || [])
+      .filter(m => m && m.id && !taken.has(m.id))
+      .map(m => Object.freeze([String(m.id), String(m.name || '')])));
+  }
+
+  /* ── The client's people (0039) ────────────────────────────────────── */
+
+  /* project_contacts.role, in the order a list shows them. */
+  const CONTACT_ROLES = Object.freeze([
+    Object.freeze({ value: 'decision_maker', label: 'Decision maker' }),
+    Object.freeze({ value: 'billing', label: 'Billing' }),
+    Object.freeze({ value: 'day_to_day', label: 'Day to day' }),
+    Object.freeze({ value: 'technical', label: 'Technical' }),
+    Object.freeze({ value: 'other', label: 'Other' })
+  ]);
+  const GONE_CONTACT = 'A contact no longer in the CRM';
+  const roleIndex = value => {
+    const index = CONTACT_ROLES.findIndex(r => r.value === value);
+    return index < 0 ? CONTACT_ROLES.length : index;
+  };
+  const roleLabel = value => (CONTACT_ROLES.find(r => r.value === value) || CONTACT_ROLES[CONTACT_ROLES.length - 1]).label;
+  const linksOf = (project, linkRows) =>
+    (linkRows || []).filter(l => l && project && l.project_id === project.id);
+
+  /* A project's client people with their role on it, decision makers first.
+     A contact gone from the CRM stays listed, so its link can still be removed;
+     `known` says whether there is still a CRM page to link to. */
+  function projectPeople(project, linkRows, contacts) {
+    if (!project) return Object.freeze([]);
+    const list = contacts || [];
+    return Object.freeze(linksOf(project, linkRows)
+      .map(l => {
+        const person = list.find(c => c && c.id === l.contact_id) || null;
+        return Object.freeze({
+          contactId: l.contact_id,
+          role: l.role,
+          roleLabel: roleLabel(l.role),
+          name: person ? person.name : GONE_CONTACT,
+          email: person ? (person.email || '') : '',
+          known: Boolean(person)
+        });
+      })
+      .sort((a, b) => roleIndex(a.role) - roleIndex(b.role) || a.name.localeCompare(b.name)));
+  }
+
+  /* Who can still be added, as [id, name]: the project company's contacts who
+     are not on it yet. An internal project has no client people. */
+  function peopleCandidates(project, linkRows, contacts) {
+    if (!project || !project.companyId) return Object.freeze([]);
+    const taken = new Set(linksOf(project, linkRows).map(l => l.contact_id));
+    return Object.freeze((contacts || [])
+      .filter(c => c && c.id && !taken.has(c.id) && c.row && c.row.company && c.row.company.id === project.companyId)
+      .map(c => Object.freeze([String(c.id), String(c.name || '')])));
+  }
+
+  /* ── Files (0039) ──────────────────────────────────────────────────── */
+
+  const KB = 1024;
+  const MB = KB * KB;
+  /* The project-files bucket's limit. */
+  const FILE_LIMIT_BYTES = 50 * MB;
+
+  /* A size a person reads: 512 B, 2 KB, 1.5 MB. */
+  function fileSize(bytes) {
+    const n = Math.max(0, Number(bytes) || 0);
+    if (n < KB) return `${n} B`;
+    if (n < MB) return `${Math.round(n / KB)} KB`;
+    return `${(n / MB).toFixed(1).replace(/\.0$/, '')} MB`;
+  }
+
+  /* Why a file cannot be stored, said before anything is uploaded — or null. */
+  function fileProblem(file) {
+    if (!file) return 'Pick a file first.';
+    const name = String(file.name || 'That file');
+    if (!(Number(file.size) > 0)) return `"${name}" is empty.`;
+    if (Number(file.size) > FILE_LIMIT_BYTES) {
+      return `"${name}" is larger than ${fileSize(FILE_LIMIT_BYTES)}, the most a project file can be.`;
+    }
+    return null;
+  }
+
+  const addedFormat = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' });
+
+  /* A project's files, newest first. */
+  function projectFiles(project, fileRows) {
+    if (!project) return Object.freeze([]);
+    return Object.freeze((fileRows || [])
+      .filter(f => f && f.project_id === project.id)
+      .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
+      .map(f => Object.freeze({
+        id: f.id,
+        name: f.name,
+        path: f.storage_path,
+        size: fileSize(f.size_bytes),
+        type: f.content_type || '',
+        uploadedBy: f.uploaded_by || null,
+        added: f.created_at ? addedFormat.format(new Date(f.created_at)) : ''
+      })));
+  }
+
+  /* ── Budget (0039) ─────────────────────────────────────────────────── */
+
+  /* numeric(12,2) holds up to 9,999,999,999.99. */
+  const BUDGET_LIMIT = 1e10;
+  const CURRENCY = /^[A-Z]{3}$/;
+
+  /* An amount the way people type one: 12500, 12,500, 12.500,50, 12 500.5,
+     1'234'567. Thousands are grouped in threes by one separator — a comma, a
+     point, a space or an apostrophe — and one or two decimals follow the other
+     separator. Anything else is refused rather than guessed at: "1,2345" used
+     to be read as 12,345 and "1.5.5" as 15.5. Empty is null; not an amount is
+     NaN. */
+  const AMOUNT = /^(\d+|\d{1,3}([ ,.])\d{3}(?:\2\d{3})*)(?:([.,])(\d{1,2}))?$/;
+
+  function parseAmount(text) {
+    const typed = String(text == null ? '' : text).trim().replace(/[  '’]/g, ' ');
+    if (!typed) return null;
+    const m = AMOUNT.exec(typed);
+    if (!m || (m[2] && m[2] === m[3])) return NaN;
+    return Number(`${m[1].replace(/[ ,.]/g, '')}.${m[4] || '0'}`);
+  }
+
+  function budgetOf(project, budgetRows) {
+    if (!project) return null;
+    const found = (budgetRows || []).find(b => b && b.project_id === project.id);
+    return found ? Object.freeze({ amount: Number(found.amount), currency: String(found.currency || 'USD') }) : null;
+  }
+
+  /* What a budget form does to `current` (budgetOf): set a budget, change it,
+     clear it, or leave it — with the amount and currency to write, or why it
+     cannot. */
+  function budgetChange(current, fields) {
+    const f = fields || {};
+    const refuse = problem => Object.freeze({ action: 'none', amount: null, currency: null, problem });
+    const amount = parseAmount(f.amount);
+    if (amount === null) {
+      return Object.freeze({ action: current ? 'clear' : 'none', amount: null, currency: null, problem: null });
+    }
+    if (Number.isNaN(amount)) return refuse('That budget is not an amount.');
+    if (amount >= BUDGET_LIMIT) return refuse('That budget is too large.');
+    const currency = String(f.currency || '').trim().toUpperCase();
+    if (!CURRENCY.test(currency)) return refuse('Pick a currency, like EUR or USD.');
+    const rounded = Math.round(amount * 100) / 100;
+    const unchanged = Boolean(current) && current.amount === rounded && current.currency === currency;
+    return Object.freeze({
+      action: unchanged ? 'none' : (current ? 'change' : 'set'),
+      amount: rounded,
+      currency,
+      problem: null
+    });
   }
 
   /* ── Meetings ──────────────────────────────────────────────────────── */
@@ -179,8 +383,9 @@ const projectsModel = (function () {
   }
 
   /* A project as the views use it: everything by id, and its tasks as titles
-     with a parallel list of ids, due dates and ticked positions (taskRows,
-     checkedTasks). `project` is what queries.projects() returns; `tasks` is
+     with a parallel list of ids, due dates and ticked positions (checkedTasks
+     in workspace.js, "my focus" in overview-model.js, a tick in
+     data/writes.js). `project` is what queries.projects() returns; `tasks` is
      every project's tasks. Not frozen: the views' offline handlers still tick
      and add tasks in place. */
   function shapeProject(project, tasks) {
@@ -200,12 +405,21 @@ const projectsModel = (function () {
          label was read as local midnight and showed a day early in America. */
       due: row.due_on ? shortDue(row.due_on) : (project.due || ''),
       dueOn: row.due_on || null,
+      startsOn: row.starts_on || null,
+      starts: shortDue(row.starts_on),
+      completedAt: row.completed_at || null,
       status: project.status,
       description: project.description,
       tasks: mine.map(t => t.title),
       taskIds: mine.map(t => t.id),
       taskDue: mine.map(t => shortDue(t.row.due_date)),
-      checked: mine.reduce((ticked, t, i) => (t.done ? ticked.concat(i) : ticked), [])
+      /* The date itself and who each task is for: "my focus" (overview-model.js). */
+      taskDueOn: mine.map(t => t.row.due_date || null),
+      taskAssignees: mine.map(t => t.row.assignee_id || null),
+      checked: mine.reduce((ticked, t, i) => (t.done ? ticked.concat(i) : ticked), []),
+      /* The tasks themselves, as queries.js shapes them, for the task list
+         (tasks-ui.js) — which reads status, priority and details from them. */
+      taskList: mine
     };
   }
 
@@ -252,6 +466,11 @@ const projectsModel = (function () {
     NAME_LIMIT,
     statusValue, isActive, shortDue, groupTasks, shapeProject, projectById, boardColumns, ownerOf,
     matchCompanies, findCompany, projectTickets, upcomingEvents, projectChanges, choices,
-    suggestedStart, meetingTimes
+    suggestedStart, meetingTimes,
+    CONTACT_ROLES, FILE_LIMIT_BYTES,
+    canManageProject, canOpenFiles, projectTeam, teamCandidates,
+    roleLabel, projectPeople, peopleCandidates,
+    fileSize, fileProblem, projectFiles,
+    budgetOf, budgetChange
   });
 })();

@@ -18,6 +18,8 @@ const projectsUi = (function () {
   const PRIORITIES = Object.freeze([['low', 'Low'], ['normal', 'Normal'], ['high', 'High'], ['urgent', 'Urgent']]);
   const TEXT_LIMIT = 200;
   const MEETING_MINUTES = 30;
+  /* Offered for a budget; one already set in another currency is kept too. */
+  const CURRENCIES = Object.freeze(['USD', 'EUR', 'GBP', 'CHF']);
   const ACTIONS = Object.freeze({
     projectEdit: 'edit', projectTicket: 'ticket', projectMeeting: 'meeting', projectArchive: 'archive'
   });
@@ -30,6 +32,7 @@ const projectsUi = (function () {
 
   const live = () => Boolean(window.workspaceStore && workspaceStore.state.loaded);
   const isManager = () => Boolean(window.workspaceSession && workspaceSession.isManager && workspaceSession.isManager());
+  const meId = () => (window.workspaceSession && workspaceSession.employee ? workspaceSession.employee.id : null);
   const pad = n => String(n).padStart(2, '0');
   const dayKey = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
   const timeKey = d => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
@@ -80,21 +83,51 @@ const projectsUi = (function () {
   function openEdit(p) {
     const companies = M.choices(workspaceStore.state.companies, p.companyId, 'Current company (not in the list)');
     const owners = M.choices(team, p.ownerId, 'Current owner (no longer on the team)');
+    /* Handing a project over is for owners and admins and the project's own
+       owner (guard_project_owner, 0039). A disabled select is not sent, so for
+       anyone else the owner stays as it is. */
+    const handsOver = M.canManageProject(p, meId(), isManager());
+    const s = workspaceStore.state;
+    const clientPeople = M.projectPeople(p, s.projectContacts, contacts).length;
+    /* The budget is for owners and admins (0039): nobody else is shown it. */
+    const budget = isManager() ? M.budgetOf(p, s.projectBudgets) : null;
+    const currencies = M.choices(CURRENCIES.map(code => ({ id: code, name: code })), budget && budget.currency, budget && budget.currency);
     showModal('PROJECT · EDIT', `<h2>Edit ${esc(p.name)}</h2>` + dialogForm('project-edit-form',
       field('Name', `<input name="name" required maxlength="${M.NAME_LIMIT}" value="${esc(p.name)}">`)
-      + field('Client company', `<select name="companyId">${options([['', 'No company (internal)'], ...companies], p.companyId || '')}</select>`)
-      + field('Owner', `<select name="ownerId">${options([['', 'No owner'], ...owners], p.ownerId || '')}</select>`)
+      + field('Client company', `<select name="companyId">${options([['', 'No company (internal)'], ...companies], p.companyId || '')}</select>`
+        + (clientPeople
+          ? `<small class="form-note">Changing the company takes ${clientPeople === 1 ? 'its person' : `its ${clientPeople} people`} off this project.</small>`
+          : ''))
+      + field('Owner', `<select name="ownerId"${handsOver ? '' : ' disabled'}>${options([['', 'No owner'], ...owners], p.ownerId || '')}</select>`
+        + (handsOver ? '' : '<small class="form-note">Only an owner or admin, or the project\'s owner, can hand it over.</small>'))
+      + '<div class="form-row form-row-two">'
+      + field('Start date', `<input type="date" name="startsOn" value="${esc(p.startsOn || '')}">`)
       + field('Due date', `<input type="date" name="dueOn" value="${esc(p.dueOn || '')}">`)
+      + '</div>'
+      + (isManager()
+        ? '<div class="form-row form-row-two">'
+          + field('Budget', `<input name="budget" inputmode="decimal" autocomplete="off" placeholder="Not set" value="${budget ? esc(String(budget.amount)) : ''}">`)
+          + field('Currency', `<select name="currency">${options(currencies, budget ? budget.currency : CURRENCIES[0])}</select>`)
+          + '</div>'
+        : '')
       + field('Description', `<textarea name="description">${esc(p.description || '')}</textarea>`),
       'Save project'));
     const form = document.getElementById('project-edit-form');
     form.addEventListener('submit', e => {
       e.preventDefault();
-      const { changes, problem } = M.projectChanges(p, Object.fromEntries(new FormData(form)));
+      const values = Object.fromEntries(new FormData(form));
+      const { changes, problem } = M.projectChanges(p, values);
       if (problem) { toast(problem); return; }
-      if (!Object.keys(changes).length) { closeModal(); return; }
-      submitting(form, saveKey('edit', p), () => workspaceActions.updateProject(p.uuid, changes),
-        () => toast('Project saved.'));
+      const budgetEdit = isManager()
+        ? M.budgetChange(budget, { amount: values.budget, currency: values.currency })
+        : { action: 'none', problem: null };
+      if (budgetEdit.problem) { toast(budgetEdit.problem); return; }
+      const edited = Object.keys(changes).length > 0;
+      if (!edited && budgetEdit.action === 'none') { closeModal(); return; }
+      submitting(form, saveKey('edit', p), async () => {
+        if (edited) await workspaceActions.updateProject(p.uuid, changes);
+        if (budgetEdit.action !== 'none') await workspaceActions.setProjectBudget(p.uuid, budgetEdit);
+      }, () => toast('Project saved.'));
     });
   }
 
@@ -181,7 +214,7 @@ const projectsUi = (function () {
         companyId: p.companyId
       }), result => toast(result && result.calendar
         ? `Added to ${result.calendar}.`
-        : 'Saved here — no calendar is connected yet.'));
+        : (result && result.why) || 'Saved here — no calendar is connected yet.'));
     });
   }
 

@@ -486,8 +486,10 @@ const mailComposer = (function () {
       if (ours()) {
         if (err.draftSaved) retryRisk = 'draft';
         else if (err.unknownOutcome) retryRisk = 'unknown';
+        const box = sentWith.boxes.find(b => b.id === request.connectionId);
         const hint = !err.reconnect ? ''
-          : sentWith.canReconnect ? ' Reconnect it under Connections.' : ' Ask a manager to reconnect it.';
+          /* Only a mailbox listed under Connections can be reconnected there. */
+          : box && sentWith.canReconnect && sentWith.canReconnect(box) ? ' Reconnect it under Connections.' : ' Ask a manager to reconnect it.';
         status(`${err.message}${hint}`, 'error');
       }
     } finally {

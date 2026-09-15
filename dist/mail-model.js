@@ -17,10 +17,11 @@ const mailModel = (function () {
 
   const isId = value => UUID.test(String(value || ''));
 
-  /* integration_status is readable by every member of staff, including other
-     people's personal connections (their MAIL is not — RLS on the threads sees
-     to that). The switcher offers what this person can actually open: studio
-     mailboxes, and their own. */
+  /* The switcher offers what this person can actually open: studio mailboxes,
+     and their own. Since 0044 integration_status returns no more than that;
+     before it every member of staff could list other people's personal
+     connections too (never their mail — RLS on the threads sees to that), so
+     the rule is kept here as well. */
   function mailboxesFor(connections, employeeId) {
     return (connections || [])
       .filter(c => c && c.provider === 'microsoft_mail')
@@ -61,6 +62,20 @@ const mailModel = (function () {
     return ['mail', mailbox || ALL, folder || 'inbox']
       .concat(threadId ? [threadId] : [])
       .join('/');
+  }
+
+  /* The folder a conversation's page opens under: its own when the mail view
+     has it, Starred for a starred one filed away in Outlook (0045), and
+     otherwise where the person already is — the thread opens by its id there. A
+     route to "archive" would land on an empty inbox with the thread nowhere on
+     screen. */
+  function folderForThread(thread, fallback) {
+    const folder = thread && thread.folder;
+    /* Opened from Starred, a starred conversation stays under Starred. */
+    if (fallback === 'starred' && thread && thread.starred) return 'starred';
+    if (FOLDERS.includes(folder)) return folder;
+    if (thread && thread.starred) return 'starred';
+    return FOLDERS.includes(fallback) ? fallback : 'inbox';
   }
 
   /* Starred spans folders: a starred sent message is still something you
@@ -281,8 +296,22 @@ const mailModel = (function () {
     return Object.freeze([...found.values()]);
   }
 
+  /* What a mailbox's last error says, as the list shows it: the first sentence,
+     short enough for the column, with the whole of it kept for a closer look.
+     A mailbox still syncing can carry one too — mail the sync went on without
+     confirming with Outlook, noted until the daily check (mail-sync.ts in the
+     backend). */
+  function mailboxNote(box) {
+    const MAX = 160;
+    const text = String((box && box.lastError) || '').trim();
+    if (!text) return null;
+    const end = text.indexOf('. ');
+    const first = end > 0 ? text.slice(0, end + 1) : text;
+    return first.length > MAX ? first.slice(0, MAX - 1) + '…' : first;
+  }
+
   return Object.freeze({
-    ALL, FOLDERS, mailboxesFor, parseMailRoute, mailRoute, visibleThreads, unreadCount, recipientLine,
+    ALL, FOLDERS, mailboxesFor, mailboxNote, parseMailRoute, mailRoute, folderForThread, visibleThreads, unreadCount, recipientLine,
     LIMITS, PURIFY_CONFIG, isAddress, subjectFor, answerFor, parseAddresses, storageName, attachmentProblem,
     signatureFor, sendProblem, addressBook
   });

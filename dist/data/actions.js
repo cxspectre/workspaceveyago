@@ -17,16 +17,8 @@
 
   /* Where attachments wait between being added and being sent (0038 §5). */
   var MAIL_ATTACHMENTS = 'mail-attachments';
-
-  /* supabase-js reports a missing function as a FunctionsFetchError or a 404;
-     both mean "not deployed", which is a different problem from "refused". */
-  function isMissingFunction(err) {
-    var name = String(err && err.name || '');
-    var message = String(err && err.message || '');
-    return name === 'FunctionsFetchError'
-        || /Failed to (send|fetch)/i.test(message)
-        || (err && err.context && err.context.status === 404);
-  }
+  /* A project's files: <project id>/<upload id>/<file name> (0039). */
+  var PROJECT_FILES = 'project-files';
 
   /* An Edge Function's own JSON answer to a failed call. supabase-js answers a
      non-2xx with { data: null, error } and the Response on error.context, so
@@ -62,6 +54,21 @@
   function one(res, what) {
     if (res.error) throw new Error('Could not ' + what + ': ' + res.error.message);
     return res.data;
+  }
+
+  /* A delete or update that RLS refuses touches nothing and says nothing: the
+     rows that come back are the only proof it happened. */
+  function touched(res, what, refusal) {
+    if (res.error) throw new Error('Could not ' + what + ': ' + res.error.message);
+    /* No row back: gone, changed since, or not this person's to change. A
+       refusal, marked as one, so a view can tell it from a write that never
+       reached the database. */
+    if (!(res.data && res.data.length)) throw Object.assign(new Error(refusal), { refused: true });
+    return res.data;
+  }
+
+  function isContactRole(role) {
+    return projectsModel.CONTACT_ROLES.some(function (r) { return r.value === role; });
   }
 
   /* Read or starred, through update-mail-state, which changes Outlook, the
@@ -100,11 +107,15 @@
 
       if (!res.error) return res.data;
 
-      /* If the function is not deployed yet, a reply must still be recorded —
-         losing what someone wrote is worse than not emailing it. The insert
-         below is the same one RLS has always allowed, and the caller is told
-         plainly that nothing was sent. */
-      if (isMissingFunction(res.error)) {
+      var answer = await functionBody(res);
+      var status = res.error.context && res.error.context.status;
+
+      /* If the function is not deployed yet — the gateway's own 404, with no
+         answer of the function's — a reply must still be recorded: losing what
+         someone wrote is worse than not emailing it. The insert below is the
+         same one RLS has always allowed, and the caller is told plainly that
+         nothing was sent. */
+      if (status === 404 && !answer.error) {
         var row = one(await sb().from('ticket_messages').insert({
           ticket_id: ticketId,
           author_employee_id: me().id,
@@ -118,7 +129,18 @@
             : 'Saved. Sending is not deployed on this project yet, so it has not gone out.'
         };
       }
-      throw new Error(await functionError(res, 'The reply could not be sent.'));
+      /* No answer of the function's own — the connection dropped, or the
+         gateway gave up while it was still working — says nothing about whether
+         the reply went. Saving a copy, or saying it did not go, invites sending
+         it twice. */
+      if (!answer.error && (!status || status >= 500)) {
+        var unknown = new Error(kind === 'note'
+          ? 'The note may have been saved. Look at the conversation before adding it again.'
+          : 'The reply may have been sent. Look at the conversation before sending it again.');
+        unknown.unknownOutcome = true;
+        throw unknown;
+      }
+      throw new Error(errorMessage(res, answer, 'The reply could not be sent.'));
     },
 
     async setTicketStatus(ticketId, status) {
@@ -128,6 +150,14 @@
       return one(await sb().from('support_tickets')
         .update({ status: status }).eq('id', ticketId).select().single(),
         'update the ticket');
+    },
+
+    async setTicketPriority(ticketId, priority) {
+      must(['low', 'normal', 'high', 'urgent'].indexOf(priority) !== -1,
+           'Unknown ticket priority: ' + priority);
+      return one(await sb().from('support_tickets')
+        .update({ priority: priority }).eq('id', ticketId).select().single(),
+        'change the priority');
     },
 
     async assignTicket(ticketId, employeeId) {
@@ -154,12 +184,31 @@
 
     /* An assignee may move their own task along and nothing else — the column
        guard (0022) silently restores title, project, priority and due date if
-       a non-manager sends them, so do not bother sending them. */
+       a non-manager sends them, so do not bother sending them. RLS refuses a
+       tick someone may not make by touching nothing (0050): the rows changed
+       are asked back, and none is said as a refusal rather than as
+       supabase-js's "no rows returned". */
     async setTaskDone(taskId, done) {
-      return one(await sb().from('tasks').update({
+      return touched(await sb().from('tasks').update({
         status: done ? 'done' : 'todo',
         completed_at: done ? new Date().toISOString() : null
-      }).eq('id', taskId).select().single(), 'update the task');
+      }).eq('id', taskId).select(), 'update the task',
+        'The task was not changed: only its assignee, its project’s team, or an owner or admin can tick it off.')[0];
+    },
+
+    /* What an edit changes (tasksModel.taskChanges), and only that. RLS refuses
+       a task someone may not change by touching nothing (0050), so the rows
+       changed are asked back: none is a refusal, and is said as one. */
+    async updateTask(taskId, changes) {
+      must(changes && Object.keys(changes).length, 'Nothing to save.');
+      return touched(await sb().from('tasks').update(changes).eq('id', taskId).select(), 'save the task',
+        'The task was not saved. Its assignee and its project’s team can change its status; only an owner or admin can change the rest.')[0];
+    },
+
+    /* Owners and admins only (0050); anyone else removes nothing, said as a refusal. */
+    async deleteTask(taskId) {
+      touched(await sb().from('tasks').delete().eq('id', taskId).select('id'), 'remove the task',
+        'The task was not removed: only an owner or admin can remove a task.');
     },
 
     async createTask(fields) {
@@ -168,7 +217,9 @@
         title: fields.title.trim(),
         details: fields.details || null,
         project_id: fields.projectId || null,
-        assignee_id: fields.assigneeId || (me() ? me().id : null),
+        /* Whoever it was given to; null is nobody. Not given at all, it is for
+           whoever adds it. */
+        assignee_id: fields.assigneeId !== undefined ? fields.assigneeId : (me() ? me().id : null),
         priority: fields.priority || 'normal',
         due_date: fields.dueDate || null,
         created_by: window.workspaceSession.session
@@ -203,7 +254,7 @@
        and arrives with its own rules — anything else in `changes` is dropped.
        Resolves to null when there is nothing to write. */
     async updateProject(projectId, changes) {
-      var allowed = ['name', 'description', 'company_id', 'owner_id', 'due_on'];
+      var allowed = ['name', 'description', 'company_id', 'owner_id', 'starts_on', 'due_on'];
       var update = allowed.reduce(function (acc, column) {
         return changes && Object.prototype.hasOwnProperty.call(changes, column)
           ? Object.assign({}, acc, { [column]: changes[column] })
@@ -225,6 +276,112 @@
         'archive the project');
     },
 
+    /* ── Projects: team, client people, files, budget (0039) ─────────── */
+    /* These tables have column grants, so they are written with insert, update
+       and delete only: PostgREST's upsert also updates the key, and is refused. */
+
+    async addProjectMember(projectId, employeeId) {
+      must(projectId && employeeId, 'Pick someone to add.');
+      var res = await sb().from('project_members')
+        .insert({ project_id: projectId, employee_id: employeeId }).select().single();
+      if (res.error && /row-level security/i.test(res.error.message)) {
+        throw new Error('Only the project\'s owner or an owner or admin can add people to it.');
+      }
+      return one(res, 'add them to the project');
+    },
+
+    async removeProjectMember(projectId, employeeId) {
+      return touched(await sb().from('project_members')
+        .delete().eq('project_id', projectId).eq('employee_id', employeeId).select(),
+        'take them off the project',
+        'Not removed: only the project\'s owner or an owner or admin can take someone else off a project.');
+    },
+
+    async addProjectContact(projectId, contactId, role) {
+      must(isContactRole(role), 'Pick a role for them on the project.');
+      return one(await sb().from('project_contacts')
+        .insert({ project_id: projectId, contact_id: contactId, role: role }).select().single(),
+        'add them to the project');
+    },
+
+    async setProjectContactRole(projectId, contactId, role) {
+      must(isContactRole(role), 'Pick a role for them on the project.');
+      return touched(await sb().from('project_contacts')
+        .update({ role: role }).eq('project_id', projectId).eq('contact_id', contactId).select(),
+        'change their role', 'That contact is not on the project any more.')[0];
+    },
+
+    async removeProjectContact(projectId, contactId) {
+      return touched(await sb().from('project_contacts')
+        .delete().eq('project_id', projectId).eq('contact_id', contactId).select(),
+        'take them off the project', 'That contact was not on the project any more.');
+    },
+
+    /* Stored first, then recorded. An upload whose record will not save is
+       taken away again: without its record, nobody would ever see it. */
+    async uploadProjectFile(projectId, file) {
+      var problem = projectsModel.fileProblem(file);
+      must(!problem, problem);
+      must(projectId, 'That project has no id yet.');
+      var contentType = file.type || 'application/octet-stream';
+      var path = projectId + '/' + window.crypto.randomUUID() + '/' + mailModel.storageName(file.name);
+      var stored = await sb().storage.from(PROJECT_FILES).upload(path, file, { contentType: contentType, upsert: false });
+      if (stored.error) throw new Error('Could not upload "' + file.name + '": ' + stored.error.message);
+      var res = await sb().from('project_files').insert({
+        project_id: projectId, storage_path: path, name: String(file.name),
+        size_bytes: Number(file.size), content_type: contentType
+      }).select().single();
+      if (res.error) {
+        await sb().storage.from(PROJECT_FILES).remove([path]);
+        throw new Error('Could not add "' + file.name + '" to the project: ' + res.error.message);
+      }
+      return res.data;
+    },
+
+    /* The upload goes first. A record left without its upload shows as missing
+       and can still be removed; an upload left without its record would be
+       found by nobody. */
+    async removeProjectFile(file) {
+      must(file && file.id && file.path, 'That file is not loaded any more. Reload the page.');
+      var label = '"' + (file.name || 'the file') + '"';
+      var removed = await sb().storage.from(PROJECT_FILES).remove([file.path]);
+      if (removed.error) throw new Error('Could not remove ' + label + ': ' + removed.error.message);
+      return touched(await sb().from('project_files').delete().eq('id', file.id).select(),
+        'remove ' + label,
+        'Only whoever uploaded it, the project\'s owner or an owner or admin can remove this file.');
+    },
+
+    /* A minute is long enough to start a download, and short enough that a link
+       copied out of the page soon stops working. */
+    async projectFileLink(path, name) {
+      var res = await sb().storage.from(PROJECT_FILES).createSignedUrl(path, 60, name ? { download: name } : undefined);
+      if (res.error) throw new Error('Could not open the file: ' + res.error.message);
+      must(res.data && /^https:\/\//.test(res.data.signedUrl || ''), 'Could not open the file.');
+      return res.data.signedUrl;
+    },
+
+    /* `change` is projectsModel.budgetChange(): set, change, clear or none. */
+    async setProjectBudget(projectId, change) {
+      must(window.workspaceSession.isManager && window.workspaceSession.isManager(),
+        'Only an owner or admin can set a project\'s budget.');
+      var c = change || {};
+      if (c.action === 'set') {
+        return one(await sb().from('project_budgets')
+          .insert({ project_id: projectId, amount: c.amount, currency: c.currency }).select().single(),
+          'set the budget');
+      }
+      if (c.action === 'change') {
+        return touched(await sb().from('project_budgets')
+          .update({ amount: c.amount, currency: c.currency }).eq('project_id', projectId).select(),
+          'change the budget', 'That budget was cleared meanwhile. Reload and set it again.')[0];
+      }
+      if (c.action === 'clear') {
+        touched(await sb().from('project_budgets').delete().eq('project_id', projectId).select(),
+          'clear the budget', 'That budget was already cleared.');
+      }
+      return null;
+    },
+
     /* ── CRM ─────────────────────────────────────────────────────────── */
 
     async createCompany(fields) {
@@ -233,12 +390,24 @@
          "https://www.northline.example/" must not become a second company. */
       var domain = (fields.domain || '').trim().toLowerCase()
         .replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/.*$/, '') || null;
-      return one(await sb().from('crm_companies').insert({
+      /* In the currency it was given (crmModel.companyForm), or the column's own default. */
+      return one(await sb().from('crm_companies').insert(Object.assign({
         name: fields.name.trim(), domain: domain,
         kind: fields.kind || 'prospect', stage: fields.stage || 'lead',
         value: fields.value ?? null, notes: fields.notes || null,
-        owner_id: fields.ownerId || (me() ? me().id : null)
-      }).select().single(), 'add the company');
+        /* No owner, when the form says none; the person adding it, when nothing says. */
+        owner_id: fields.ownerId !== undefined ? fields.ownerId : (me() ? me().id : null)
+      }, fields.currency ? { currency: fields.currency } : {})).select().single(), 'add the company');
+    },
+
+    /* What an edit to a company changes (crmModel.companyChanges), and only
+       that. Staff may change a company (0021), but not one a manager has
+       removed: that, or a change RLS refuses, touches no row, and the rows
+       changed are asked back to say so. */
+    async updateCompany(companyId, changes) {
+      must(changes && Object.keys(changes).length, 'Nothing to save.');
+      return touched(await sb().from('crm_companies').update(changes).eq('id', companyId).is('deleted_at', null).select(), 'save the company',
+        'The company was not saved: it has been removed from the CRM, or you may not change it.')[0];
     },
 
     async createContact(fields) {
@@ -252,9 +421,12 @@
       }).select().single(), 'add the contact');
     },
 
-    async updateContact(contactId, fields) {
-      return one(await sb().from('crm_contacts')
-        .update(fields).eq('id', contactId).select().single(), 'update the contact');
+    /* What an edit to a contact changes (crmModel.contactChanges), and only that,
+       said as a refusal when no row changed. */
+    async updateContact(contactId, changes) {
+      must(changes && Object.keys(changes).length, 'Nothing to save.');
+      return touched(await sb().from('crm_contacts').update(changes).eq('id', contactId).is('deleted_at', null).select(), 'save the contact',
+        'The contact was not saved: they have been removed from the CRM, or you may not change them.')[0];
     },
 
     /* Turn a /websites/ enquiry into a company + contact. Safe to call twice:
@@ -263,6 +435,33 @@
       var res = await sb().rpc('promote_enquiry_to_crm', { p_enquiry_id: enquiryId });
       if (res.error) throw new Error('Could not promote the enquiry: ' + res.error.message);
       return res.data;
+    },
+
+    /* ── Finance (owners and admins, 0005) ── */
+
+    /* Paid, on the day it was paid — one the page checked is not still to
+       come. RLS lets only owners and admins change an invoice; anyone else
+       changes no row, and that is said as a refusal. */
+    async markInvoicePaid(invoiceId, paidOn) {
+      must(/^\d{4}-\d{2}-\d{2}$/.test(String(paidOn || '')), 'Pick the day it was paid.');
+      /* Only one still waiting for payment: one someone has since recorded,
+         or turned back into a draft in the admin, is left as it is. */
+      return touched(await sb().from('finance_invoices').update({ status: 'paid', paid_on: paidOn })
+        .eq('id', invoiceId).in('status', ['sent', 'overdue']).select(),
+        'mark the invoice paid', 'The invoice was not changed: it has been paid, turned back into a draft or removed since, or only an owner or admin can change it.')[0];
+    },
+
+    /* Back to waiting for payment, when it was marked paid by mistake: sent —
+       finance-model.js reads it as overdue once its due date has passed — and
+       no day it was paid. Only the payment the dialog showed, by the day it
+       was paid (null for none): one recorded again since is left as it is. */
+    async reopenInvoice(invoiceId, paidOn) {
+      must(paidOn === null || /^\d{4}-\d{2}-\d{2}$/.test(String(paidOn)), 'Which payment to undo was not given.');
+      var unpaid = sb().from('finance_invoices').update({ status: 'sent', paid_on: null })
+        .eq('id', invoiceId).eq('status', 'paid');
+      unpaid = paidOn === null ? unpaid.is('paid_on', null) : unpaid.eq('paid_on', paidOn);
+      return touched(await unpaid.select(), 'mark the invoice unpaid',
+        'The invoice was not changed: its payment was changed or it is no longer marked paid, it was removed, or only an owner or admin can change it.')[0];
     },
 
     /* ── Agenda ──────────────────────────────────────────────────────── */
@@ -277,8 +476,7 @@
       var endsAt = fields.endsAt ? new Date(fields.endsAt).toISOString() : null;
 
       /* Book it in Outlook when a calendar is connected, so it shows up on the
-         phone too. 409 means nothing is connected — then a local-only event is
-         the right answer, not an error. */
+         phone too. */
       var res = await sb().functions.invoke('create-calendar-event', {
         body: {
           title: fields.title.trim(), startsAt: startsAt, endsAt: endsAt,
@@ -292,27 +490,70 @@
 
       if (!res.error) return res.data;
 
-      var status = res.error && res.error.context && res.error.context.status;
-      if (status && status !== 409 && !isMissingFunction(res.error)) {
-        throw new Error(await functionError(res, 'The event could not be booked.'));
+      /* Saved here alone only when the function says so (localOnly): no
+         calendar is connected, or the studio's needs reconnecting. Any other
+         failure saves nothing — a private event the function refused, or an
+         answer that never arrived, must not land where every member of staff
+         reads it. */
+      var answer = await functionBody(res);
+      if (answer.localOnly !== true) {
+        /* In the function's words when it gave any; otherwise one sentence
+           rather than the client library's. */
+        throw new Error(answer.error || answer.message
+          ? errorMessage(res, answer, '')
+          : 'The event could not be booked, and nothing was saved.');
       }
 
       /* Local only: connection_id and external_id stay null, which is what the
          RLS policy for a hand-made event requires and what keeps it out of the
          sync's unique index. */
-      return one(await sb().from('calendar_events').insert({
+      var local = one(await sb().from('calendar_events').insert({
         title: fields.title.trim(),
         detail: fields.detail || null, location: fields.location || null,
         starts_at: startsAt, ends_at: endsAt,
         all_day: !!fields.allDay, kind: fields.kind || 'internal',
         project_id: fields.projectId || null, company_id: fields.companyId || null,
+        contact_id: fields.contactId || null,
         created_by: me() ? me().id : null
       }).select().single(), 'add the event');
+      /* Why it is only here, when that is something to fix: the studio
+         calendar waiting to be reconnected, or client work with no studio
+         calendar to go in — which someone whose own calendar is connected
+         would otherwise be told is no calendar at all. */
+      return Object.assign({}, local, {
+        why: answer.reason === 'studio-needs-reconnect' ? (answer.error || null)
+          : answer.reason === 'no-studio' ? 'The studio calendar is not connected, so this is saved in the workspace only.'
+            : null
+      });
     },
 
+    /* Only a hand-made event, by whoever booked it or an owner or admin (0048).
+       RLS refuses anything else by removing nothing, so the rows removed are
+       asked back: none is a refusal, and is said as one. */
     async deleteEvent(eventId) {
-      var res = await sb().from('calendar_events').delete().eq('id', eventId);
-      if (res.error) throw new Error('Could not remove the event: ' + res.error.message);
+      touched(await sb().from('calendar_events').delete().eq('id', eventId).select('id'), 'remove the event',
+        'The event was not removed: it has been removed already, or only whoever booked it, or an owner or admin, can remove it — an event from a connected calendar is removed there.');
+    },
+
+    /* Changing a hand-made event, by whoever booked it or an owner or admin
+       (0048): only what an edit may change — its title, times, place and
+       details. `since` is the updated_at the change was made against, which
+       0026's trigger moves on every change: an event changed meanwhile is not
+       overwritten. RLS refuses by changing nothing, as do the connection_id and
+       updated_at filters; none changed is a refusal, and is said as one. */
+    async updateEvent(eventId, changes, since) {
+      var EDITABLE = ['title', 'detail', 'location', 'starts_at', 'ends_at'];
+      var fields = changes || {};
+      var keys = Object.keys(fields);
+      must(keys.length, 'Nothing was changed.');
+      must(keys.every(function (key) { return EDITABLE.indexOf(key) !== -1; }), 'Only an event’s title, times, place and details can be changed here.');
+      if ('title' in fields) must(String(fields.title || '').trim(), 'An event needs a title.');
+      if ('starts_at' in fields) must(!isNaN(Date.parse(fields.starts_at)), 'An event needs a start time.');
+      if (fields.starts_at && fields.ends_at) must(Date.parse(fields.ends_at) > Date.parse(fields.starts_at), 'An event cannot end before it starts.');
+      var update = sb().from('calendar_events').update(fields).eq('id', eventId).is('connection_id', null);
+      if (since) update = update.eq('updated_at', since);
+      return touched(await update.select(), 'change the event',
+        'The event was not changed: it was changed or removed since this was opened, or only whoever booked it, or an owner or admin, can change it. Close this and open the event again.')[0];
     },
 
     /* ── Notes ───────────────────────────────────────────────────────── */
@@ -329,9 +570,19 @@
       }).select().single(), 'save the note');
     },
 
+    /* Whoever wrote a note changes its words (0032); anyone else changes
+       nothing, said as a refusal. */
+    async updateNote(noteId, body) {
+      must(body && String(body).trim(), 'Write something first.');
+      return touched(await sb().from('workspace_notes').update({ body: String(body).trim() }).eq('id', noteId).select(),
+        'save the note', 'The note was not changed: only whoever wrote it can change it, or it has been removed.')[0];
+    },
+
+    /* Whoever wrote a note, or an owner or admin, removes it (0032); anyone
+       else removes nothing — which used to be taken for a removal. */
     async deleteNote(noteId) {
-      var res = await sb().from('workspace_notes').delete().eq('id', noteId);
-      if (res.error) throw new Error('Could not remove the note: ' + res.error.message);
+      touched(await sb().from('workspace_notes').delete().eq('id', noteId).select('id'), 'remove the note',
+        'The note was not removed: only whoever wrote it, or an owner or admin, can remove it — or it has been removed already.');
     },
 
     /* ── Mail ────────────────────────────────────────────────────────── */
@@ -363,7 +614,8 @@
        No employeeId is sent: microsoft-connect then keeps whose mailbox it is
        and who consented to it. Only ever a Microsoft sign-in page — the page is
        opened as it comes back, so anything else is refused rather than
-       followed. Managers only; the function says so to anyone else. */
+       followed. Owners and admins reconnect the studio's mailboxes, and anyone
+       their own; the function says so to anyone else. */
     async reconnectMailbox(address) {
       must(address && String(address).trim(), 'Say which mailbox to reconnect.');
       var res = await sb().functions.invoke('microsoft-connect', {

@@ -45,19 +45,38 @@ const USER = 'a0000000-0000-4000-8000-000000000001';
 /* answer(name, options): what functions.invoke resolves to.
    storage(bucket): the stand-in for sb().storage.from(bucket).
    purify: the stand-in for DOMPurify. */
-function workspace(answer, { storage, purify, manager = true } = {}) {
+/* rows(table, what): the rows a write awaited without single() touched — [] is
+   what a delete or update RLS quietly refused looks like.
+   fail(table, what): the error a write comes back with, or null. */
+function workspace(answer, { storage, purify, manager = true, rows, fail } = {}) {
   const invoked = [];
   const written = [];
   const record = (table, what) => (change, options) => {
     const index = written.push({ table, what, change: { ...change }, ...(options ? { options: { ...options } } : {}) }) - 1;
+    const error = fail ? fail(table, what) : null;
+    let selected = false;
     const chain = {
       /* Which rows a write is aimed at: without this, a write to the wrong row passes. */
       eq: (column, value) => {
         written[index] = { ...written[index], where: [...(written[index].where || []), [column, value]] };
         return chain;
       },
-      select: () => chain,
-      single: async () => ({ data: { id: 'new-row', ...change }, error: null })
+      /* Named too: eq(column, null) matches no row in PostgREST, is(column, null) the empty ones. */
+      is: (column, value) => {
+        written[index] = { ...written[index], where: [...(written[index].where || []), [column, { is: value }]] };
+        return chain;
+      },
+      /* Named, so a list given to eq() cannot pass for one given to in(). */
+      in: (column, values) => {
+        written[index] = { ...written[index], where: [...(written[index].where || []), [column, { in: [...values] }]] };
+        return chain;
+      },
+      /* supabase-js hands rows back only to a write that asked for them. */
+      select: () => { selected = true; return chain; },
+      single: async () => (error ? { data: null, error } : { data: { id: 'new-row', ...change }, error: null }),
+      then: (resolve, reject) => Promise.resolve(error
+        ? { data: null, error }
+        : { data: !selected ? null : rows ? rows(table, what) : [{ id: 'new-row', ...change }], error: null }).then(resolve, reject)
     };
     return chain;
   };
@@ -68,7 +87,10 @@ function workspace(answer, { storage, purify, manager = true } = {}) {
         return answer(name, options);
       }
     },
-    from: (table) => ({ update: record(table, 'update'), insert: record(table, 'insert'), upsert: record(table, 'upsert') }),
+    from: (table) => ({
+      update: record(table, 'update'), insert: record(table, 'insert'), upsert: record(table, 'upsert'),
+      delete: () => record(table, 'delete')({})
+    }),
     storage: { from: (bucket) => (storage ? storage(bucket) : {}) }
   };
   const session = {
@@ -79,7 +101,7 @@ function workspace(answer, { storage, purify, manager = true } = {}) {
     console,
     window: { workspaceSession: session, DOMPurify: purify, crypto: globalThis.crypto }
   });
-  for (const file of ['mail-model.js', 'data/actions.js']) {
+  for (const file of ['mail-model.js', 'projects-model.js', 'data/actions.js']) {
     vm.runInContext(readFileSync(new URL(`../dist/${file}`, import.meta.url), 'utf8'), context);
   }
   return { actions: context.window.workspaceActions, invoked, written };
@@ -128,6 +150,158 @@ test('a conversation the function cannot find is an error, not a quiet write to 
     'writing the thread row directly would be undone by the next sync, and never reach Outlook');
 });
 
+/* ── Events ───────────────────────────────────────────────────────────── */
+
+test('removing an event asks which rows went, and none is a refusal, said as one', async () => {
+  const removed = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: 'ev-1' }] });
+  await removed.actions.deleteEvent('ev-1');
+  assert.deepEqual(removed.written.map(w => [w.table, w.what, w.where]), [['calendar_events', 'delete', [['id', 'ev-1']]]]);
+  const refused = workspace(async () => ({ data: null, error: null }), { rows: () => [] });
+  await assert.rejects(refused.actions.deleteEvent('ev-1'), { message: /^The event was not removed: it has been removed already, or only whoever booked it, or an owner or admin, can remove it/ });
+});
+
+test('changing an event sends only its title, times, place and details, to an event made here as it was when opened; nothing changed is a refusal, said as one', async () => {
+  const STAMP = '2026-09-15T08:00:00.123456+00:00';
+  const saved = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: 'ev-1', title: 'Dentist, moved' }] });
+  const row = await saved.actions.updateEvent('ev-1', { title: 'Dentist, moved', starts_at: '2026-09-21T12:30:00.000Z', ends_at: null }, STAMP);
+  assert.equal(row.title, 'Dentist, moved');
+  assert.deepEqual(saved.written.map(w => [w.table, w.what, w.change, w.where]),
+    [['calendar_events', 'update', { title: 'Dentist, moved', starts_at: '2026-09-21T12:30:00.000Z', ends_at: null }, [['id', 'ev-1'], ['connection_id', { is: null }], ['updated_at', STAMP]]]],
+    'an event someone changed since the dialog opened has another updated_at, so it is not touched');
+  const unstamped = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: 'ev-1' }] });
+  await unstamped.actions.updateEvent('ev-1', { title: 'Dentist' });
+  assert.deepEqual(unstamped.written[0].where, [['id', 'ev-1'], ['connection_id', { is: null }]], 'with no stamp to go by, the event as it is');
+  const refused = workspace(async () => ({ data: null, error: null }), { rows: () => [] });
+  await assert.rejects(refused.actions.updateEvent('ev-1', { title: 'Dentist' }, STAMP),
+    { message: 'The event was not changed: it was changed or removed since this was opened, or only whoever booked it, or an owner or admin, can change it. Close this and open the event again.' });
+  const sneaky = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: 'ev-1' }] });
+  await assert.rejects(sneaky.actions.updateEvent('ev-1', { connection_id: null, title: 'Dentist' }), { message: 'Only an event’s title, times, place and details can be changed here.' });
+  await assert.rejects(sneaky.actions.updateEvent('ev-1', {}), { message: 'Nothing was changed.' });
+  await assert.rejects(sneaky.actions.updateEvent('ev-1', { title: '  ' }), { message: 'An event needs a title.' });
+  await assert.rejects(sneaky.actions.updateEvent('ev-1', { starts_at: 'soon' }), { message: 'An event needs a start time.' });
+  await assert.rejects(sneaky.actions.updateEvent('ev-1', { starts_at: '2026-09-21T12:30:00.000Z', ends_at: '2026-09-21T12:00:00.000Z' }),
+    { message: 'An event cannot end before it starts.' });
+  assert.equal(sneaky.written.length, 0, 'nothing is sent for a change that cannot be saved');
+});
+
+/* ── Tasks ────────────────────────────────────────────────────────────── */
+
+test('a note is changed by whoever wrote it and removed by them or an owner or admin, and a refusal is said as one', async () => {
+  const saved = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: 'n1' }] });
+  await saved.actions.updateNote('n1', '  Client wants green  ');
+  await saved.actions.deleteNote('n1');
+  assert.deepEqual(saved.written.map(w => [w.table, w.what, w.change, w.where]), [
+    ['workspace_notes', 'update', { body: 'Client wants green' }, [['id', 'n1']]],
+    ['workspace_notes', 'delete', {}, [['id', 'n1']]]
+  ], 'only the words, to that note; and the removal asks which rows went');
+  const refused = workspace(async () => ({ data: null, error: null }), { rows: () => [] });
+  await assert.rejects(refused.actions.updateNote('n1', 'Client wants green'),
+    err => /^The note was not changed: only whoever wrote it can change it, or it has been removed\.$/.test(err.message) && err.refused === true);
+  await assert.rejects(refused.actions.deleteNote('n1'),
+    err => /^The note was not removed: only whoever wrote it, or an owner or admin, can remove it — or it has been removed already\.$/.test(err.message) && err.refused === true);
+  const empty = workspace(async () => ({ data: null, error: null }));
+  await assert.rejects(empty.actions.updateNote('n1', '   '), { message: 'Write something first.' });
+  assert.equal(empty.written.length, 0);
+});
+
+test('a new task is for whoever it was given to, for nobody when that is none, and for whoever adds it when no one was given', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }));
+  await ws.actions.createTask({ title: ' Draft copy ', details: 'Two options', assigneeId: 'emp-2', dueDate: '2026-09-25', priority: 'high', projectId: 'p-1' });
+  await ws.actions.createTask({ title: 'Book the photographer', details: null, assigneeId: null, dueDate: null, priority: 'normal', projectId: 'p-1' });
+  await ws.actions.createTask({ title: 'Order prints', projectId: 'p-1' });
+  assert.deepEqual(ws.written.map(w => [w.table, w.what, w.change]), [
+    ['tasks', 'insert', { title: 'Draft copy', details: 'Two options', project_id: 'p-1', assignee_id: 'emp-2', priority: 'high', due_date: '2026-09-25', created_by: USER }],
+    ['tasks', 'insert', { title: 'Book the photographer', details: null, project_id: 'p-1', assignee_id: null, priority: 'normal', due_date: null, created_by: USER }],
+    ['tasks', 'insert', { title: 'Order prints', details: null, project_id: 'p-1', assignee_id: 'emp-1', priority: 'normal', due_date: null, created_by: USER }]
+  ]);
+  await assert.rejects(ws.actions.createTask({ title: '  ', projectId: 'p-1' }), { message: 'A task needs a title.' });
+  assert.equal(ws.written.length, 3);
+});
+
+test('saving a task writes only the columns that changed, to that task, and a refusal is said as one', async () => {
+  const saved = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: 'task-1', due_date: '2026-09-30' }] });
+  const row = await saved.actions.updateTask('task-1', { due_date: '2026-09-30' });
+  assert.equal(row.id, 'task-1');
+  assert.deepEqual(saved.written.map(w => [w.table, w.what, w.change, w.where]),
+    [['tasks', 'update', { due_date: '2026-09-30' }, [['id', 'task-1']]]]);
+  const refused = workspace(async () => ({ data: null, error: null }), { rows: () => [] });
+  await assert.rejects(refused.actions.updateTask('task-1', { status: 'done' }), { message: /The task was not saved\./ });
+  const nothing = workspace(async () => ({ data: null, error: null }));
+  await assert.rejects(nothing.actions.updateTask('task-1', {}), { message: 'Nothing to save.' });
+  assert.equal(nothing.written.length, 0);
+});
+
+test('saving a company or a contact writes only the columns given, to that row while it is in the CRM, and a refusal is said as one', async () => {
+  const saved = workspace(async () => ({ data: null, error: null }), { rows: table => [{ id: table === 'crm_companies' ? 'co-1' : 'c-1' }] });
+  assert.equal((await saved.actions.updateCompany('co-1', { stage: 'client' })).id, 'co-1');
+  assert.equal((await saved.actions.updateContact('c-1', { title: 'Producer' })).id, 'c-1');
+  assert.deepEqual(saved.written.map(w => [w.table, w.what, w.change, w.where]), [
+    ['crm_companies', 'update', { stage: 'client' }, [['id', 'co-1'], ['deleted_at', { is: null }]]],
+    ['crm_contacts', 'update', { title: 'Producer' }, [['id', 'c-1'], ['deleted_at', { is: null }]]]
+  ], 'a record a manager removed is not changed back into view');
+  const refused = workspace(async () => ({ data: null, error: null }), { rows: () => [] });
+  await assert.rejects(refused.actions.updateCompany('co-1', { stage: 'client' }), { message: /^The company was not saved/ });
+  await assert.rejects(refused.actions.updateContact('c-1', { title: 'Producer' }), { message: /^The contact was not saved/ });
+  const nothing = workspace(async () => ({ data: null, error: null }));
+  await assert.rejects(nothing.actions.updateCompany('co-1', {}), { message: 'Nothing to save.' });
+  await assert.rejects(nothing.actions.updateContact('c-1', {}), { message: 'Nothing to save.' });
+  assert.equal(nothing.written.length, 0);
+});
+
+test('a new company is added in the currency and with the owner it was given, or else the defaults', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }));
+  await ws.actions.createCompany({ name: 'Harbor', currency: 'EUR' });
+  await ws.actions.createCompany({ name: 'Lighthouse' });
+  await ws.actions.createCompany({ name: 'Northline', ownerId: null });
+  assert.equal(ws.written[0].change.currency, 'EUR');
+  assert.equal('currency' in ws.written[1].change, false, 'the column\'s own default');
+  assert.equal(ws.written[1].change.owner_id, 'emp-1', 'nothing said: whoever adds it');
+  assert.equal(ws.written[2].change.owner_id, null, '"No owner" is no owner');
+});
+
+test('an invoice marked paid or unpaid writes its status and the day it was paid to that invoice, and a refusal is said as one', async () => {
+  const saved = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: 'inv-1' }] });
+  await saved.actions.markInvoicePaid('inv-1', '2026-09-12');
+  await saved.actions.reopenInvoice('inv-1', '2026-09-12');
+  await saved.actions.reopenInvoice('inv-2', null);
+  assert.deepEqual(saved.written.map(w => [w.table, w.what, w.change, w.where]), [
+    ['finance_invoices', 'update', { status: 'paid', paid_on: '2026-09-12' }, [['id', 'inv-1'], ['status', { in: ['sent', 'overdue'] }]]],
+    ['finance_invoices', 'update', { status: 'sent', paid_on: null }, [['id', 'inv-1'], ['status', 'paid'], ['paid_on', '2026-09-12']]],
+    ['finance_invoices', 'update', { status: 'sent', paid_on: null }, [['id', 'inv-2'], ['status', 'paid'], ['paid_on', { is: null }]]]
+  ], 'only an invoice still waiting is marked paid, and only the payment its dialog showed is undone');
+  const refused = workspace(async () => ({ data: null, error: null }), { rows: () => [] });
+  await assert.rejects(refused.actions.markInvoicePaid('inv-1', '2026-09-12'),
+    err => /has been paid, turned back into a draft or removed since/.test(err.message) && err.refused === true);
+  await assert.rejects(refused.actions.reopenInvoice('inv-1', '2026-09-12'),
+    err => /its payment was changed or it is no longer marked paid/.test(err.message) && err.refused === true);
+  const failing = workspace(async () => ({ data: null, error: null }), { fail: () => ({ message: 'Failed to fetch' }) });
+  await assert.rejects(failing.actions.markInvoicePaid('inv-1', '2026-09-12'),
+    err => err.message === 'Could not mark the invoice paid: Failed to fetch' && !err.refused, 'a write that failed is no refusal');
+  const undated = workspace(async () => ({ data: null, error: null }));
+  await assert.rejects(undated.actions.markInvoicePaid('inv-1', 'yesterday'), { message: 'Pick the day it was paid.' });
+  await assert.rejects(undated.actions.reopenInvoice('inv-1'), { message: 'Which payment to undo was not given.' });
+  assert.equal(undated.written.length, 0);
+});
+
+test('ticking a task off asks which rows changed, and none is a refusal, said as one', async () => {
+  const ticked = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: 'task-1', status: 'done' }] });
+  const row = await ticked.actions.setTaskDone('task-1', true);
+  assert.equal(row.id, 'task-1');
+  assert.deepEqual(ticked.written.map(w => [w.table, w.what, w.change.status, w.where]), [['tasks', 'update', 'done', [['id', 'task-1']]]]);
+  const refused = workspace(async () => ({ data: null, error: null }), { rows: () => [] });
+  await assert.rejects(refused.actions.setTaskDone('task-1', true),
+    { message: 'The task was not changed: only its assignee, its project’s team, or an owner or admin can tick it off.' },
+    'not supabase-js\'s "no rows returned"');
+});
+
+test('removing a task asks which rows went, and none is a refusal, said as one', async () => {
+  const removed = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: 'task-1' }] });
+  await removed.actions.deleteTask('task-1');
+  assert.deepEqual(removed.written.map(w => [w.table, w.what, w.where]), [['tasks', 'delete', [['id', 'task-1']]]]);
+  const refused = workspace(async () => ({ data: null, error: null }), { rows: () => [] });
+  await assert.rejects(refused.actions.deleteTask('task-1'), { message: /only an owner or admin can remove a task/ });
+});
+
 test('a function that cannot be reached is an error too, never a direct write', async () => {
   const ws = workspace(async () => unreachable);
   await assert.rejects(ws.actions.markThreadRead(THREAD, false), { message: /Failed to send/ });
@@ -158,6 +332,101 @@ test('a ticket reply that could not be sent says so in the function\'s words', a
   assert.equal(ws.written.length, 0, 'the function saved it; the browser must not save it twice');
 });
 
+test('a reply whose answer never arrived may have gone: nothing is saved here, and it says so', async () => {
+  for (const answer of [unreachable, httpError(504)]) {
+    const ws = workspace(async () => answer);
+    await assert.rejects(ws.actions.replyToTicket(TICKET, 'Thanks, fixed.', 'reply'), (err) => {
+      assert.equal(err.unknownOutcome, true);
+      assert.match(err.message, /may have been sent/);
+      return true;
+    });
+    assert.equal(ws.written.length, 0, 'a second copy would show the reply twice');
+  }
+});
+
+test('a note whose answer never arrived is said as a note, not as a reply that may have gone', async () => {
+  const ws = workspace(async () => unreachable);
+  await assert.rejects(ws.actions.replyToTicket(TICKET, 'Checking the logs.', 'note'), (err) => {
+    assert.equal(err.unknownOutcome, true);
+    assert.match(err.message, /^The note may have been saved/);
+    return true;
+  });
+});
+
+test('a 404 in the function\'s own words is its answer, not a function that is not deployed', async () => {
+  const ws = workspace(async () => httpError(404, { error: 'No such ticket' }));
+  await assert.rejects(ws.actions.replyToTicket(TICKET, 'Thanks, fixed.', 'reply'), { message: 'No such ticket' });
+  assert.equal(ws.written.length, 0, 'nothing saved beside it as "not deployed"');
+});
+
+test('a reply function that is not deployed still keeps what was written, and says it did not go', async () => {
+  const ws = workspace(async () => httpError(404, { code: 'NOT_FOUND', message: 'Requested function was not found' }));
+  const result = await ws.actions.replyToTicket(TICKET, 'Thanks, fixed.', 'reply');
+  assert.equal(result.sent, false);
+  assert.equal(ws.written.length, 1);
+  assert.equal(ws.written[0].table, 'ticket_messages');
+});
+
+test('a ticket\'s priority, owner and status are written to that ticket, and "Unassigned" is no owner', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }));
+  await ws.actions.setTicketPriority(TICKET, 'urgent');
+  await ws.actions.assignTicket(TICKET, '');
+  await ws.actions.setTicketStatus(TICKET, 'waiting');
+  assert.deepEqual(ws.written, [
+    { table: 'support_tickets', what: 'update', change: { priority: 'urgent' }, where: [['id', TICKET]] },
+    { table: 'support_tickets', what: 'update', change: { assignee_id: null }, where: [['id', TICKET]] },
+    { table: 'support_tickets', what: 'update', change: { status: 'waiting' }, where: [['id', TICKET]] }
+  ]);
+});
+
+/* ── Booking ──────────────────────────────────────────────────────────── */
+
+const EVENT = { title: 'Physio', startsAt: '2026-09-15T08:00:00Z', endsAt: '2026-09-15T09:00:00Z' };
+
+test('an event is saved here alone only when the function says so', async () => {
+  const ws = workspace(async () => httpError(409, { error: 'No calendar is connected', localOnly: true, reason: 'none' }));
+  const saved = await ws.actions.createEvent(EVENT);
+  assert.equal(ws.written.length, 1);
+  assert.equal(ws.written[0].table, 'calendar_events');
+  assert.equal(saved.why, null, 'nothing to fix: nothing is connected');
+});
+
+test('a studio calendar waiting to be reconnected says so when the event is saved here instead', async () => {
+  const why = 'The studio calendar needs reconnecting, so this is saved in the workspace only.';
+  const ws = workspace(async () => httpError(409, { error: why, localOnly: true, reason: 'studio-needs-reconnect' }));
+  assert.equal((await ws.actions.createEvent({ ...EVENT, projectId: 'p1' })).why, why);
+});
+
+test('client work with no studio calendar to go in says so, not that no calendar is connected', async () => {
+  const ws = workspace(async () => httpError(409, { error: 'No calendar is connected', localOnly: true, reason: 'no-studio' }));
+  assert.equal((await ws.actions.createEvent({ ...EVENT, projectId: 'p1' })).why, 'The studio calendar is not connected, so this is saved in the workspace only.');
+});
+
+test('a refused private event, a 409 that is not localOnly, or no answer at all saves nothing', async () => {
+  const answers = [
+    httpError(503, { error: 'Your calendar needs reconnecting before events can be booked into it.', reason: 'own-needs-reconnect' }),
+    httpError(409, { error: 'That calendar is not connected. Reconnect it first.' }),
+    httpError(404, { code: 'NOT_FOUND', message: 'Requested function was not found' }),
+    unreachable
+  ];
+  for (const answer of answers) {
+    const ws = workspace(async () => answer);
+    await assert.rejects(ws.actions.createEvent(EVENT));
+    assert.equal(ws.written.length, 0, `nothing written for ${answer.error.name} ${answer.error.context.status || ''}`);
+  }
+  const refused = workspace(async () => answers[0]);
+  await assert.rejects(refused.actions.createEvent(EVENT), { message: 'Your calendar needs reconnecting before events can be booked into it.' });
+  const lost = workspace(async () => unreachable);
+  await assert.rejects(lost.actions.createEvent(EVENT), { message: 'The event could not be booked, and nothing was saved.' },
+    'one sentence, not the client library\'s');
+});
+
+test('a priority the database does not know is refused before anything is written', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }));
+  await assert.rejects(ws.actions.setTicketPriority(TICKET, 'Medium'), /priority/);
+  assert.equal(ws.written.length, 0);
+});
+
 /* ── Reconnecting a mailbox ───────────────────────────────────────────── */
 
 const CONSENT = 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=x&state=y';
@@ -181,8 +450,9 @@ test('a sign-in page that is not Microsoft\'s is never opened', async () => {
 });
 
 test('reconnecting says why it was refused, in the function\'s words', async () => {
-  const ws = workspace(async () => httpError(403, { error: 'Managers only' }));
-  await assert.rejects(ws.actions.reconnectMailbox('hello@veyago.cloud'), { message: 'Managers only' });
+  const refusal = 'Only an owner or admin can reconnect a studio mailbox or calendar.';
+  const ws = workspace(async () => httpError(403, { error: refusal }));
+  await assert.rejects(ws.actions.reconnectMailbox('hello@veyago.cloud'), { message: refusal });
 });
 
 test('reconnecting needs a mailbox to reconnect', async () => {
@@ -225,6 +495,128 @@ test('archiving a project is for owners and admins, and keeps the project', asyn
   const staff = workspace(async () => ({}), { manager: false });
   await assert.rejects(staff.actions.archiveProject('p1'), /owner or admin/);
   assert.equal(staff.written.length, 0);
+});
+
+test('a project\'s start date is one of the columns an edit may change', async () => {
+  const ws = workspace(async () => ({}));
+  await ws.actions.updateProject('p1', { starts_on: '2026-09-15' });
+  assert.deepEqual(ws.written[0].change, { starts_on: '2026-09-15' });
+});
+
+/* ── A project's team, client people, files and budget (0039) ────────── */
+
+test('adding someone to a project and taking them off touch that membership only', async () => {
+  const ws = workspace(async () => ({}));
+  await ws.actions.addProjectMember('p1', 'e2');
+  await ws.actions.removeProjectMember('p1', 'e2');
+  assert.deepEqual(ws.written, [
+    { table: 'project_members', what: 'insert', change: { project_id: 'p1', employee_id: 'e2' } },
+    { table: 'project_members', what: 'delete', change: {}, where: [['project_id', 'p1'], ['employee_id', 'e2']] }
+  ]);
+});
+
+test('a removal the database quietly refused says so, instead of looking done', async () => {
+  const ws = workspace(async () => ({}), { rows: () => [] });
+  await assert.rejects(ws.actions.removeProjectMember('p1', 'e2'), /owner/);
+  await assert.rejects(ws.actions.removeProjectContact('p1', 'k1'), /not on the project/);
+});
+
+test('a refused addition to the team says who may add people', async () => {
+  const ws = workspace(async () => ({}), {
+    fail: table => (table === 'project_members' ? { message: 'new row violates row-level security policy for table "project_members"' } : null)
+  });
+  await assert.rejects(ws.actions.addProjectMember('p1', 'e2'), /owner or an owner or admin/);
+});
+
+test('a client person joins with a role, and only the role changes afterwards — never upserted', async () => {
+  const ws = workspace(async () => ({}));
+  await ws.actions.addProjectContact('p1', 'k1', 'billing');
+  await ws.actions.setProjectContactRole('p1', 'k1', 'decision_maker');
+  await ws.actions.removeProjectContact('p1', 'k1');
+  assert.deepEqual(ws.written, [
+    { table: 'project_contacts', what: 'insert', change: { project_id: 'p1', contact_id: 'k1', role: 'billing' } },
+    { table: 'project_contacts', what: 'update', change: { role: 'decision_maker' }, where: [['project_id', 'p1'], ['contact_id', 'k1']] },
+    { table: 'project_contacts', what: 'delete', change: {}, where: [['project_id', 'p1'], ['contact_id', 'k1']] }
+  ], 'the column grants refuse an upsert, which also updates the key');
+  await assert.rejects(ws.actions.addProjectContact('p1', 'k1', 'boss'), /role/);
+  await assert.rejects(ws.actions.setProjectContactRole('p1', 'k1', ''), /role/);
+  assert.equal(ws.written.length, 3, 'a role the database does not know is refused before it is sent');
+});
+
+test('a project file is stored in its project\'s folder, then recorded', async () => {
+  const stub = storageStub();
+  const ws = workspace(async () => ({}), { storage: stub.storage });
+  const record = await ws.actions.uploadProjectFile('p1', { name: 'Brief (v2).pdf', size: 2048, type: 'application/pdf' });
+  assert.equal(stub.calls.length, 1);
+  assert.equal(stub.calls[0].bucket, 'project-files');
+  assert.match(stub.calls[0].path, /^p1\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/Brief-v2\.pdf$/);
+  assert.equal(stub.calls[0].options.upsert, false);
+  assert.deepEqual(ws.written, [{
+    table: 'project_files', what: 'insert',
+    change: { project_id: 'p1', storage_path: stub.calls[0].path, name: 'Brief (v2).pdf', size_bytes: 2048, content_type: 'application/pdf' }
+  }]);
+  assert.equal(record.id, 'new-row');
+});
+
+test('an upload that could not be recorded is taken away again', async () => {
+  const stub = storageStub();
+  const ws = workspace(async () => ({}), {
+    storage: stub.storage,
+    fail: table => (table === 'project_files' ? { message: 'new row violates row-level security policy' } : null)
+  });
+  await assert.rejects(ws.actions.uploadProjectFile('p1', { name: 'a.pdf', size: 5, type: 'application/pdf' }), /a\.pdf/);
+  assert.deepEqual(stub.calls.map(c => c.what), ['upload', 'remove']);
+  assert.deepEqual(stub.calls[1].paths, [stub.calls[0].path], 'nobody would ever see an upload without its record');
+});
+
+test('a file too large for the bucket is refused before it is uploaded', async () => {
+  const stub = storageStub();
+  const ws = workspace(async () => ({}), { storage: stub.storage });
+  await assert.rejects(ws.actions.uploadProjectFile('p1', { name: 'film.mov', size: 52428801, type: 'video/quicktime' }), /50 MB/);
+  await assert.rejects(ws.actions.uploadProjectFile('p1', { name: 'empty.txt', size: 0, type: 'text/plain' }), /empty/);
+  assert.equal(stub.calls.length, 0);
+  assert.equal(ws.written.length, 0);
+});
+
+test('removing a file removes the upload first, then its record', async () => {
+  const stub = storageStub();
+  const ws = workspace(async () => ({}), { storage: stub.storage });
+  await ws.actions.removeProjectFile({ id: 'f1', name: 'brief.pdf', path: 'p1/u1/brief.pdf' });
+  assert.deepEqual(stub.calls, [{ bucket: 'project-files', what: 'remove', paths: ['p1/u1/brief.pdf'] }]);
+  assert.deepEqual(ws.written, [{ table: 'project_files', what: 'delete', change: {}, where: [['id', 'f1']] }]);
+});
+
+test('a file someone may not remove stays, and they are told whose it is to remove', async () => {
+  const stub = storageStub();
+  const ws = workspace(async () => ({}), { storage: stub.storage, rows: () => [] });
+  await assert.rejects(ws.actions.removeProjectFile({ id: 'f1', name: 'brief.pdf', path: 'p1/u1/brief.pdf' }), /uploaded it/);
+});
+
+test('a file opens through a link that expires in a minute', async () => {
+  const stub = storageStub();
+  const ws = workspace(async () => ({}), { storage: stub.storage });
+  const url = await ws.actions.projectFileLink('p1/u1/brief.pdf');
+  assert.match(url, /^https:\/\//);
+  assert.deepEqual(stub.calls, [{ bucket: 'project-files', what: 'sign', path: 'p1/u1/brief.pdf', seconds: 60 }]);
+});
+
+test('a budget is set with insert, changed with update and cleared with delete — never upserted', async () => {
+  const ws = workspace(async () => ({}));
+  await ws.actions.setProjectBudget('p1', { action: 'set', amount: 12500, currency: 'EUR' });
+  await ws.actions.setProjectBudget('p1', { action: 'change', amount: 13000, currency: 'EUR' });
+  await ws.actions.setProjectBudget('p1', { action: 'clear' });
+  assert.equal(await ws.actions.setProjectBudget('p1', { action: 'none' }), null);
+  assert.deepEqual(ws.written, [
+    { table: 'project_budgets', what: 'insert', change: { project_id: 'p1', amount: 12500, currency: 'EUR' } },
+    { table: 'project_budgets', what: 'update', change: { amount: 13000, currency: 'EUR' }, where: [['project_id', 'p1']] },
+    { table: 'project_budgets', what: 'delete', change: {}, where: [['project_id', 'p1']] }
+  ]);
+});
+
+test('a budget is for owners and admins only', async () => {
+  const ws = workspace(async () => ({}), { manager: false });
+  await assert.rejects(ws.actions.setProjectBudget('p1', { action: 'set', amount: 1, currency: 'EUR' }), /owner or admin/);
+  assert.equal(ws.written.length, 0);
 });
 
 /* ── Sending ──────────────────────────────────────────────────────────── */
@@ -305,6 +697,10 @@ function storageStub(error = null) {
       remove: async (paths) => {
         calls.push({ bucket, what: 'remove', paths: [...paths] });
         return { data: [], error };
+      },
+      createSignedUrl: async (path, seconds) => {
+        calls.push({ bucket, what: 'sign', path, seconds });
+        return { data: error ? null : { signedUrl: `https://storage.example/sign/${path}` }, error };
       }
     })
   };

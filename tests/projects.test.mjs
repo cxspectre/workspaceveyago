@@ -34,6 +34,16 @@ const task = (id, projectId, over = {}) => ({
 
 /* ── Identity ────────────────────────────────────────────────────────── */
 
+test('a project\'s tasks say who each is for and when it is due, for "my focus"', () => {
+  const shaped = model.shapeProject(row(), [
+    task('t1', P1, { row: { project_id: P1, due_date: '2026-09-20', assignee_id: OWNER } }),
+    task('t2', P1, { row: { project_id: P1, due_date: null } })
+  ]);
+  assert.deepEqual([...shaped.taskDueOn], ['2026-09-20', null]);
+  assert.deepEqual([...shaped.taskAssignees], [OWNER, null]);
+  assert.deepEqual([...shaped.taskList.map(t => t.id)], ['t1', 't2'], 'and the tasks themselves, for the task list');
+});
+
 test('a project is known by its id, wherever it sits in the list', () => {
   const second = row({ id: P2, name: 'Studio app', row: { id: P2, company_id: null, owner_id: null } });
   const inOrder = [row(), second].map(p => model.shapeProject(p, []));
@@ -216,7 +226,7 @@ test('a name that is already too long does not block other edits', () => {
 
 test('the edit form sends the fields projectChanges reads', () => {
   const ui = readFileSync(new URL('../dist/projects-ui.js', import.meta.url), 'utf8');
-  for (const field of ['name', 'companyId', 'ownerId', 'dueOn', 'description']) {
+  for (const field of ['name', 'companyId', 'ownerId', 'startsOn', 'dueOn', 'description']) {
     assert.match(ui, new RegExp(`name="${field}"`), `renaming the ${field} field would quietly save nothing`);
   }
 });
@@ -296,4 +306,159 @@ test('a typed client is an existing company whatever its case or spacing, contac
   assert.equal(model.findCompany(companies, 'Northline'), null, 'a different name is a different company');
   assert.equal(model.findCompany(companies, ''), null);
   assert.equal(model.findCompany(null, 'Northline Studio'), null);
+});
+
+/* ── Dates ───────────────────────────────────────────────────────────── */
+
+test('a project\'s start date is saved like its due date, and cannot come after it', () => {
+  const p = model.shapeProject(row(), []);
+  assert.deepEqual({ ...model.projectChanges(p, { startsOn: '2026-09-15' }).changes }, { starts_on: '2026-09-15' });
+  assert.match(model.projectChanges(p, { startsOn: '2026-10-05' }).problem, /after the due date/);
+  assert.match(model.projectChanges(p, { startsOn: '2026-09-15', dueOn: '2026-09-01' }).problem, /after the due date/);
+  assert.equal(model.projectChanges(p, { startsOn: '2026-10-05', dueOn: '' }).problem, null, 'with no due date there is nothing to be after');
+  assert.match(model.projectChanges(p, { startsOn: 'soon' }).problem, /start date/);
+
+  const started = model.shapeProject(row({ row: { id: P1, starts_on: '2026-09-01', completed_at: '2026-09-30T10:00:00Z' } }), []);
+  assert.equal(started.startsOn, '2026-09-01');
+  assert.equal(started.starts, 'Sep 1');
+  assert.equal(started.completedAt, '2026-09-30T10:00:00Z');
+  assert.equal(model.shapeProject(row(), []).startsOn, null);
+});
+
+/* ── The team (0039) ─────────────────────────────────────────────────── */
+
+const people = [
+  { id: OWNER, name: 'Cassian Drefke', initial: 'CD' },
+  { id: 'e-jamie', name: 'Jamie Doe', initial: 'JD' },
+  { id: 'e-alex', name: 'Alex Roe', initial: 'AR' }
+];
+const member = (projectId, employeeId) => ({ project_id: projectId, employee_id: employeeId });
+
+test('a project\'s team is its owner, then its members, each once', () => {
+  const p = model.shapeProject(row(), []);
+  const members = [member(P1, 'e-jamie'), member(P2, 'e-alex'), member(P1, OWNER), member(P1, 'e-gone')];
+  assert.deepEqual([...model.projectTeam(p, members, people)].map(m => [m.employeeId, m.name, m.owner]), [
+    [OWNER, 'Cassian Drefke', true],
+    ['e-jamie', 'Jamie Doe', false],
+    ['e-gone', 'Former team member', false]
+  ]);
+  const ownerless = model.shapeProject(row({ row: { id: P1, owner_id: null } }), []);
+  assert.deepEqual([...model.projectTeam(ownerless, [member(P1, 'e-jamie')], people)].map(m => m.employeeId), ['e-jamie']);
+  assert.deepEqual([...model.projectTeam(p, null, null)].map(m => [m.employeeId, m.name]), [[OWNER, 'Former team member']]);
+});
+
+test('who runs a project\'s team, and who opens its files, as the database decides', () => {
+  const p = model.shapeProject(row(), []);
+  const members = [member(P1, 'e-jamie')];
+  assert.equal(model.canManageProject(p, OWNER, false), true, 'its owner');
+  assert.equal(model.canManageProject(p, 'e-jamie', true), true, 'an owner or admin');
+  assert.equal(model.canManageProject(p, 'e-jamie', false), false, 'a member does not run the team');
+  assert.equal(model.canManageProject(p, null, false), false);
+  assert.equal(model.canOpenFiles(p, members, 'e-jamie', false), true, 'a member opens the files');
+  assert.equal(model.canOpenFiles(p, members, 'e-alex', false), false, 'someone else on staff does not');
+  assert.equal(model.canOpenFiles(p, [member(P2, 'e-alex')], 'e-alex', false), false, 'nor a member of another project');
+  assert.equal(model.canOpenFiles(p, null, OWNER, false), true);
+});
+
+test('the people who can join a project are the team members not on it yet', () => {
+  const p = model.shapeProject(row(), []);
+  assert.deepEqual([...model.teamCandidates(p, [member(P1, 'e-jamie')], people)].map(option => [...option]),
+    [['e-alex', 'Alex Roe']], 'not its owner, not a member already');
+});
+
+/* ── The client's people (0039) ──────────────────────────────────────── */
+
+const contact = (id, name, companyId) =>
+  ({ id, name, email: `${id}@client.example`, row: { id, company: companyId ? { id: companyId, name: 'Co' } : null } });
+const link = (projectId, contactId, role) => ({ project_id: projectId, contact_id: contactId, role });
+
+test('a project\'s client people come with their role, decision makers first', () => {
+  const p = model.shapeProject(row(), []);
+  const contacts = [contact('k1', 'Ana Billing', COMPANY), contact('k2', 'Ben Boss', COMPANY), contact('k3', 'Cy Elsewhere', 'c-other')];
+  const links = [link(P1, 'k1', 'billing'), link(P1, 'k2', 'decision_maker'), link(P2, 'k3', 'other'), link(P1, 'k-gone', 'technical')];
+  assert.deepEqual([...model.projectPeople(p, links, contacts)].map(x => [x.contactId, x.name, x.roleLabel]), [
+    ['k2', 'Ben Boss', 'Decision maker'],
+    ['k1', 'Ana Billing', 'Billing'],
+    ['k-gone', 'A contact no longer in the CRM', 'Technical']
+  ], 'a contact gone from the CRM stays listed, so the link can still be removed');
+});
+
+test('only the project company\'s people who are not on it yet can be added', () => {
+  const p = model.shapeProject(row(), []);
+  const contacts = [contact('k1', 'Ana Billing', COMPANY), contact('k2', 'Ben Boss', COMPANY),
+                    contact('k3', 'Cy Elsewhere', 'c-other'), contact('k4', 'No Company', null)];
+  assert.deepEqual([...model.peopleCandidates(p, [link(P1, 'k1', 'billing')], contacts)].map(option => [...option]), [['k2', 'Ben Boss']]);
+  const internal = model.shapeProject(row({ row: { id: P1, company_id: null } }), []);
+  assert.deepEqual([...model.peopleCandidates(internal, [], contacts)], [], 'an internal project has no client people');
+  assert.equal(model.roleLabel('day_to_day'), 'Day to day');
+  assert.equal(model.roleLabel('nonsense'), 'Other');
+  assert.deepEqual([...model.CONTACT_ROLES].map(r => r.value), ['decision_maker', 'billing', 'day_to_day', 'technical', 'other'],
+    'the roles 0039 allows, in the order a list shows them');
+});
+
+/* ── Files (0039) ────────────────────────────────────────────────────── */
+
+const fileRow = (id, projectId, name, size, createdAt) => ({
+  id, project_id: projectId, storage_path: `${projectId}/${id}/${name}`, name, size_bytes: size,
+  content_type: 'application/pdf', uploaded_by: OWNER, created_at: createdAt
+});
+
+test('a project\'s files are its own, newest first, with a size a person can read', () => {
+  const p = model.shapeProject(row(), []);
+  const rows = [fileRow('f1', P1, 'brief.pdf', 2048, '2026-09-10T09:00:00Z'), fileRow('f2', P2, 'other.pdf', 10, '2026-09-12T09:00:00Z'),
+                fileRow('f3', P1, 'logo.png', 1572864, '2026-09-13T09:00:00Z')];
+  assert.deepEqual([...model.projectFiles(p, rows)].map(f => [f.id, f.name, f.size, f.path, f.uploadedBy]), [
+    ['f3', 'logo.png', '1.5 MB', `${P1}/f3/logo.png`, OWNER],
+    ['f1', 'brief.pdf', '2 KB', `${P1}/f1/brief.pdf`, OWNER]
+  ]);
+  assert.equal(model.fileSize(512), '512 B');
+  assert.equal(model.fileSize(52428800), '50 MB');
+  assert.deepEqual([...model.projectFiles(null, rows)], []);
+});
+
+test('a file that cannot be stored says why before anything is uploaded', () => {
+  assert.equal(model.fileProblem({ name: 'brief.pdf', size: 2048 }), null);
+  assert.match(model.fileProblem({ name: 'empty.txt', size: 0 }), /empty/);
+  assert.match(model.fileProblem({ name: 'film.mov', size: 52428801 }), /50 MB/, 'the bucket\'s limit (0039)');
+  assert.match(model.fileProblem(null), /file/i);
+});
+
+/* ── Budget (0039) ───────────────────────────────────────────────────── */
+
+test('a typed budget is read the way people write amounts', () => {
+  const read = text => model.budgetChange(null, { amount: text, currency: 'EUR' });
+  assert.equal(read('12500').amount, 12500);
+  assert.equal(read('12,500').amount, 12500);
+  assert.equal(read('12.500,50').amount, 12500.5);
+  assert.equal(read('12 500.5').amount, 12500.5);
+  assert.equal(read('1,5').amount, 1.5);
+  assert.match(read('-10').problem, /amount/);
+  assert.match(read('lots').problem, /amount/);
+  assert.match(read('99999999999').problem, /large/, 'numeric(12,2) holds up to 9,999,999,999.99');
+  assert.equal(read("1'234'567.5").amount, 1234567.5);
+  assert.equal(read('12,50').amount, 12.5);
+  assert.equal(read('1.234').amount, 1234, 'three digits after a point group thousands');
+});
+
+test('a mistyped budget is refused, not read as a different number', () => {
+  const read = text => model.budgetChange(null, { amount: text, currency: 'EUR' });
+  for (const typo of ['1,2345', '1.5.5', '12.500.50', '1,234.567', '12,500.', '1 2345', ',5', '12500.505']) {
+    assert.match(String(read(typo).problem), /amount/, `"${typo}" is refused`);
+    assert.equal(read(typo).amount, null, `"${typo}" writes nothing`);
+  }
+});
+
+test('a budget form says whether it sets, changes, clears or leaves the budget', () => {
+  const current = { amount: 12500, currency: 'EUR' };
+  assert.equal(model.budgetChange(null, { amount: '12500', currency: 'EUR' }).action, 'set');
+  assert.equal(model.budgetChange(current, { amount: '12,500', currency: 'eur' }).action, 'none');
+  assert.equal(model.budgetChange(current, { amount: '13000', currency: 'EUR' }).action, 'change');
+  assert.equal(model.budgetChange(current, { amount: '12500', currency: 'USD' }).action, 'change');
+  assert.equal(model.budgetChange(current, { amount: '', currency: 'EUR' }).action, 'clear');
+  assert.equal(model.budgetChange(null, { amount: ' ', currency: 'EUR' }).action, 'none');
+  assert.match(model.budgetChange(null, { amount: '10', currency: 'euro' }).problem, /currency/);
+
+  const rows = [{ project_id: P1, amount: '12500.00', currency: 'EUR' }, { project_id: P2, amount: 5, currency: 'USD' }];
+  assert.deepEqual({ ...model.budgetOf(model.shapeProject(row(), []), rows) }, { amount: 12500, currency: 'EUR' });
+  assert.equal(model.budgetOf(model.shapeProject(row({ id: 'p-none', row: { id: 'p-none' } }), []), rows), null);
 });
