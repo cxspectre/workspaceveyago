@@ -48,7 +48,7 @@
     failed: [], notice: null,
     overview: null, revenue: [], revenueMix: [], companies: [], projectEvents: [],
     projectMembers: [], projectContacts: [], projectFiles: [], projectBudgets: [],
-    mailboxes: [], mailTruncated: []
+    mailboxes: [], mailTruncated: [], calendars: []
   };
 
   /* When each part last arrived, and what it looked like then. */
@@ -74,7 +74,20 @@
     var shown = shownWeek || agendaModel.startWeek(now);
     return shown.key === today.key ? [today] : [today, shown];
   }
-  var windowKey = function () { return weeksToLoad().map(function (week) { return week.key; }).join('|'); };
+  /* The month view (agenda-ui.js showMonth): a grid of whole weeks, wider than
+     the one or two weeksToLoad() already covers, asked for as one range
+     rather than one request per row. Set only while the agenda shows it —
+     showMonth(null) clears it, so a view nobody is looking at stops asking
+     for a month's worth of events every two minutes. { key, since, to } —
+     `key` names the month ("2026-10") for monthLoaded(); `since`/`to` are
+     what eventsOverlapping() takes, the same shape agendaModel.loadRange()
+     gives a week. */
+  var shownMonth = null;
+  var loadedMonth = null;
+  var windowKey = function () {
+    var key = weeksToLoad().map(function (week) { return week.key; }).join('|');
+    return shownMonth ? key + '+' + shownMonth.key : key;
+  };
 
   /* Events from more than one week, each once — one over a weekend is in both —
      in the order they start. */
@@ -94,6 +107,11 @@
   function markWeeks(loaded) {
     loadedWeeks = {};
     loaded.weeks.forEach(function (key) { loadedWeeks[key] = true; });
+    /* Cleared, not left as it was, when this load did not ask for a month
+       (loaded.month undefined on an answer kept from before weekFailed's
+       `keep`, or null once nobody asked for one): a month shown again after
+       being left is loaded again rather than trusted stale. */
+    loadedMonth = loaded.month || null;
   }
 
   /* options.sign: what counts as a change, when not the whole answer.
@@ -126,15 +144,20 @@
       function (rows) { swap(team, rows); }),
     /* The weeks travel with the rows, so a week that moved counts as a change.
        Before queries.js can ask for the events overlapping a week, the events
-       starting in it. */
+       starting in it. The month view's range (showMonth) rides along the same
+       request, one more eventsOverlapping call rather than a load of its own —
+       every event a month, a week or a day view could show is one array. */
     part('events', 'the agenda',
       function (d) {
         var weeks = weeksToLoad();
-        return Promise.all(weeks.map(function (week) {
+        var month = shownMonth;
+        var asks = weeks.map(function (week) {
           var range = agendaModel.loadRange(week);
           return typeof d.eventsOverlapping === 'function' ? d.eventsOverlapping(range) : d.events(range.from, range.to);
-        })).then(function (lists) {
-          return { weeks: weeks.map(function (week) { return week.key; }), rows: mergeEvents(lists) };
+        });
+        if (month) asks.push(d.eventsOverlapping({ since: month.since, to: month.to }));
+        return Promise.all(asks).then(function (lists) {
+          return { weeks: weeks.map(function (week) { return week.key; }), month: month ? month.key : null, rows: mergeEvents(lists) };
         });
       },
       function (loaded) {
@@ -194,7 +217,14 @@
       function (rows) { state.projectBudgets = rows; }),
     part('notes', 'notes',
       function (d) { return d.notes(); },
-      function (rows) { lastNotes = rows; })
+      function (rows) { lastNotes = rows; }),
+    /* The studio's calendar connections and this person's own (0057): which
+       calendar a synced event came from (agenda-ui.js), and a connections
+       panel to reconnect one or ask it to sync now. Not CORE: an agenda with
+       no calendars connected is exactly what a studio with none looks like. */
+    part('calendars', 'connected calendars',
+      function (d) { return d.calendars(); },
+      function (rows) { state.calendars = rows; })
   ];
 
   /* A load asked for while one is running is queued, not dropped: the running
@@ -820,6 +850,20 @@
     /* Whether a week's events are in: until then the agenda says it is loading. */
     weekLoaded: function (key) { return Boolean(loadedWeeks[key]); },
 
+    /* The month the agenda shows (agenda-ui.js, month mode): { key, since, to }
+       — since/to as eventsOverlapping() takes a week's. null clears it, so
+       leaving month view stops asking for a whole month's events every two
+       minutes. One not loaded yet is fetched in the background, as showWeek
+       fetches a week; one already loaded is not asked for again. */
+    showMonth: function (month) {
+      shownMonth = (month && month.key) ? month : null;
+      return shownMonth && state.loaded && loadedMonth !== shownMonth.key
+        ? load({ quiet: true, only: ['events'] })
+        : Promise.resolve();
+    },
+    /* Whether a month's events are in: until then the month view says it is loading. */
+    monthLoaded: function (key) { return Boolean(key) && loadedMonth === key; },
+
     /* A company's or a person's past meetings (crm-ui.js), as { state:
        'loading' | 'ready' | 'failed', meetings, more }. The first ask for a
        page, once the workspace has loaded, starts the load; the page is drawn
@@ -866,20 +910,30 @@
     /* Views call this after a write so the screen and the database agree. A
        refusal is said in a toast — unless the view says it itself, where it
        happened, and asks for none with { toast: false }: a dialog's error
-       line (dialog-forms.js), which a screen reader would otherwise hear twice. */
+       line (dialog-forms.js), which a screen reader would otherwise hear
+       twice. `only`: the parts this write can have changed — an event save
+       needs only ['events'] (and ['events','projectEvents'] for one on a
+       project), not the other sixteen parts a note or a task save still
+       reloads whole. Left out, every part reloads exactly as it always has:
+       `only` is something a caller opts INTO, never assumed. A write that
+       FAILS always reloads everything regardless — a refusal can still land
+       after an earlier step of a multi-step write went through (the comment
+       below), and `only` naming what the caller expected to change is not
+       proof nothing else did. */
     async after(promise, options) {
+      var opts = options || {};
       try {
         var out = await promise;
         pastMeetingsBy = {};
         eventsAskedFor = {};
         inviteesAskedFor = {};
-        await load();
+        await load(opts.only ? { only: opts.only } : undefined);
         return out;
       } catch (err) {
         pastMeetingsBy = {};
         eventsAskedFor = {};
         inviteesAskedFor = {};
-        if (typeof toast === 'function' && !(options && options.toast === false)) toast(err.message);
+        if (typeof toast === 'function' && !(opts.toast === false)) toast(err.message);
         /* A write that failed may still have changed something — a row saved
            before a later step was refused — so the page is brought back to
            what the database has, and a second try starts from the truth. */

@@ -184,6 +184,93 @@ test('changing an event sends only its title, times, place and details, to an ev
   assert.equal(sneaky.written.length, 0, 'nothing is sent for a change that cannot be saved');
 });
 
+test('a synced event\'s change goes through update-calendar-event, not straight to the table (0057)', async () => {
+  const STAMP = '2026-09-15T08:00:00.123456+00:00';
+  const ws = workspace(async () => ({ data: { ok: true, id: 'ev-1' }, error: null }));
+  const result = await ws.actions.updateEvent('ev-1', { title: 'Kickoff, moved' }, STAMP, 'conn-1');
+  assert.deepEqual(result, { ok: true, id: 'ev-1' });
+  assert.deepEqual(ws.invoked, [{
+    name: 'update-calendar-event',
+    body: { eventId: 'ev-1', changes: { title: 'Kickoff, moved' }, since: STAMP }
+  }]);
+  assert.equal(ws.written.length, 0, 'the table is changed by the function, with the service role, not from here');
+});
+
+test('a synced event still checks its own field allowlist before asking Outlook to change anything', async () => {
+  const ws = workspace(async () => ({ data: { ok: true }, error: null }));
+  await assert.rejects(ws.actions.updateEvent('ev-1', { kind: 'client' }, null, 'conn-1'),
+    { message: 'Only an event’s title, times, place and details can be changed here.' });
+  assert.equal(ws.invoked.length, 0, 'refused here, so Outlook is never asked');
+});
+
+test('a synced event\'s refusal is said in update-calendar-event\'s own words', async () => {
+  const ws = workspace(async () => httpError(409, { error: 'This is part of a recurring series, which cannot be changed from the workspace yet.' }));
+  await assert.rejects(ws.actions.updateEvent('ev-1', { title: 'Kickoff' }, null, 'conn-1'),
+    { message: 'This is part of a recurring series, which cannot be changed from the workspace yet.' });
+});
+
+test('a synced event is removed through delete-calendar-event, not a table delete', async () => {
+  const ws = workspace(async () => ({ data: { ok: true }, error: null }));
+  await ws.actions.deleteEvent('ev-1', 'conn-1');
+  assert.deepEqual(ws.invoked, [{ name: 'delete-calendar-event', body: { eventId: 'ev-1' } }]);
+  assert.equal(ws.written.length, 0);
+});
+
+test('a synced event\'s removal refusal is said in the function\'s own words', async () => {
+  const ws = workspace(async () => httpError(409, { error: 'This event is marked private, so it cannot be changed from the studio calendar.' }));
+  await assert.rejects(ws.actions.deleteEvent('ev-1', 'conn-1'),
+    { message: 'This event is marked private, so it cannot be changed from the studio calendar.' });
+});
+
+test('with no connection id, both still go straight to the table exactly as before', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: 'ev-1' }] });
+  await ws.actions.updateEvent('ev-1', { title: 'Dentist' }, null, null);
+  await ws.actions.deleteEvent('ev-1', undefined);
+  assert.deepEqual(ws.written.map(w => [w.table, w.what]), [['calendar_events', 'update'], ['calendar_events', 'delete']]);
+  assert.equal(ws.invoked.length, 0);
+});
+
+/* ── Connecting and syncing a calendar (0057) ────────────────────────────── */
+
+test('connecting a calendar asks microsoft-connect for that provider, and hands back Microsoft\'s page', async () => {
+  const ws = workspace(async () => ({ data: { connectionId: 'c1', consentUrl: CONSENT }, error: null }));
+  const url = await ws.actions.connectCalendar('hello@veyago.cloud');
+  assert.equal(url, CONSENT);
+  assert.deepEqual(ws.invoked, [{
+    name: 'microsoft-connect',
+    body: { provider: 'microsoft_calendar', accountLabel: 'hello@veyago.cloud' }
+  }], 'no employeeId: a reconnect keeps whose calendar it is');
+});
+
+test('connecting a brand new studio calendar says whose it is, explicitly', async () => {
+  const ws = workspace(async () => ({ data: { connectionId: 'c1', consentUrl: CONSENT }, error: null }));
+  await ws.actions.connectCalendar('hello@veyago.cloud', null);
+  assert.deepEqual(ws.invoked[0].body, { provider: 'microsoft_calendar', accountLabel: 'hello@veyago.cloud', employeeId: null });
+});
+
+test('connecting a calendar refuses a page that is not Microsoft\'s, and needs an address', async () => {
+  const bad = workspace(async () => ({ data: { consentUrl: 'javascript:alert(1)' }, error: null }));
+  await assert.rejects(bad.actions.connectCalendar('hello@veyago.cloud'), /Microsoft/);
+  const empty = workspace(async () => ({ data: { consentUrl: CONSENT }, error: null }));
+  await assert.rejects(empty.actions.connectCalendar(''), /calendar/i);
+  assert.equal(empty.invoked.length, 0);
+});
+
+test('syncing a calendar asks sync-outlook-calendar for that connection', async () => {
+  const ws = workspace(async () => ({ data: { ok: true, events: 4, skipped: 0 }, error: null }));
+  const result = await ws.actions.syncCalendar('conn-1');
+  assert.deepEqual(result, { ok: true, events: 4, skipped: 0 });
+  assert.deepEqual(ws.invoked, [{ name: 'sync-outlook-calendar', body: { connectionId: 'conn-1' } }]);
+});
+
+test('syncing needs a calendar to sync, and says why a sync was refused', async () => {
+  const empty = workspace(async () => ({ data: {}, error: null }));
+  await assert.rejects(empty.actions.syncCalendar(''), /calendar/i);
+  assert.equal(empty.invoked.length, 0);
+  const refused = workspace(async () => httpError(409, { error: 'That calendar is not connected. Reconnect it first.' }));
+  await assert.rejects(refused.actions.syncCalendar('conn-1'), { message: 'That calendar is not connected. Reconnect it first.' });
+});
+
 /* ── Tasks ────────────────────────────────────────────────────────────── */
 
 test('a note is changed by whoever wrote it and removed by them or an owner or admin, and a refusal is said as one', async () => {

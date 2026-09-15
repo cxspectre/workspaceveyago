@@ -67,6 +67,7 @@ function answers(over = {}) {
     projectFiles: async () => [],
     projectBudgets: async () => [],
     notes: async () => [],
+    calendars: async () => [],
     ...over
   };
 }
@@ -404,6 +405,71 @@ test('a week not loaded asks for its events, not for the whole workspace again',
   assert.equal(s.store.weekLoaded(s.read(LATER_WEEK).key), true);
 });
 
+/* ── The agenda's month view ──────────────────────────────────────────── */
+
+const MONTH_RANGE = Object.freeze({ key: '2026-10', since: '2026-09-27T00:00:00.000Z', to: '2026-11-09T00:00:00.000Z' });
+
+test('a month shown for the first time asks for its events, not for the whole workspace again', async () => {
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  const before = { ...s.calls };
+  await s.store.showMonth(MONTH_RANGE);
+  assert.deepEqual(Object.keys(s.calls).filter(name => s.calls[name] !== before[name]), ['eventsOverlapping']);
+  assert.equal(s.store.monthLoaded(MONTH_RANGE.key), true);
+});
+
+test('a month already loaded is shown without asking again', async () => {
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  await s.store.showMonth(MONTH_RANGE);
+  const before = s.calls.eventsOverlapping;
+  await s.store.showMonth(MONTH_RANGE);
+  assert.equal(s.calls.eventsOverlapping, before);
+  assert.equal(s.store.monthLoaded('2026-11'), false, 'a month never shown is not loaded');
+});
+
+test('the month\'s own range is asked for, and what comes back joins the events the weeks already loaded', async () => {
+  const asked = [];
+  const s = start(answers({
+    eventsOverlapping: async range => {
+      asked.push(range.to);
+      return range.to === MONTH_RANGE.to
+        ? [{ id: 'm1', title: 'Offsite', row: { id: 'm1', starts_at: '2026-10-05T09:00:00Z' } }]
+        : [];
+    }
+  }));
+  await s.store.load();
+  await s.store.showMonth(MONTH_RANGE);
+  assert.ok(asked.includes(MONTH_RANGE.to));
+  assert.ok(s.read('events').some(e => e.id === 'm1'), 'the month\'s own event lands in the shared events array');
+});
+
+test('leaving the month view stops asking for it in the background; shown again, it asks afresh', async () => {
+  const asked = [];
+  const s = start(answers({ eventsOverlapping: async range => { asked.push(range.to); return []; } }));
+  await s.store.load();
+  await s.store.showMonth(MONTH_RANGE);
+  assert.ok(asked.includes(MONTH_RANGE.to));
+  asked.length = 0;
+  await s.store.showMonth(null);
+  await s.store.load({ quiet: true });
+  assert.ok(!asked.includes(MONTH_RANGE.to), 'nobody is looking at the month any more');
+  assert.equal(s.store.monthLoaded(MONTH_RANGE.key), false, 'a load that did not ask for it does not still call it loaded');
+  asked.length = 0;
+  await s.store.showMonth(MONTH_RANGE);
+  assert.ok(asked.includes(MONTH_RANGE.to), 'shown again, it is loaded again');
+});
+
+test('a month asked for before the workspace has loaded rides along with the first load, not a second request', async () => {
+  const asked = [];
+  const s = start(answers({ eventsOverlapping: async range => { asked.push(range.to); return []; } }));
+  const shown = s.store.showMonth(MONTH_RANGE);
+  await s.store.load();
+  await shown;
+  assert.equal(asked.filter(to => to === MONTH_RANGE.to).length, 1);
+  assert.equal(s.store.monthLoaded(MONTH_RANGE.key), true);
+});
+
 test('a week whose events fail says so, and leaves the rest of the workspace as it was', async () => {
   const s = start(answers({ eventsOverlapping: async () => [] }));
   await s.store.load();
@@ -494,6 +560,22 @@ test('a note on a company is shown on its page, and a note written there finds t
   assert.equal(notes && notes[0].body, 'Met at the fair');
   assert.deepEqual({ ...s.store.noteTarget('companies', 'CO1') }, { type: 'company', id: 'co1' });
   assert.equal(s.store.noteTarget('companies', 'gone'), null);
+});
+
+/* ── Connected calendars ──────────────────────────────────────────────── */
+
+test('every connected calendar loads into state.calendars, for the agenda\'s connections panel and its event pages', async () => {
+  const boxes = [{ id: 'cal1', label: 'hello@veyago.cloud', employeeId: null, live: true, status: 'connected', lastSyncedAt: '2026-09-15T08:00:00Z' }];
+  const s = start(answers({ calendars: async () => boxes }));
+  await s.store.load();
+  assert.deepEqual(s.store.state.calendars, boxes);
+});
+
+test('calendars that did not load leave the rest of the workspace open, as any other part does', async () => {
+  const s = start(answers({ calendars: async () => { throw new Error('Could not load calendars: Failed to fetch'); } }));
+  await s.store.load();
+  assert.equal(s.store.state.loaded, true, 'calendars is not one of the CORE parts');
+  assert.deepEqual([...s.store.state.failed], ['connected calendars']);
 });
 
 test('a week that loads after one failed calls off that retry, and the next failure starts from the first delay', async () => {
@@ -748,6 +830,55 @@ test('a refusal the page says itself, on a dialog, is not said again in a toast;
   await tick();
   assert.equal(s.calls.tickets, before + 1);
   assert.ok(!s.context.toasts.includes('The note was not changed.'));
+});
+
+/* ── A write that only touches a few parts (after's `only`) ──────────────
+   Every write used to reload all eighteen parts of the store — an event
+   saved asked for tickets, invoices, mail and the rest again too. `only`
+   scopes the reload the same way showWeek() already scopes a week's own:
+   fewer requests, the same repaint. */
+
+test('a write that names `only` reloads just those parts, not the whole workspace', async () => {
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  const before = { ...s.calls };
+  await s.store.after(Promise.resolve('saved'), { only: ['events'] });
+  assert.deepEqual(Object.keys(s.calls).filter(name => s.calls[name] !== before[name]), ['eventsOverlapping'],
+    'an event save asks only for events, not for tickets, invoices, mail and the rest again');
+});
+
+test('a write that changes an event\'s row still shows the change once `only` reloads', async () => {
+  let title = 'Kickoff';
+  const s = start(answers({ eventsOverlapping: async () => [{ id: 'ev1', title, row: { id: 'ev1', starts_at: '2026-09-15T09:00:00Z' } }] }));
+  await s.store.load();
+  title = 'Kickoff, moved';
+  await s.store.after(Promise.resolve('saved'), { only: ['events'] });
+  assert.equal(s.read('events').find(e => e.id === 'ev1').title, 'Kickoff, moved');
+});
+
+test('with no `only` given, a write still reloads everything, exactly as before', async () => {
+  const s = start(answers());
+  await s.store.load();
+  const before = s.calls.tickets;
+  await s.store.after(Promise.resolve('saved'));
+  assert.equal(s.calls.tickets, before + 1, 'a note or a task save still refreshes the whole workspace');
+});
+
+test('a write that fails reloads everything regardless of `only` — a refusal may still have changed something else', async () => {
+  const s = start(answers());
+  await s.store.load();
+  const before = { ...s.calls };
+  await assert.rejects(s.store.after(Promise.reject(new Error('Could not save: refused')), { only: ['events'] }));
+  await tick();
+  assert.ok(s.calls.tickets > before.tickets, 'the safety net is not narrowed just because the write named a part');
+});
+
+test('the scoped reload\'s own part failing is not the write failing — after() still resolves with what the write returned', async () => {
+  const s = start(answers({ eventsOverlapping: async () => { throw new Error('Could not load the agenda: Failed to fetch'); } }));
+  await s.store.load();
+  const result = await s.store.after(Promise.resolve('saved'), { only: ['events'], toast: false });
+  assert.equal(result, 'saved');
+  assert.deepEqual([...s.store.state.failed], ['the agenda']);
 });
 
 test('a part loaded since a mark arrived from a load begun after it — not from one begun before, even one ending after, nor from one that did not bring it back', async () => {

@@ -190,12 +190,14 @@
      meanwhile is refused rather than overwritten (actions.updateEvent). */
   var EVENT_COLUMNS = 'id, title, detail, location, starts_at, ends_at, all_day, kind, status, project_id, company_id, contact_id, updated_at';
   /* What a list of events brings for each one's page: who may change it
-     (connection_id, created_by). Who is invited (attendees, 0026: [{name,
-     email, response}]) is the largest column an event has and only its page
-     reads it, so it comes with one event asked for by its id (event,
-     eventInvitees) rather than with every week, project meeting and past
-     meeting, which are loaded again every two minutes. */
-  var EVENT_LIST_COLUMNS = EVENT_COLUMNS + ', connection_id, created_by';
+     (connection_id, created_by), and — for a synced one (0057) — who
+     organised it, its video-call link and the zone it was booked in.
+     Who is invited (attendees, 0026: [{name, email, response}]) is the
+     largest column an event has and only its page reads it, so it comes
+     with one event asked for by its id (event, eventInvitees) rather than
+     with every week, project meeting and past meeting, which are loaded
+     again every two minutes. */
+  var EVENT_LIST_COLUMNS = EVENT_COLUMNS + ', connection_id, calendar_id, created_by, organizer_name, organizer_email, meeting_url, time_zone';
   var EVENT_PAGE_COLUMNS = EVENT_LIST_COLUMNS + ', attendees';
 
   function agendaEvent(r) {
@@ -714,6 +716,37 @@
         ? query.or('employee_id.is.null,employee_id.eq.' + me.id)
         : query.is('employee_id', null);
       return unwrap(await query.order('account_label'), 'mailboxes');
+    },
+
+    /* Every calendar connection the agenda may show or act on: the studio's
+       and this person's own (0044's rule, the same integration_status view
+       mailboxes() reads, filtered to the other provider). What the agenda
+       says a synced event came from, and what a connections panel offers to
+       reconnect or sync (0057, "No way to connect a calendar or see its last
+       sync"). */
+    async calendars() {
+      var me = window.workspaceSession.employee;
+      var query = sb()
+        .from('integration_status')
+        .select('id, provider, account_label, employee_id, employee_name, status, ' +
+                'is_live, last_synced_at, last_error')
+        .eq('provider', 'microsoft_calendar');
+      query = me && me.id
+        ? query.or('employee_id.is.null,employee_id.eq.' + me.id)
+        : query.is('employee_id', null);
+      var rows = unwrap(await query.order('account_label'), 'calendars');
+      return rows.map(function (r) {
+        return {
+          id: r.id, label: r.account_label,
+          /* null = the studio's, shared calendar; otherwise this person's own
+             (integration_status only ever returns one of the two — 0044). */
+          employeeId: r.employee_id || null,
+          ownerName: r.employee_id ? r.employee_name : 'Studio',
+          live: Boolean(r.is_live), status: r.status,
+          lastSyncedAt: r.last_synced_at, lastError: r.last_error || '',
+          row: r
+        };
+      });
     },
 
     /* The signed-in person's own signatures: one per mailbox, and at most one

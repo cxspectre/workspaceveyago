@@ -239,7 +239,7 @@ test('a client\'s past meetings: before the day given, filed under the company, 
   assert.deepEqual(call('neq'), ['neq', 'status', 'cancelled']);
   assert.deepEqual(call('order'), ['order', 'starts_at', { ascending: false }]);
   assert.deepEqual(call('limit'), ['limit', 3], 'one more than are shown, to know whether there are more');
-  assert.match(call('select')[1], /connection_id, created_by/, 'the columns that say who may change one');
+  assert.match(call('select')[1], /connection_id, calendar_id, created_by/, 'the columns that say who may change one, and which calendar it is in (0057)');
   assert.doesNotMatch(call('select')[1], /attendees/, 'who is invited is asked for by the page of the one opened');
   assert.deepEqual(result.meetings.map(m => m.id), ['e3', 'e2']);
   assert.equal(result.more, true);
@@ -306,7 +306,7 @@ test('one event is asked for by its id — a uuid, and nothing else — and none
   assert.equal(found.id, EV);
   assert.equal(found.title, 'Pitch');
   assert.deepEqual(plain(queries[0].calls.find(([method]) => method === 'eq')), ['eq', 'id', EV]);
-  assert.match(queries[0].calls.find(([method]) => method === 'select')[1], /connection_id, created_by, attendees/, 'every column its page reads');
+  assert.match(queries[0].calls.find(([method]) => method === 'select')[1], /connection_id, calendar_id, created_by, organizer_name, organizer_email, meeting_url, time_zone, attendees/, 'every column its page reads');
   assert.match(queries[0].calls.find(([method]) => method === 'select')[1], /\bupdated_at\b/, 'and when it last changed, which an edit is made against');
   assert.equal(await loadTables(() => []).data.event(EV), null);
   const crafted = loadTables(() => []);
