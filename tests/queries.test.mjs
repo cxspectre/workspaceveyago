@@ -387,6 +387,18 @@ test('every contact loads, past the thousand rows the API hands back at once, wi
   assert.ok(queries[0].calls.some(call => call.join(' ') === 'order id'), 'pages in a fixed order do not overlap');
 });
 
+test('a contact carries whether they are primary and which enquiry introduced them, on its raw row', async () => {
+  const { data, queries } = loadTables(table => (table !== 'crm_contacts' ? [] : [{
+    id: 'c1', full_name: 'Ana Lima', email: 'ana@northline.example', is_primary: true, enquiry_id: 'enq-1', company: null
+  }]));
+  const [ana] = await data.contacts();
+  assert.equal(ana.row.is_primary, true);
+  assert.equal(ana.row.enquiry_id, 'enq-1');
+  const select = queries[0].calls.find(([method]) => method === 'select')[1];
+  assert.ok(select.split(/,\s*/).includes('is_primary'));
+  assert.ok(select.split(/,\s*/).includes('enquiry_id'));
+});
+
 test('a contact pushed into the next page while the list is read is listed once', async () => {
   let served = 0;
   const person = i => ({ id: `c${i}`, full_name: `Person ${i}`, email: null, company: null });
@@ -435,6 +447,33 @@ test('a company arrives with its owner', async () => {
   const [co] = await data.companies();
   assert.ok(queries[0].calls.find(([method]) => method === 'select')[1].split(/,\s*/).includes('owner_id'));
   assert.equal(co.row.owner_id, 'e-sam');
+});
+
+test('enquiries arrive newest first, with what the promote button and the list need', async () => {
+  const { data, queries } = loadTables(table => (table !== 'website_enquiries' ? [] : [{
+    id: 'enq-1', kind: 'website', name: 'Bo Ahn', email: 'bo@example.com', business: 'Ahn Studio',
+    website: null, message: 'Looking for a rebuild.', status: 'new', created_at: '2026-09-10T09:00:00Z'
+  }]));
+  const [enquiry] = await data.enquiries();
+  assert.equal(enquiry.id, 'enq-1');
+  assert.equal(enquiry.name, 'Bo Ahn');
+  assert.equal(enquiry.business, 'Ahn Studio');
+  assert.equal(enquiry.status, 'New');
+  assert.equal(enquiry.row.email, 'bo@example.com');
+  const order = queries[0].calls.find(([method]) => method === 'order');
+  assert.equal(order[1], 'created_at');
+  assert.equal(order[2].ascending, false, 'newest first');
+});
+
+test('a blank enquiry field reads as empty text, never null in the page', async () => {
+  const { data } = loadTables(table => (table !== 'website_enquiries' ? [] : [{
+    id: 'enq-2', kind: 'product', name: 'Cy Ide', email: 'cy@example.com', business: null,
+    website: null, message: null, status: 'spam', created_at: '2026-09-11T09:00:00Z'
+  }]));
+  const [enquiry] = await data.enquiries();
+  assert.equal(enquiry.business, '');
+  assert.equal(enquiry.message, '');
+  assert.equal(enquiry.status, 'Spam');
 });
 
 test('an amount is written in its currency, and a code Intl cannot format goes beside it rather than throwing', () => {
