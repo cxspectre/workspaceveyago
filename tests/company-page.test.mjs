@@ -167,6 +167,20 @@ test('a stale link to someone gone from the team says the record is unavailable,
   assert.ok(isNotFound(call(context, 'personDetail', 'nobody-here')));
 });
 
+test('"Change role or status" is offered on a colleague\'s page, never on your own, and not to an admin looking at the owner\'s', () => {
+  const managerOnBo = load({ viewer: { id: OWNER, full_name: 'Cassian Drefke', email: 'cassian@veyago.cloud', role: 'owner', title: null, status: 'active' } });
+  assert.match(call(managerOnBo.context, 'personDetail', EMPLOYEE), /data-employee-edit="e1000000-0000-4000-8000-000000000005"/);
+
+  const ownOwnPage = load({ viewer: { id: OWNER, full_name: 'Cassian Drefke', email: 'cassian@veyago.cloud', role: 'owner', title: null, status: 'active' } });
+  assert.doesNotMatch(call(ownOwnPage.context, 'personDetail', OWNER), /data-employee-edit/, 'nobody changes their own role or status');
+
+  const adminOnOwner = load({ viewer: { id: ADMIN, full_name: 'Zoë Adler', email: 'zoe@veyago.cloud', role: 'admin', title: null, status: 'active' } });
+  assert.doesNotMatch(call(adminOnOwner.context, 'personDetail', OWNER), /data-employee-edit/, 'only an owner changes an owner');
+
+  const staffOnBo = load({ manager: false, viewer: { id: ADMIN, full_name: 'Zoë Adler', email: 'zoe@veyago.cloud', role: 'employee', title: null, status: 'active' } });
+  assert.doesNotMatch(call(staffOnBo.context, 'personDetail', EMPLOYEE), /data-employee-edit/, 'staff are never offered it');
+});
+
 /* ── The studio tab ───────────────────────────────────────────────────── */
 
 test('the studio profile comes from the database, not text written into the page, and falls back to the studio\'s defaults when there is none', () => {
