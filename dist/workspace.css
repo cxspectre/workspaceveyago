@@ -237,6 +237,22 @@ body.mail-mode .reader-compose .composer-editor { flex: 1; min-height: 240px; ma
    with what the column is worth in each currency under its heading. */
 .project-board.stage-board.crm-board { grid-template-columns: repeat(6, minmax(220px, 1fr)); }
 .crm-board .board-total { margin: 0 2px 10px; color: #66758a; font-size: .8125rem; font-variant-numeric: tabular-nums; }
+/* Six columns at 220px need at least 1,320px to show without scrolling. The
+   plain .project-board above narrows for a phone at both breakpoints below;
+   .crm-board (three classes) is more specific than that lone-class rule, so
+   without its own override here it would keep 220px at any width, and a
+   phone would show barely half of one column before the next has to be
+   scrolled to. Narrower still at 520px, so a column stays clear of a small
+   phone's own edges rather than running right up against them. */
+@media (max-width: 760px) { .project-board.stage-board.crm-board { grid-template-columns: repeat(6, minmax(190px, 1fr)); } }
+@media (max-width: 520px) { .project-board.stage-board.crm-board { grid-template-columns: repeat(6, minmax(165px, 1fr)); } }
+/* The filter and sort controls above the pipeline and the companies table,
+   on their own row under the search box (view-toolbar): small controls, so
+   they wrap onto more than one line before either crowds the other. */
+.filter-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin: -4px 0 15px; }
+.filter-field { display: flex; align-items: center; gap: 7px; font-size: .8125rem; font-weight: 500; color: #66758a; }
+.filter-field select { padding: 6px 10px; border: 1px solid #dce0e6; border-radius: 10px; background: #fff; color: var(--ink); font-size: .8125rem; font-weight: 400; }
+@media (max-width: 520px) { .filter-field select { max-width: 40vw; } }
 /* The role chip is painted in once someone has signed in. */
 .demo-label:empty { display: none; }
 
