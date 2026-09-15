@@ -30,6 +30,9 @@ function element(page, name) {
     name, hidden: false, disabled: false, inert: false, open: false,
     value: '', textContent: '', className: '', innerHTML: '', dataset: {},
     classList: { add: c => classes.add(c), remove: c => classes.delete(c), contains: c => classes.has(c) },
+    attributes: {},
+    setAttribute: (name, value) => { el.attributes[name] = String(value); },
+    getAttribute: name => (Object.prototype.hasOwnProperty.call(el.attributes, name) ? el.attributes[name] : null),
     addEventListener: (type, fn) => { (listeners[type] = listeners[type] || []).push(fn); },
     fire: type => Promise.all((listeners[type] || []).map(fn => fn({ type, target: el, preventDefault() {} }))),
     focus: () => { page.focused = name; },
@@ -42,9 +45,16 @@ function element(page, name) {
   return el;
 }
 
+/* The header paintHeader() repaints: the sidebar's profile link, the avatar
+   inside it, the role chip and, once a session chip replaces it, the button
+   inside that. Selectors only reachable once someone is signed in, so no
+   test that never sets state.employee ever looks them up. */
+const HEADER_PARTS = { '.sidebar .profile': '.profile', '.avatar': '.avatar', '.demo-label': '.demo-label', '.header-avatar': '.header-avatar', '.session-signout': '.session-signout' };
+
 function start(initial = {}) {
   const page = { parts: {}, focused: null, reloads: 0, authed: 0, gate: null };
   PARTS.forEach(id => { page.parts[id] = element(page, id); });
+  Object.entries(HEADER_PARTS).forEach(([selector, name]) => { page.parts[selector] = element(page, name); });
   const app = element(page, '.app');
   app.classList.add('locked');
   app.inert = true;
@@ -59,7 +69,9 @@ function start(initial = {}) {
     reset: async () => ({ data: { ok: true }, error: null }),
     afterRefresh: null
   };
-  const window = {};
+  /* The real two-initial shape (queries.js initials()), which paintHeader()
+     asks for by name — its own tests cover initials() itself. */
+  const window = { workspaceData: { initials: name => String(name || '').trim().split(/\s+/).map(w => w[0]).join('').toUpperCase() } };
   const emit = () => (listeners['workspace:session'] || []).forEach(fn => fn({ type: 'workspace:session' }));
 
   window.workspaceSession = {
@@ -110,7 +122,7 @@ function start(initial = {}) {
           return true;
         }
       },
-      querySelector: selector => (selector === '.app' ? app : null),
+      querySelector: selector => (selector === '.app' ? app : page.parts[selector] || null),
       getElementById: id => (id === 'modal' ? modal : null),
       createElement: () => { page.gate = element(page, '#gate'); return page.gate; }
     }
@@ -306,6 +318,26 @@ test('a code screen with no factor it can use still has a way back', async () =>
   await tick();
   assert.equal(g.calls.signOut, 1);
   assert.equal(g.part('#step-pw').hidden, false);
+});
+
+/* ── The header, once someone is signed in ───────────────────────────── */
+
+test('the sidebar and the header chip say whose session it is — never a name written into the page', async () => {
+  const g = start({ access: 'staff', userId: 'u1', employee: { full_name: 'Ana Lima', role: 'assistant', title: null } });
+  g.ready();
+  await tick();
+  assert.equal(g.part('.sidebar .profile').attributes['aria-label'], 'Ana Lima, Assistant',
+    'said from the signed-in employee, not "Cassian, workspace owner" for everyone');
+  assert.equal(g.part('.avatar').textContent, 'AL');
+  assert.equal(g.part('.demo-label').textContent, 'Assistant');
+});
+
+test('a title stands in for the role where one is set', async () => {
+  const g = start({ access: 'staff', userId: 'u1', employee: { full_name: 'Cassian Drefke', role: 'owner', title: 'Founder' } });
+  g.ready();
+  await tick();
+  assert.equal(g.part('.sidebar .profile').attributes['aria-label'], 'Cassian Drefke, Founder');
+  assert.equal(g.part('.demo-label').textContent, 'Founder');
 });
 
 test('not a team member: signed out, told why, and the password form stays up', async () => {
