@@ -214,6 +214,17 @@
     };
   }
 
+  /* An activity row (workspace_activity, 0027/0052) the way a feed shows it,
+     whether it came from the studio-wide feed or one project's own. */
+  function shapeActivity(r) {
+    var who = r.actor ? r.actor.full_name : 'Veyago';
+    return {
+      id: r.id, who: who, initial: initials(who), text: r.summary,
+      when: shortDate(r.created_at), createdAt: r.created_at, verb: r.verb,
+      entityType: r.entity_type, entityId: r.entity_id, row: r
+    };
+  }
+
   function projectTask(r) {
     return {
       id: r.id, title: r.title, done: r.status === 'done', status: r.status,
@@ -240,14 +251,7 @@
         .select('id, verb, entity_type, entity_id, summary, created_at, actor:employees (full_name)')
         .order('created_at', { ascending: false })
         .limit(limit || 8), 'activity');
-      return rows.map(function (r) {
-        var who = r.actor ? r.actor.full_name : 'Veyago';
-        return {
-          id: r.id, who: who, initial: initials(who), text: r.summary,
-          when: shortDate(r.created_at), createdAt: r.created_at, verb: r.verb,
-          entityType: r.entity_type, entityId: r.entity_id, row: r
-        };
-      });
+      return rows.map(shapeActivity);
     },
 
     /* ── Agenda ──────────────────────────────────────────────────────── */
@@ -501,11 +505,17 @@
     },
 
     /* ── Projects ────────────────────────────────────────────────────── */
+    /* sort_order is 0 for every project alike — nothing in the workspace ever
+       sets it to anything else — so ordering by it first settled nothing, and
+       whatever order Postgres happened to hand rows back in (not guaranteed
+       to be the same twice) decided the rest: a reload could reshuffle the
+       whole list. Ordered by name then, tie-broken by id, the way contacts
+       and companies already are (everyRow, above) — every reload the same. */
     async projects() {
       var rows = unwrap(await sb()
         .from('client_project_progress')
         .select('*')
-        .order('sort_order'), 'projects');
+        .order('sort_order').order('name').order('id'), 'projects');
       return rows.map(function (r) {
         return {
           id: r.id, name: r.name, client: r.company_name || 'Internal product',
@@ -516,6 +526,47 @@
           taskCount: r.task_count, tasksDone: r.tasks_done, row: r
         };
       });
+    },
+
+    /* Archived projects (deleted_at set): left out of client_project_progress
+       entirely (0022's view), so a project once archived could not be found
+       again anywhere in the workspace. Read straight off client_projects —
+       RLS lets any staff member see it, archived or not (0022's own select
+       policy carries no deleted_at condition; only the view added one) — with
+       just enough to list and restore one, none of the task rollups a live
+       board needs. Newest-archived first, tie-broken by id. */
+    async archivedProjects() {
+      var rows = unwrap(await sb()
+        .from('client_projects')
+        .select('id, name, code, accent, status, description, company_id, owner_id, due_on, deleted_at, ' +
+                'company:crm_companies (name)')
+        .not('deleted_at', 'is', null)
+        .order('deleted_at', { ascending: false })
+        .order('id'), 'archived projects');
+      return rows.map(function (r) {
+        return {
+          id: r.id, name: r.name, client: (r.company && r.company.name) || 'Internal product',
+          initial: r.code || initials(r.name), style: r.accent === 'default' ? '' : r.accent,
+          status: label(r.status), description: r.description || '',
+          archivedAt: r.deleted_at, archived: shortDate(r.deleted_at), row: r
+        };
+      });
+    },
+
+    /* A project's own history (0052): the tasks, notes and files logged under
+       it, which can reach further back than the studio-wide feed's most
+       recent window keeps (that one is loaded with the workspace and capped;
+       this is asked for by a project's page, the way a client's past
+       meetings are). Only a uuid is asked for. */
+    async projectActivity(projectId, limit) {
+      if (!uuids([projectId], 1).length) return [];
+      var rows = unwrap(await sb()
+        .from('workspace_activity')
+        .select('id, verb, entity_type, entity_id, summary, created_at, actor:employees (full_name)')
+        .eq('project_id', projectId)
+        .order('created_at', { ascending: false })
+        .limit(Math.min(Math.max(Math.floor(Number(limit)) || 50, 1), 200)), 'this project’s activity');
+      return rows.map(shapeActivity);
     },
 
     async projectTasks(projectId) {

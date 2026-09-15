@@ -1,5 +1,9 @@
 /* Connected workspace views. All records remain studio data for this session. */
 let routeParts = [], projectMode = 'board', agendaMode = 'week';
+/* projectMode also takes 'archived' (see archivedProjectsView, below).
+   projectFilter: 'all' or one of projectsModel.STATUS_LABELS. projectSort:
+   'name', 'due' or 'status' — the project list had neither before. */
+let projectFilter = 'all', projectSort = 'name';
 let ticketScope = 'All tickets', financeTab = 'overview', companyTab = 'team';
 /* On a new day the page is drawn again. Once data is loaded, store.js owns the
    repaint (it reloads the week's events on the same signal), and agenda-ui.js
@@ -52,10 +56,70 @@ overview = function(){if(routeParts[1]==='activity')return activityPage();const 
 
 /* Mail: mailboxes, folders, conversations and the reading pane live in mail.js. */
 
-/* Projects: board, list and full task workspaces. */
-projectsView = function(){if(routeParts[1]!==undefined)return projectDetail(String(routeParts[1]));const list=projects.filter(p=>matches(queries.projects,p.name,p.client));return titlebar('Make room for good work.','Products, client work, and everything moving toward launch.',createButton('New project','projects'))+statStrip([['Active projects',projects.filter(projectsModel.isActive).length,'Across the studio'],['In review',projects.filter(p=>p.status==='In review').length,'Ready for a closer look'],['Open tasks',projects.reduce((a,p)=>a+p.tasks.length-checkedTasks(p),0),'Across all projects'],['Completed tasks',projects.reduce((a,p)=>a+checkedTasks(p),0),'Done so far']])+`<div class="view-toolbar">${segments([['board','Board'],['list','List']],projectMode,'projectMode')}${queryInput('projects','Search projects')}</div>${projectMode==='board'?`<div class="project-board stage-board">${projectsModel.boardColumns(list).map(({status,projects:items})=>`<section class="board-column"><div class="board-heading"><h2>${status}</h2>${countTag(items.length)}</div><div class="board-cards">${items.map(p=>projectTile(p)).join('')||'<div class="board-empty">No projects in this stage.</div>'}</div></section>`).join('')}</div>`:`<section class="panel"><div class="table-wrap"><table class="module-table"><thead><tr><th>Project</th><th>Status</th><th>Tasks</th><th>Due</th></tr></thead><tbody>${list.map(p=>`<tr data-action="project" data-id="${p.id}" role="button" tabindex="0"><td><div class="cell-main"><div class="project-logo ${p.style}">${esc(p.initial)}</div><div><strong>${esc(p.name)}</strong><small>${esc(p.client)}</small></div></div></td><td>${pill(p.status)}</td><td>${checkedTasks(p)} / ${p.tasks.length}</td><td>${esc(p.due)}</td></tr>`).join('')}</tbody></table>${!list.length?empty('No projects found','Try another search.'):''}</div></section>`}`;};
-function projectTile(p){return `<a class="project-card board-card" href="#projects/${p.id}"><div class="card-top"><div class="project-logo ${p.style}">${esc(p.initial)}</div><span class="card-arrow">${icon('chevron')}</span></div><h2>${esc(p.name)}</h2><p>${esc(p.description)}</p><div class="card-task-progress"><span>${checkedTasks(p)} of ${p.tasks.length} tasks complete</span><span>${p.tasks.length?Math.round(checkedTasks(p)/p.tasks.length*100):0}%</span></div><div class="progress"><i style="width:${p.tasks.length?checkedTasks(p)/p.tasks.length*100:0}%"></i></div><div class="project-card-bottom">${ownerAvatar(p)}${p.due?`<span>Due ${esc(p.due)}</span>`:''}</div></a>`;}
-function projectDetail(id){const p=projects.find(p=>p.id===id);if(!p)return notFound();const tab=routeParts[2]||'overview';const byCompany=p.companyId?contacts.findIndex(c=>c.row&&c.row.company&&c.row.company.id===p.companyId):-1;const ci=byCompany;const related=projectsModel.projectTickets(tickets,p);const meetings=projectsModel.upcomingEvents((window.workspaceStore&&workspaceStore.state.projectEvents)||[],p,Date.now());const taskPanel=tasksUi.panel(p);return detailHeader('projects','All projects',p.name,p.client,pill(p.status)+(typeof projectsUi!=='undefined'?projectsUi.actions(p):''))+subnav([['projects/'+id,'Overview','overview'],['projects/'+id+'/tasks','Tasks','tasks'],['projects/'+id+'/files','Files','files'],['projects/'+id+'/notes','Notes','notes']],tab)+`<div class="record-layout"><div class="record-main">${tab==='notes'?notesPanel('projects',id):tab==='tasks'?taskPanel:tab==='files'&&typeof projectPanels!=='undefined'?projectPanels.filesPanel(p):`<section class="panel project-summary"><div class="project-logo ${p.style}">${esc(p.initial)}</div><div><span class="eyebrow">PROJECT BRIEF</span><h2>${esc(p.name)}</h2><p>${esc(p.description)}</p></div><div class="project-completion"><strong>${checkedTasks(p)}<span> / ${p.tasks.length}</span></strong><small>tasks complete</small></div></section>${taskPanel}`}</div><aside class="record-aside">${properties([['Status',selectField('Project status','projects',id,'status',projectsModel.STATUS_LABELS,p.status)],['Owner',ownerChip(p)],['Starts',esc(p.starts||'Not set')],['Due date',esc(p.due||'Not set')],['Client / product',esc(p.client)],...(typeof projectPanels!=='undefined'?projectPanels.budgetRows(p):[])])}${typeof projectPanels!=='undefined'?projectPanels.teamPanel(p)+projectPanels.peoplePanel(p):''}${linkedPanel('Connected work',[...(ci>=0?[[`crm/${contacts[ci].id}`,contacts[ci].name,p.client,'crm']]:[]),...related.map(t=>[`tickets/${t.id}`,t.title,'VYG-'+t.id+' · '+t.status+(t.row&&t.row.project_id?'':' · not filed under a project'),'tickets'])])}${linkedPanel('Meetings',meetings.map(ev=>[events.some(e=>e.id===ev.id)?'agenda/'+ev.id:'agenda',ev.title,ev.when,'agenda']))}</aside></div>`;}
+/* Projects: board, list, archived and full task workspaces. */
+/* A due date the way the board and list read it (projects-model.js's
+   shortDue drops the year unconditionally), read in UTC like a task's own
+   due date: from the raw column, not the pre-formatted label, so a project
+   due in another year says so instead of reading as this year's. */
+const MONTHS_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function dueWithYear(p){if(!p.dueOn)return p.due||'';const d=new Date(p.dueOn+'T00:00:00Z');if(isNaN(d.getTime()))return p.due||'';const y=d.getUTCFullYear();return MONTHS_SHORT[d.getUTCMonth()]+' '+d.getUTCDate()+(y===new Date().getFullYear()?'':', '+y);}
+/* Past its due date and still moving — a finished project is not overdue,
+   whatever its due date says. */
+function isOverdue(p){return Boolean(p.dueOn)&&p.status!=='Completed'&&p.dueOn<CAL.dayKey(new Date());}
+/* "0 of 0 tasks complete" and a 0% bar read as a stalled project; a project
+   with no tasks yet has not stalled, it has not been planned. */
+function taskProgress(p){return p.tasks.length?`<span>${checkedTasks(p)} of ${p.tasks.length} tasks complete</span><span>${Math.round(checkedTasks(p)/p.tasks.length*100)}%</span>`:'<span>No tasks yet</span>';}
+const projectSelectOptions=(list,current)=>list.map(([value,label])=>`<option value="${esc(value)}"${value===current?' selected':''}>${esc(label)}</option>`).join('');
+function projectStatusFilter(){return `<select aria-label="Filter by status" data-view="projectFilter">${projectSelectOptions([['all','All statuses'],...projectsModel.STATUS_LABELS.map(s=>[s,s])],projectFilter)}</select>`;}
+function projectSortSelect(){return `<select aria-label="Sort by" data-view="projectSort">${projectSelectOptions([['name','Name (A–Z)'],['due','Due date'],['status','Status']],projectSort)}</select>`;}
+/* `list` is always a fresh array from .filter() below, never `projects`
+   itself, so sorting it in place mutates nothing shared (store.js's swap()
+   is for the array everyone holds a reference to; this one is nobody's but
+   this render). */
+function sortProjects(list){const key=p=>p.dueOn||'9999-99-99';if(projectSort==='due')list.sort((a,b)=>key(a).localeCompare(key(b))||a.name.localeCompare(b.name));else if(projectSort==='status')list.sort((a,b)=>projectsModel.STATUS_LABELS.indexOf(a.status)-projectsModel.STATUS_LABELS.indexOf(b.status)||a.name.localeCompare(b.name));else list.sort((a,b)=>a.name.localeCompare(b.name));return list;}
+function projectsToolbar(){return `<div class="view-toolbar">${segments([['board','Board'],['list','List'],['archived','Archived']],projectMode,'projectMode')}${projectMode!=='archived'?projectStatusFilter()+projectSortSelect():''}${queryInput('projects',projectMode==='archived'?'Search archived projects':'Search projects')}</div>`;}
+/* Whether an empty list means nothing exists yet, or a filter narrowed a
+   real list down to nothing — "No projects found. Try another search." on a
+   brand new studio with zero projects sends someone looking for a typo that
+   is not there. */
+function projectsEmptyState(list,total){return total?empty('No projects match your filters.','Try another search, or clear the status filter.'):empty('No projects yet.','Create one and it will show up here.');}
+projectsView = function(){
+  if(routeParts[1]!==undefined) return projectDetail(String(routeParts[1]));
+  if(projectMode==='archived') return archivedProjectsView();
+  const byStatus=projectFilter==='all'?projects:projects.filter(p=>p.status===projectFilter);
+  const list=sortProjects(byStatus.filter(p=>matches(queries.projects,p.name,p.client)));
+  return titlebar('Make room for good work.','Products, client work, and everything moving toward launch.',createButton('New project','projects'))
+    +statStrip([['Active projects',projects.filter(projectsModel.isActive).length,'Across the studio'],['In review',projects.filter(p=>p.status==='In review').length,'Ready for a closer look'],['Open tasks',projects.reduce((a,p)=>a+p.tasks.length-checkedTasks(p),0),'Across all projects'],['Completed tasks',projects.reduce((a,p)=>a+checkedTasks(p),0),'Done so far']])
+    +projectsToolbar()
+    +(!list.length?`<section class="panel">${projectsEmptyState(list,projects.length)}</section>`
+      :projectMode==='board'?`<div class="project-board stage-board">${projectsModel.boardColumns(list).map(({status,projects:items})=>`<section class="board-column"><div class="board-heading"><h2>${status}</h2>${countTag(items.length)}</div><div class="board-cards">${items.map(p=>projectTile(p)).join('')||'<div class="board-empty">No projects in this stage.</div>'}</div></section>`).join('')}</div>`
+      :`<section class="panel"><div class="table-wrap"><table class="module-table"><thead><tr><th>Project</th><th>Status</th><th>Tasks</th><th>Due</th></tr></thead><tbody>${list.map(p=>`<tr data-action="project" data-id="${p.id}" role="button" tabindex="0"><td><div class="cell-main"><div class="project-logo ${p.style}">${esc(p.initial)}</div><div><strong>${esc(p.name)}</strong><small>${esc(p.client)}</small></div></div></td><td>${pill(p.status)}</td><td>${checkedTasks(p)} / ${p.tasks.length}</td><td>${esc(dueWithYear(p))}</td></tr>`).join('')}</tbody></table></div></section>`);
+};
+/* Archived projects (deleted_at set) never appear in `projects`, so they had
+   no page anywhere in the workspace once archived — the audit's own words
+   were "can't be seen or brought back". Asked for on demand
+   (workspaceStore.archivedProjects), since most visits to Projects never
+   need the list. Rows are plain, not links: an archived project has no live
+   page to open (projectDetail only ever looks in `projects`), so linking one
+   would open "Record not found" instead of doing anything useful. */
+function archivedProjectsView(){
+  const store=window.workspaceStore;
+  const entry=store&&typeof store.archivedProjects==='function'?store.archivedProjects():{state:'failed',projects:[]};
+  const all=entry.projects||[];
+  const list=all.filter(p=>matches(queries.projects,p.name,p.client));
+  const body=entry.state==='loading'?'<p class="quiet-text" role="status">Loading archived projects…</p>'
+    :entry.state==='failed'?'<p class="quiet-text" role="status">Archived projects did not load. <button type="button" class="text-btn" data-archived-retry>Try again</button></p>'
+    :!list.length?`<p class="quiet-text">${all.length?'No archived project matches your search.':'Nothing is archived right now.'}</p>`
+    :`<ul class="plain-list">${list.map(p=>`<li class="archived-project-row"><div class="project-logo ${p.style}">${esc(p.initial)}</div><div class="archived-project-name"><strong>${esc(p.name)}</strong><small>${esc(p.client)} · ${pill(p.status)} · Archived ${esc(p.archived)}</small></div>${typeof projectsUi!=='undefined'?projectsUi.restoreButton(p):''}</li>`).join('')}</ul>`;
+  return titlebar('Archived projects.','Left the board, but not gone. Restore one to bring it back.')
+    +projectsToolbar()
+    +`<section class="panel">${body}</section>`;
+}
+function projectTile(p){const overdue=isOverdue(p);return `<a class="project-card board-card" href="#projects/${p.id}"><div class="card-top"><div class="project-logo ${p.style}">${esc(p.initial)}</div><span class="card-arrow">${icon('chevron')}</span></div><h2>${esc(p.name)}</h2><p>${esc(p.description)}</p><div class="card-task-progress">${taskProgress(p)}</div><div class="progress"><i style="width:${p.tasks.length?checkedTasks(p)/p.tasks.length*100:0}%"></i></div><div class="project-card-bottom">${ownerAvatar(p)}${p.due?`<span${overdue?' class="overdue"':''}>${overdue?'Overdue, due':'Due'} ${esc(dueWithYear(p))}</span>`:''}</div></a>`;}
+/* A start date, read the same careful way a due date is (dueWithYear, above):
+   from the raw column in UTC, another year named. */
+function startsWithYear(p){if(!p.startsOn)return p.starts||'';const d=new Date(p.startsOn+'T00:00:00Z');if(isNaN(d.getTime()))return p.starts||'';const y=d.getUTCFullYear();return MONTHS_SHORT[d.getUTCMonth()]+' '+d.getUTCDate()+(y===new Date().getFullYear()?'':', '+y);}
+function projectDetail(id){const p=projects.find(p=>p.id===id);if(!p)return notFound();const tab=routeParts[2]||'overview';const byCompany=p.companyId?contacts.findIndex(c=>c.row&&c.row.company&&c.row.company.id===p.companyId):-1;const ci=byCompany;const related=projectsModel.projectTickets(tickets,p);const meetings=projectsModel.upcomingEvents((window.workspaceStore&&workspaceStore.state.projectEvents)||[],p,Date.now());const taskPanel=tasksUi.panel(p);return detailHeader('projects','All projects',p.name,p.client,pill(p.status)+(typeof projectsUi!=='undefined'?projectsUi.actions(p):''))+subnav([['projects/'+id,'Overview','overview'],['projects/'+id+'/tasks','Tasks','tasks'],['projects/'+id+'/files','Files','files'],['projects/'+id+'/notes','Notes','notes'],['projects/'+id+'/activity','Activity','activity']],tab)+`<div class="record-layout"><div class="record-main">${tab==='notes'?notesPanel('projects',id):tab==='tasks'?taskPanel:tab==='files'&&typeof projectPanels!=='undefined'?projectPanels.filesPanel(p):tab==='activity'&&typeof projectPanels!=='undefined'?projectPanels.activityPanel(p):`<section class="panel project-summary"><div class="project-logo ${p.style}">${esc(p.initial)}</div><div><span class="eyebrow">PROJECT BRIEF</span><h2>${esc(p.name)}</h2><p>${esc(p.description)}</p></div><div class="project-completion">${p.tasks.length?`<strong>${checkedTasks(p)}<span> / ${p.tasks.length}</span></strong><small>tasks complete</small>`:'<small>No tasks yet</small>'}</div></section>${taskPanel}`}</div><aside class="record-aside">${properties([['Status',selectField('Project status','projects',id,'status',projectsModel.STATUS_LABELS,p.status)],['Owner',ownerChip(p)],['Starts',esc(p.startsOn?startsWithYear(p):'Not set')],['Due date',esc(p.dueOn?dueWithYear(p):'Not set')],['Client / product',esc(p.client)],...(typeof projectPanels!=='undefined'?projectPanels.budgetRows(p):[])])}${typeof projectPanels!=='undefined'?projectPanels.teamPanel(p)+projectPanels.peoplePanel(p):''}${linkedPanel('Connected work',[...(ci>=0?[[`crm/${contacts[ci].id}`,contacts[ci].name,p.client,'crm']]:[]),...related.map(t=>[`tickets/${t.id}`,t.title,'VYG-'+t.id+' · '+t.status+(t.row&&t.row.project_id?'':' · not filed under a project'),'tickets'])])}${linkedPanel('Meetings',meetings.map(ev=>[events.some(e=>e.id===ev.id)?'agenda/'+ev.id:'agenda',ev.title,ev.when,'agenda']))}</aside></div>`;}
 
 /* CRM: the pipeline, the companies and contacts, and their pages are drawn by crm-ui.js. */
 
@@ -103,7 +167,11 @@ document.addEventListener('click', e => {
   render();
 }, true);
 
-document.addEventListener('click',e=>{const view=e.target.closest('[data-view]');if(view){const {view:key,value}=view.dataset;if(key==='ticketScope')ticketScope=value;if(key==='projectMode')projectMode=value;if(key==='agendaMode')agendaMode=value;repaintKeepingFocus();return;}if(e.target.closest('[data-print-invoice]'))window.print();});
+document.addEventListener('click',e=>{const view=e.target.closest('[data-view]');if(view){const {view:key,value}=view.dataset;if(key==='ticketScope')ticketScope=value;if(key==='projectMode')projectMode=value;if(key==='agendaMode')agendaMode=value;repaintKeepingFocus();return;}if(e.target.closest('[data-print-invoice]')){window.print();return;}const archivedRetry=e.target.closest('[data-archived-retry]');if(archivedRetry){if(window.workspaceStore&&typeof workspaceStore.retryArchivedProjects==='function')workspaceStore.retryArchivedProjects();repaintKeepingFocus();}});
+/* projectFilter and projectSort are selects, not the button-based segments
+   [data-view] above handles by click — a native select's chosen value is
+   read from the element itself, not a data-value on the option clicked. */
+document.addEventListener('change',e=>{const select=e.target.closest&&e.target.closest('select[data-view]');if(!select)return;const key=select.dataset.view;if(key==='projectFilter')projectFilter=select.value;else if(key==='projectSort')projectSort=select.value;else return;repaintKeepingFocus();});
 /* The last resort, once writes.js — which loads first and claims every field
    and tick it knows how to save for real — has had its turn: a record field
    or a task tick that reaches here has no write behind it (a new select this
@@ -121,7 +189,7 @@ projectRows = function(){
 const active=overviewModel.activeProjects(projects,projectsModel.isActive);
 const today=CAL.dayKey(new Date());
 if(!active.length)return `<p class="quiet-text" style="padding:4px 19px 20px">${projects.length?'Nothing active right now. Paused and finished work is on the Projects page.':'No projects yet. Create one and it will show here with its progress.'}</p>`;
-return `<div class="project-list">${active.map(p=>`<a class="project-row" href="#projects/${esc(p.id)}"><div class="project-logo ${p.style}">${esc(p.initial)}</div><div><div class="project-name">${esc(p.name)}</div><div class="project-meta">${esc(p.client)}${p.due?` · <span class="${p.dueOn&&p.dueOn<today?'overdue':''}">${p.dueOn&&p.dueOn<today?'Overdue, due':'Due'} ${esc(p.due)}</span>`:''}</div></div><div><div class="progress-caption">${checkedTasks(p)} / ${p.tasks.length} tasks</div><div class="progress"><i style="width:${p.tasks.length?checkedTasks(p)/p.tasks.length*100:0}%"></i></div></div>${ownerAvatar(p)}</a>`).join('')}</div>`;};
+return `<div class="project-list">${active.map(p=>`<a class="project-row" href="#projects/${esc(p.id)}"><div class="project-logo ${p.style}">${esc(p.initial)}</div><div><div class="project-name">${esc(p.name)}</div><div class="project-meta">${esc(p.client)}${p.due?` · <span class="${p.dueOn&&p.dueOn<today?'overdue':''}">${p.dueOn&&p.dueOn<today?'Overdue, due':'Due'} ${esc(dueWithYear(p))}</span>`:''}</div></div><div><div class="progress-caption">${p.tasks.length?`${checkedTasks(p)} / ${p.tasks.length} tasks`:'No tasks yet'}</div><div class="progress"><i style="width:${p.tasks.length?checkedTasks(p)/p.tasks.length*100:0}%"></i></div></div>${ownerAvatar(p)}</a>`).join('')}</div>`;};
 /* the notifications bell is handled in app.js, from live data */
 
 navigate(routeBeforeInit||'overview');

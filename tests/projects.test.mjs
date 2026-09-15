@@ -442,10 +442,32 @@ test('a typed budget is read the way people write amounts', () => {
 
 test('a mistyped budget is refused, not read as a different number', () => {
   const read = text => model.budgetChange(null, { amount: text, currency: 'EUR' });
-  for (const typo of ['1,2345', '1.5.5', '12.500.50', '1,234.567', '12,500.', '1 2345', ',5', '12500.505']) {
+  for (const typo of [
+    '1,2345', '1.5.5', '12.500.50', '1,234.567', '12,500.', '1 2345', ',5', '12500.505',
+    /* Doubled separators, a leading sign, and text that is only separators —
+       none of these were tried before, and a regex this shaped can misread a
+       run of punctuation as a number if a group is left optional by mistake. */
+    '12,,500', '12..500', '+12500', '-12,500', '.', ',', ' , . ', '1,50,00',
+    'NaN', 'Infinity', '1e10', '12٥00'
+  ]) {
     assert.match(String(read(typo).problem), /amount/, `"${typo}" is refused`);
     assert.equal(read(typo).amount, null, `"${typo}" writes nothing`);
   }
+});
+
+test('a budget of zero is a real amount, not a refusal or the same as clearing it', () => {
+  const read = text => model.budgetChange(null, { amount: text, currency: 'EUR' });
+  assert.equal(read('0').amount, 0);
+  assert.equal(read('0').problem, null);
+  assert.equal(read('0.00').amount, 0);
+  assert.equal(read('0').action, 'set', 'a typed 0 sets a budget; only a blank field clears one');
+});
+
+test('a budget right at numeric(12,2)’s limit is kept; the next cent over is refused', () => {
+  const read = text => model.budgetChange(null, { amount: text, currency: 'EUR' });
+  assert.equal(read('9999999999.99').amount, 9999999999.99);
+  assert.equal(read('9999999999.99').problem, null);
+  assert.match(String(read('10000000000').problem), /large/);
 });
 
 test('a budget form says whether it sets, changes, clears or leaves the budget', () => {

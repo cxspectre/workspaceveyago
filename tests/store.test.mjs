@@ -205,6 +205,111 @@ test('who is invited that did not load says so until a load works, then is asked
   assert.equal(asked, 2);
 });
 
+/* ── A project's own activity ─────────────────────────────────────────── */
+
+test('a project\'s activity loads when its page asks, once however often it is drawn, is drawn again when it lands, and is asked again after a write', async () => {
+  const asked = [];
+  let answer = [{ id: 'a1', text: 'New task · Draft copy' }];
+  const s = start(answers({ projectActivity: async id => { asked.push(id); return answer; } }));
+  assert.equal(s.store.projectActivity('p1').state, 'loading', 'nothing is asked before the workspace has loaded');
+  assert.deepEqual(asked, []);
+  await s.store.load();
+  assert.equal(s.store.projectActivity('p1').state, 'loading');
+  s.store.projectActivity('p1');
+  const drawn = s.read('renders') + s.read('idleRepaints');
+  await tick();
+  assert.deepEqual(asked, ['p1'], 'asked once, drawn or not');
+  const ready = s.store.projectActivity('p1');
+  assert.equal(ready.state, 'ready');
+  assert.equal(ready.activity[0].id, 'a1');
+  assert.ok(s.read('renders') + s.read('idleRepaints') > drawn, 'the page is drawn again once it lands');
+  answer = [];
+  await s.store.after(Promise.resolve());
+  assert.equal(s.store.projectActivity('p1').state, 'loading', 'a write may have added to it: asked again');
+  await tick();
+  assert.deepEqual(s.store.projectActivity('p1').activity, []);
+});
+
+test('a project\'s activity that did not load says so until a load works, then is asked for again', async () => {
+  let fail = true;
+  let asked = 0;
+  const s = start(answers({ projectActivity: async () => {
+    asked += 1;
+    if (fail) throw new Error('Could not load this project’s activity: Failed to fetch');
+    return [];
+  } }));
+  await s.store.load();
+  s.store.projectActivity('p1');
+  await tick();
+  assert.equal(s.store.projectActivity('p1').state, 'failed');
+  await tick();
+  assert.equal(asked, 1, 'a page drawn again does not ask again by itself');
+  fail = false;
+  await s.store.load();
+  s.store.projectActivity('p1');
+  await tick();
+  assert.equal(s.store.projectActivity('p1').state, 'ready');
+  assert.equal(asked, 2);
+});
+
+test('asking again for a project\'s activity that did not load clears only that failure', async () => {
+  const s = start(answers({ projectActivity: async () => { throw new Error('Could not load this project’s activity: Failed to fetch'); } }));
+  await s.store.load();
+  s.store.projectActivity('p1');
+  s.store.projectActivity('p2');
+  await tick();
+  assert.equal(s.store.projectActivity('p1').state, 'failed');
+  assert.equal(s.store.projectActivity('p2').state, 'failed');
+  s.store.retryProjectActivity('p1');
+  assert.equal(s.store.projectActivity('p1').state, 'loading', 'cleared, so asked again');
+  assert.equal(s.store.projectActivity('p2').state, 'failed', 'the other project\'s failure is untouched');
+});
+
+/* ── Archived projects ────────────────────────────────────────────────── */
+
+test('archived projects load when the Archived view first asks, once however often it is drawn, and are asked again after a write', async () => {
+  let asked = 0;
+  let answer = [{ id: 'p1', name: 'Old brief' }];
+  const s = start(answers({ archivedProjects: async () => { asked += 1; return answer; } }));
+  assert.equal(s.store.archivedProjects().state, 'loading', 'nothing is asked before the workspace has loaded');
+  await s.store.load();
+  assert.equal(s.store.archivedProjects().state, 'loading');
+  s.store.archivedProjects();
+  await tick();
+  assert.equal(asked, 1, 'asked once, drawn or not');
+  const ready = s.store.archivedProjects();
+  assert.equal(ready.state, 'ready');
+  assert.equal(ready.projects[0].name, 'Old brief');
+  answer = [];
+  await s.store.after(Promise.resolve());
+  assert.equal(s.store.archivedProjects().state, 'loading', 'restoring or archiving one changes this list: asked again');
+  await tick();
+  assert.deepEqual(s.store.archivedProjects().projects, []);
+});
+
+test('archived projects that did not load say so until asked again, or until a load works', async () => {
+  let fail = true;
+  let asked = 0;
+  const s = start(answers({ archivedProjects: async () => {
+    asked += 1;
+    if (fail) throw new Error('Could not load archived projects: Failed to fetch');
+    return [];
+  } }));
+  await s.store.load();
+  s.store.archivedProjects();
+  await tick();
+  assert.equal(s.store.archivedProjects().state, 'failed');
+  s.store.retryArchivedProjects();
+  assert.equal(s.store.archivedProjects().state, 'loading', 'cleared by the retry, so asked again');
+  await tick();
+  assert.equal(asked, 2);
+  fail = false;
+  await s.store.load();
+  s.store.archivedProjects();
+  await tick();
+  assert.equal(s.store.archivedProjects().state, 'ready');
+});
+
 test('a client\'s past meetings load when their page asks, once however often it is drawn, and it is drawn again when they land', async () => {
   const asked = [];
   const s = start(answers({ pastMeetings: async filter => { asked.push(filter); return { meetings: [{ id: 'e1', title: 'Kickoff' }], more: false }; } }));

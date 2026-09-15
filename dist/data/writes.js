@@ -89,16 +89,6 @@
       : 'Not saved: the workspace is still loading. Try again in a moment.');
   }
 
-  /* A new project or contact matches its typed client name against the
-     companies that loaded, and creates one when none matches. If companies
-     never arrived, it would quietly create a second one. A ticket only links
-     to what it finds, so it needs nothing. */
-  function missingFor(kind) {
-    /* A contact is added from crm-forms.js's dialog, which checks for itself. */
-    var needs = { projects: ['companies'] }[kind] || [];
-    return needs.filter(function (key) { return !window.workspaceStore.has(key); });
-  }
-
   /* Moving through a closed select with the arrow keys fires a change for every
      option passed (Chrome and Firefox on Windows and Linux). A status is saved
      once the choice settles, not once per key. */
@@ -109,6 +99,17 @@
     var shown = [].filter.call(select.options, function (o) { return o.defaultSelected; })[0];
     if (shown) select.value = shown.value;
   }
+
+  /* What a task's status was just before its checkbox marked it done — "in
+     progress" or "blocked" — so unticking it puts that back, instead of
+     always "to do": the one thing a done/not-done box can never say by
+     itself. Read from the box's own data-stored when it has one (tasks-ui.js
+     draws its row that way); the Overview's quick-focus box carries no
+     status at all, so a task ticked off there still reopens at "to do", as
+     it always has. Forgotten on a page reload, like every other
+     save-in-progress state this file keeps only in memory, not on disk. */
+  var wasBeforeDone = {};
+  var REOPEN_STATUSES = ['todo', 'in_progress', 'blocked'];
 
   /* A checkbox that has already flipped in the DOM but not yet in the database
      is a lie in progress; put it back until the write lands. */
@@ -131,16 +132,23 @@
     }
 
     var wanted = box.checked;
+    if (wanted && REOPEN_STATUSES.indexOf(box.dataset.stored) !== -1) wasBeforeDone[taskId] = box.dataset.stored;
+    var revertTo = wasBeforeDone[taskId];
+    if (!wanted) delete wasBeforeDone[taskId];
+
     /* In line with the task's status select (tasks-ui.js): a tick waits for a
        status on its way, and a status picked after it compares with the tick.
        Saved apart, the two raced, and the later answer won whatever was picked. */
     if (typeof tasksUi !== 'undefined' && typeof tasksUi.setStatus === 'function') {
-      tasksUi.setStatus(taskId, wanted ? 'done' : 'todo');
+      tasksUi.setStatus(taskId, wanted ? 'done' : (revertTo || 'todo'));
       return;
     }
     box.disabled = true;
+    var write = (!wanted && revertTo)
+      ? window.workspaceActions.setTaskDone(taskId, false, revertTo)
+      : window.workspaceActions.setTaskDone(taskId, wanted);
     window.workspaceStore
-      .after(window.workspaceActions.setTaskDone(taskId, wanted))
+      .after(write)
       .then(function () {
         if (typeof toast === 'function') toast(wanted ? 'Task completed' : 'Task reopened');
       })
@@ -385,9 +393,11 @@
     if (form.id === 'create-form') {
       e.stopImmediatePropagation();
       e.preventDefault();
-      /* One create per click. A double click, or Enter pressed twice, used to
-         look the company up twice before either insert landed: two companies,
-         two projects. */
+      /* Tickets only now — a contact is added from crm-forms.js's dialog, an
+         event from event-edit.js's, and a project from project-forms.js's,
+         each of which replaces createForm() for its own kind before this ever
+         runs. One create per click: a double click, or Enter pressed twice,
+         used to look the requester up twice before either insert landed. */
       if (form.dataset.pending === '1') return;
       var d = new FormData(form);
       var kind = form.dataset.kind;
@@ -395,24 +405,9 @@
       var context = String(d.get('context') || '').trim();
       var description = String(d.get('description') || '').trim();
       if (!name || !context) return;
-      var missing = missingFor(kind);
-      if (missing.length) {
-        fail(new Error('Not saved: ' + missing.join(' and ') + ' did not load, and without them this could ' +
-                       'create a duplicate. Try again once they have.'));
-        return;
-      }
 
       var A = window.workspaceActions;
       var lower = function (s) { return String(s || '').trim().toLowerCase(); };
-      /* Two companies with the same name: the person chooses, not the first in
-         the alphabet. Thrown inside the chain, so it arrives as a message. */
-      var companyNamed = function (n) {
-        var matches = projectsModel.matchCompanies(companies(), n);
-        if (matches.length > 1) {
-          throw new Error('More than one company is called "' + String(n).trim() + '". Rename one in the CRM, then try again.');
-        }
-        return matches.length ? matches[0].id : null;
-      };
       /* A ticket's requester: by address, or by a name only one contact has.
          Two with that name is a question for the person, not a guess. */
       var contactFor = function (n) {
@@ -474,23 +469,10 @@
           });
         });
 
-      } else if (kind === 'projects') {
-        /* A client name that is not in the CRM yet is a new client, not a
-           typo — that is what someone means when they type it here. */
-        work = Promise.resolve(context).then(companyNamed).then(function (id) {
-          if (id || /^internal/i.test(context)) return id;
-          return A.createCompany({ name: context, kind: 'client', stage: 'client' })
-                  .then(function (c) { return c.id; });
-        }).then(function (companyId) {
-          return A.createProject({
-            name: name, companyId: companyId, description: description,
-            code: name.charAt(0).toUpperCase(), accent: companyId ? 'client' : 'default'
-          });
-        });
-
       } else {
-        /* A new event is event-edit.js's own dialog, and a contact
-           crm-forms.js's. */
+        /* A new event is event-edit.js's own dialog, a contact crm-forms.js's,
+           and a project project-forms.js's — each replaces this form's
+           createForm() branch for its own kind before this ever runs. */
         return;
       }
 

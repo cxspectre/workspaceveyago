@@ -223,7 +223,7 @@ const projectsUi = (function () {
   function openArchive(p) {
     if (!isManager()) return;
     showModal('PROJECT · ARCHIVE', `<h2>Archive ${esc(p.name)}?</h2>`
-      + '<p class="form-note">It leaves the board and every list. Nothing is deleted: its tasks, tickets, meetings and notes are kept.</p>'
+      + '<p class="form-note">It leaves the board and every list. Nothing is deleted: its tasks, tickets, meetings and notes are kept, and it can be brought back from the Archived view.</p>'
       + dialogForm('project-archive-form', '', 'Archive project'));
     const form = document.getElementById('project-archive-form');
     form.addEventListener('submit', e => {
@@ -237,7 +237,52 @@ const projectsUi = (function () {
 
   const OPEN = Object.freeze({ edit: openEdit, ticket: openTicket, meeting: openMeeting, archive: openArchive });
 
+  /* ── Archived projects ─────────────────────────────────────────────── */
+  /* Archiving worked; nothing could see an archived project again, or bring
+     one back — the audit's own words for this were "can't be seen or
+     brought back". workspaceStore.archivedProjects() is where they are now
+     (workspace.js's Archived view draws the list; this is its Restore
+     button and the dialog behind it). Looked up there rather than in
+     `projects`, which never holds one. */
+  function archivedById(id) {
+    const store = window.workspaceStore;
+    const entry = store && typeof store.archivedProjects === 'function' ? store.archivedProjects() : { projects: [] };
+    return (entry.projects || []).find(p => p.id === id) || null;
+  }
+
+  function restoreButton(p) {
+    return isManager()
+      ? `<button type="button" class="btn" data-project-restore="${esc(p.id)}">Restore</button>`
+      : '';
+  }
+
+  function openRestore(p) {
+    if (!isManager()) return;
+    showModal('PROJECT · RESTORE', `<h2>Restore ${esc(p.name)}?</h2>`
+      + '<p class="form-note">It goes back onto the board, at the status it had when it was archived.</p>'
+      + dialogForm('project-restore-form', '', 'Restore project'));
+    const form = document.getElementById('project-restore-form');
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      submitting(form, saveKey('restore', p), () => workspaceActions.restoreProject(p.id), () => {
+        navigate('projects/' + p.id);
+        toast(`${p.name} is restored.`);
+      });
+    });
+  }
+
   document.addEventListener('click', e => {
+    const restore = e.target.closest && e.target.closest('[data-project-restore]');
+    if (restore) {
+      e.preventDefault();
+      if (!live()) { toast('Not yet: the workspace is still loading.'); return; }
+      const p = archivedById(restore.dataset.projectRestore);
+      if (!p) { toast('That project is not in the archive any more. Reload the page.'); return; }
+      if (saving.has(saveKey('restore', p))) { toast('Still saving the last one — a moment.'); return; }
+      openRestore(p);
+      return;
+    }
+
     const target = e.target.closest
       && e.target.closest('[data-project-edit], [data-project-ticket], [data-project-meeting], [data-project-archive]');
     if (!target) return;
@@ -250,5 +295,5 @@ const projectsUi = (function () {
     OPEN[action](p);
   });
 
-  return Object.freeze({ actions });
+  return Object.freeze({ actions, restoreButton });
 })();

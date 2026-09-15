@@ -247,6 +247,18 @@ body.mail-mode .reader-compose .composer-editor { flex: 1; min-height: 240px; ma
 /* The CRM pipeline: a column for each of the six stages a company can be at,
    with what the column is worth in each currency under its heading. */
 .project-board.stage-board.crm-board { grid-template-columns: repeat(6, minmax(220px, 1fr)); }
+/* A laptop (1250–1440px) sits between the two .project-board breakpoints
+   above and below: wide enough that neither one's plain .project-board rule
+   ever wins against this compound selector's higher specificity, narrow
+   enough that five columns — six for the CRM pipeline — at 230/220px do not
+   fit the content area next to the sidebar. The board still scrolled, but
+   most of a laptop's width showed one card mostly cut off at the right
+   edge with nothing to suggest more sat past it. Narrower cards fit what a
+   laptop actually has without losing the wider ones' breathing room. */
+@media (max-width: 1440px) {
+  .project-board.stage-board { grid-template-columns: repeat(5, minmax(170px, 1fr)); }
+  .project-board.stage-board.crm-board { grid-template-columns: repeat(6, minmax(160px, 1fr)); }
+}
 .crm-board .board-total { margin: 0 2px 10px; color: #66758a; font-size: .8125rem; font-variant-numeric: tabular-nums; }
 /* The role chip is painted in once someone has signed in. */
 .demo-label:empty { display: none; }
@@ -261,18 +273,24 @@ body.mail-mode .reader-compose .composer-editor { flex: 1; min-height: 240px; ma
 
 /* ── A project's team, client people and files (0039) ─────────────────── */
 .plain-list { list-style: none; margin: 10px 0 0; padding: 0; }
-.team-person, .client-person, .file-row { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: .875rem; }
-.team-person:last-child, .client-person:last-child, .file-row:last-child { border-bottom: 0; }
+.team-person, .client-person, .file-row, .archived-project-row { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: .875rem; }
+.team-person:last-child, .client-person:last-child, .file-row:last-child, .archived-project-row:last-child { border-bottom: 0; }
 .team-name { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; }
 .team-name small { color: #7a828e; font-size: .75rem; }
-.client-person-name, .file-name { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-.client-person-name small, .file-name small, .file-name strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.client-person-name small, .file-name small { color: #7a828e; font-size: .75rem; }
+.client-person-name, .file-name, .archived-project-name { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.client-person-name small, .file-name small, .file-name strong, .archived-project-name small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.client-person-name small, .file-name small, .archived-project-name small { color: #7a828e; font-size: .75rem; }
 .client-person select, .inline-add select { min-width: 0; border: 1px solid #e0e7f0; border-radius: 10px; background: #f8fafc; padding: 7px 9px; font-size: .8125rem; }
 .client-person select { max-width: 9.5rem; }
 .inline-add { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .inline-add select { flex: 1 1 8rem; }
-.file-pick { cursor: pointer; margin: 6px 0 0; }
+.file-pick { cursor: pointer; margin: 0; }
+/* The status line beside "Add files" (project-panels.js) replaced a run of
+   toast() calls that outran each other on a quick multi-file upload — see
+   its own comment there. Reserving its line height keeps the row from
+   jumping as the text comes and goes. */
+.file-pick-row { display: flex; align-items: center; gap: 12px; margin: 6px 0 0; flex-wrap: wrap; }
+.file-upload-status { min-height: 1.2em; }
 @media (max-width: 520px) { .form-row, .form-row.form-row-two { grid-template-columns: 1fr; gap: 0; } }
 
 /* ── Compose, after review ─────────────────────────────────────────────── */
