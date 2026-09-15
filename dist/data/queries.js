@@ -561,11 +561,22 @@
     },
 
     /* ── Finance (managers only — RLS returns [] for everyone else) ──── */
+    /* updated_at, tax_rate and tax_amount, and each invoice's line items
+       (0060): finance-model.js's shapeInvoice() does not know any of these —
+       it is a peer file, tested and not touched here — but every shaped
+       invoice keeps the full row under `row`, which is where finance-ui.js
+       reads them from. Lines come back oldest-sort-order first, the way an
+       invoice reads down the page; an invoice with none (every one made
+       before 0060 was backfilled with the one line invoice-pdf.ts prints for
+       it, so this is really "not yet re-read", not "blank"). */
     async invoices() {
       var rows = unwrap(await sb()
         .from('finance_invoices')
-        .select('id, number, client, client_email, amount, currency, status, issued_on, due_on, paid_on, notes')
-        .order('issued_on', { ascending: false, nullsFirst: false }), 'invoices');
+        .select('id, number, client, client_email, amount, currency, status, issued_on, due_on, paid_on, notes, ' +
+                'updated_at, tax_rate, tax_amount, ' +
+                'finance_invoice_lines (id, description, quantity, unit_amount, amount, sort_order)')
+        .order('issued_on', { ascending: false, nullsFirst: false })
+        .order('sort_order', { foreignTable: 'finance_invoice_lines', ascending: true }), 'invoices');
       return rows.map(function (r) {
         return {
           id: r.number, uuid: r.id, client: r.client,
@@ -575,14 +586,21 @@
       });
     },
 
+    /* Every transaction in the window, a page at a time (everyRow): the plain
+       .limit()-less query this replaced stopped at Supabase's 1000-row cap
+       without a word once an account had more than that many in range. */
     async transactions(sinceISODate) {
       var since = sinceISODate ||
         new Date(Date.now() - 180 * 86400000).toISOString().slice(0, 10);
-      return unwrap(await sb()
-        .from('finance_transactions')
-        .select('id, posted_at, description, counterparty, amount, currency, status, source')
-        .gte('posted_at', since)
-        .order('posted_at', { ascending: false }), 'transactions');
+      return everyRow(function (from, to) {
+        return sb()
+          .from('finance_transactions')
+          .select('id, posted_at, description, counterparty, amount, currency, status, source, kind')
+          .gte('posted_at', since)
+          .order('posted_at', { ascending: false })
+          .order('id')
+          .range(from, to);
+      }, 'transactions');
     },
 
     /* ── Company ─────────────────────────────────────────────────────── */

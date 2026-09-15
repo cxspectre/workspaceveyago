@@ -43,11 +43,17 @@ function target(attributes) {
 /* The page, and what its buttons and dialogs do: the dialog showModal() is
    given is kept with the values a test fills in, and the writes are recorded.
    refuse: the database refuses the invoice writes. */
-function start({ list = [], route = ['finance'], contacts = [], loaded = ['invoices', 'revenueMix'], overview = null, mix = [], manager = true, refuse = false, live = true } = {}) {
+function start({
+  list = [], route = ['finance'], contacts = [], loaded = ['invoices', 'revenueMix'], overview = null, mix = [],
+  manager = true, refuse = false, live = true, query = '', range = '6 months',
+  transactions = { state: 'ready', rows: [] }
+} = {}) {
   const listeners = {};
   const toasts = [];
   const modals = [];
   const calls = [];
+  const queries = { finance: query };
+  let txState = transactions;
   /* The buttons given focus on the page, by selector. */
   const focused = [];
   let form = null;
@@ -122,6 +128,15 @@ function start({ list = [], route = ['finance'], contacts = [], loaded = ['invoi
     financeTab: 'overview',
     invoices: list,
     contacts,
+    /* workspace.js's own state: the search box's text, kept across repaints
+       (queryInput reads and writes it exactly as the real one does), and the
+       revenue chart's own 6/12-month toggle, which the transactions panel
+       shares so the two never disagree about what window they show. */
+    queries,
+    queryInput: (key, placeholder) =>
+      `<div class="list-search"><input type="search" data-query="${key}" aria-label="${escape(placeholder)}" placeholder="${escape(placeholder)}" value="${escape(queries[key])}"></div>`,
+    range,
+    repaintKeepingFocus: () => {},
     workspaceStore: {
       has: part => loaded.includes(part),
       state: { overview, revenueMix: mix, loaded: live },
@@ -129,7 +144,9 @@ function start({ list = [], route = ['finance'], contacts = [], loaded = ['invoi
          loaded and the page drawn again before anyone is told; a refusal is
          said in a toast unless the caller says it itself ({ toast: false }),
          and passed on. */
-      after: (work, options) => Promise.resolve(work).then(value => { draw(); return value; }, err => { if (!(options && options.toast === false)) toasts.push(err.message); throw err; })
+      after: (work, options) => Promise.resolve(work).then(value => { draw(); return value; }, err => { if (!(options && options.toast === false)) toasts.push(err.message); throw err; }),
+      transactions: since => { calls.push(['transactions', since]); return txState; },
+      retryTransactions: since => { calls.push(['retryTransactions', since]); }
     },
     financeView: () => 'the page app.js drew'
   });
@@ -167,6 +184,22 @@ test('what anyone typed into an invoice stays text: in the list, the figures, th
   const alone = load({ list: [typed], route: ['finance', U1] })();
   assert.doesNotMatch(alone, MARKUP, 'and with no contact at that address');
   assert.match(alone, /<p>&lt;img src=x onerror=alert\(1\)&gt;<\/p>/);
+
+  const itemised = invoice({ finance_invoice_lines: [{ id: 'l1', description: TYPED, quantity: 1, unit_amount: 1, amount: 1 }] });
+  const linesPage = load({ list: [itemised], route: ['finance', U1] })();
+  assert.doesNotMatch(linesPage, MARKUP, 'a line item\'s own description');
+  assert.match(linesPage, /<td>&lt;img src=x onerror=alert\(1\)&gt;<\/td>/);
+
+  const query = load({ list: [invoice()], route: ['finance', 'invoices'], query: TYPED })();
+  assert.doesNotMatch(query, MARKUP, 'the search box carries back what was typed, escaped');
+  assert.match(query, /value="&lt;img src=x onerror=alert\(1\)&gt;"/);
+});
+
+test('what anyone types on a bank or card statement stays text on the transactions panel', () => {
+  const rows = [{ id: 't1', posted_at: '2026-09-01', description: TYPED, counterparty: TYPED, kind: TYPED, amount: '1', currency: 'USD' }];
+  const page = load({ transactions: { state: 'ready', rows } })();
+  assert.doesNotMatch(page, MARKUP);
+  assert.match(page, /&lt;img src=x onerror=alert\(1\)&gt;/);
 });
 
 test('a row opens its invoice by its uuid, in lower case, and the invoice number is a link to it', () => {
@@ -226,6 +259,62 @@ test('the invoice table is named by its heading, and the column that opens a row
   assert.match(html, /<h2 id="finance-invoices-heading">Recent invoices <span class="small-count">1<\/span><\/h2>/);
   assert.match(html, /<table class="module-table" aria-labelledby="finance-invoices-heading">/);
   assert.match(html, /<th><span class="sr-only">Open<\/span><\/th>/);
+});
+
+/* ── The document: matching invoice-pdf.ts, tax, lines, last changed ─────── */
+
+test('the printed invoice gives Veyago\'s real registered address and EIN, matching invoice-pdf.ts, never "New York"', () => {
+  const page = load({ list: [invoice()], route: ['finance', U1] })();
+  assert.match(page, /54 State Street, Ste 804 #17055/);
+  assert.match(page, /Albany, NY 12207, USA/);
+  assert.match(page, /EIN 30-1492188/);
+  assert.doesNotMatch(page, /New York/, 'the page used to disagree with the real document about where Veyago is');
+  assert.match(page, /The document the client actually received.+is the PDF sent from the admin/,
+    'and says plainly that payment itself — the real document\'s bank details — is not reproduced here');
+});
+
+test('an invoice\'s lines are drawn in the order they arrive — queries.js already asked the database for sort_order — and tax is one more row after them', () => {
+  /* Not re-sorted here: the query (queries.js invoices()) already orders by
+     sort_order, and doing it again client-side would be a second place that
+     could disagree with the first about what "in order" means. */
+  const lines = [
+    { id: 'l1', description: 'Design', quantity: '2.00', unit_amount: '100.00', amount: '200.00', sort_order: 0 },
+    { id: 'l2', description: 'Development', quantity: '10.00', unit_amount: '100.00', amount: '1000.00', sort_order: 1 }
+  ];
+  const page = load({ list: [invoice({ finance_invoice_lines: lines, tax_rate: '8.875', tax_amount: '106.50' })], route: ['finance', U1] })();
+  const design = page.indexOf('Design');
+  const development = page.indexOf('Development');
+  const tax = page.indexOf('Tax (8.875%)');
+  assert.ok(design > -1 && development > design, 'the array\'s own order, not re-sorted');
+  assert.ok(tax > development, 'tax comes after the lines');
+  assert.match(page, /<td>Design<\/td><td>2<\/td><td>\$200\.00<\/td>/, 'a whole quantity has no ".00" nailed onto it, unlike an amount, which always keeps its cents');
+  assert.match(page, /<td>Development<\/td><td>10<\/td><td>\$1,000\.00<\/td>/);
+  assert.match(page, /<td colspan="2">Tax \(8\.875%\)<\/td><td>\$106\.50<\/td>/);
+});
+
+test('an invoice with no lines recorded yet still shows its own description and total as its one line, and no tax row', () => {
+  const page = load({ list: [invoice({ notes: 'Site build', finance_invoice_lines: [] })], route: ['finance', U1] })();
+  assert.match(page, /<td>Site build<\/td><td>1<\/td><td>\$1,234\.50<\/td>/);
+  assert.doesNotMatch(page, /Tax \(/);
+  assert.doesNotMatch(page, /<td colspan="2">Tax<\/td>/, 'no tax_amount recorded means no tax row at all');
+});
+
+test('a quantity or a tax rate that is not a number does not throw, and reads as a dash or a bare "Tax"', () => {
+  const page = load({
+    list: [invoice({
+      finance_invoice_lines: [{ id: 'l1', description: 'Odd row', quantity: 'not-a-number', unit_amount: 1, amount: 5 }],
+      tax_amount: '12.00', tax_rate: null
+    })], route: ['finance', U1]
+  })();
+  assert.match(page, /<td>Odd row<\/td><td>—<\/td>/);
+  assert.match(page, /<td colspan="2">Tax<\/td><td>\$12\.00<\/td>/, 'a rate that is not recorded says only "Tax"');
+});
+
+test('the invoice\'s aside says when it last changed, or a dash before that ever arrives', () => {
+  const changed = load({ list: [invoice({ updated_at: '2026-09-01T10:00:00Z' })], route: ['finance', U1] })();
+  assert.match(changed, /<span>Last changed<\/span><div>Sep 1<\/div>/);
+  const none = load({ list: [invoice({ updated_at: null })], route: ['finance', U1] })();
+  assert.match(none, /<span>Last changed<\/span><div>—<\/div>/);
 });
 
 test('an invoice page finds its client by the invoice address, never by a company name two clients can share', () => {
@@ -413,4 +502,153 @@ test('the revenue mix draws each category in the colour the model gives it, with
   assert.match(html, /<i style="width:25%;background:#2a78d6"><\/i><i style="width:75%;background:#eb6834"><\/i>/,
     'in name order: Build, then Design');
   assert.match(html, /Build<\/span><strong>\$100\.00<\/strong><small>25%<\/small>/);
+});
+
+/* ── Recent transactions, on the Overview tab (0060) ──────────────────────── */
+
+test('recent transactions are drawn on the Overview tab, in the chart\'s own window, signed rather than coloured', () => {
+  const rows = [
+    { id: 't1', posted_at: '2026-09-10', description: 'Client wire', counterparty: 'Northline', amount: '1200.00', currency: 'USD', kind: 'income' },
+    { id: 't2', posted_at: '2026-09-05', description: 'AWS', counterparty: null, amount: '-45.00', currency: 'USD', source: 'mercury' }
+  ];
+  const h = start({ transactions: { state: 'ready', rows } });
+  const page = h.view();
+  assert.match(page, /<h2>Recent transactions<\/h2><span class="quiet-text">Last 6 months<\/span>/);
+  assert.match(page, /<td>Sep 10<\/td><td><div class="cell-main"><div><strong>Client wire<\/strong><small>Northline<\/small><\/div><\/div><\/td><td>Income<\/td><td>\$1,200\.00<\/td>/);
+  assert.match(page, /<td>Sep 5<\/td><td><div class="cell-main"><div><strong>AWS<\/strong><\/div><\/div><\/td><td>Mercury<\/td><td>-\$45\.00<\/td>/,
+    'no kind recorded falls back to the sync source, capitalised the same way');
+  assert.deepEqual(h.calls.filter(c => c[0] === 'transactions').at(-1), ['transactions', '2026-03-18'], 'six months back from financeDay(), not the machine clock');
+});
+
+test('the 12-month range the chart itself is on asks for a wider window, and says so', () => {
+  const h = start({ range: '12 months', transactions: { state: 'ready', rows: [] } });
+  assert.match(h.view(), /Last 12 months/);
+  assert.deepEqual(h.calls.filter(c => c[0] === 'transactions').at(-1), ['transactions', '2025-09-19']);
+});
+
+test('transactions still loading, or that did not load, say so; a retry asks the store again', () => {
+  const loading = load({ transactions: { state: 'loading', rows: [] } })();
+  assert.match(loading, /Loading transactions/);
+  assert.doesNotMatch(loading, /table/);
+
+  const empty = load({ transactions: { state: 'ready', rows: [] } })();
+  assert.match(empty, /No transactions in this window\./);
+
+  const h = start({ transactions: { state: 'failed', rows: [] } });
+  assert.match(h.view(), /Transactions did not load\./);
+  h.click({ 'data-finance-tx-retry': '' });
+  assert.deepEqual(h.calls.filter(c => c[0] === 'retryTransactions'), [['retryTransactions', '2026-03-18']]);
+});
+
+test('more than twenty transactions shows the twenty most recent and says how many there are in all', () => {
+  const rows = Array.from({ length: 25 }, (_, i) => ({ id: `t${i}`, posted_at: '2026-09-01', description: `Row ${i}`, amount: '1', currency: 'USD' }));
+  const page = load({ transactions: { state: 'ready', rows } })();
+  assert.equal([...page.matchAll(/<tr><td>Sep 1<\/td>/g)].length, 20);
+  assert.match(page, /Showing the 20 most recent of 25\./);
+});
+
+test('the transactions panel is only on the Overview tab, not the Invoices tab', () => {
+  const page = load({ list: [invoice()], route: ['finance', 'invoices'], transactions: { state: 'ready', rows: [{ id: 't1', posted_at: '2026-09-01', description: 'Should not appear', amount: '1', currency: 'USD' }] } })();
+  assert.doesNotMatch(page, /Recent transactions/);
+  assert.doesNotMatch(page, /Should not appear/);
+});
+
+/* ── The Invoices tab: search, a status filter, sortable columns, paging (0060) ── */
+
+/* Three invoices, each a distinct id, number, client, amount and status —
+   what a search, a filter and a sort each need to tell apart. */
+function ledger() {
+  return [
+    invoice({ id: U1, number: 'INV-1042', client: 'Harbor & Co', amount: '1234.50', status: 'sent', due_on: '2026-09-20', paid_on: null }),
+    invoice({ id: U2, number: 'INV-2001', client: 'Acme', amount: '500.00', status: 'paid', due_on: '2026-08-01', paid_on: '2026-09-05' }),
+    invoice({ id: '9f2c4a3b-4d5e-4f60-8a7b-9c0d1e2f3a4c', number: 'INV-1500', client: 'Zenith', amount: '9999.00', status: 'draft', due_on: null, paid_on: null })
+  ];
+}
+
+test('the Invoices tab can be searched — by number, client or address — and says how many matched', () => {
+  const h = start({ list: ledger(), route: ['finance', 'invoices'], query: 'harbor' });
+  const page = h.view();
+  assert.match(page, /Invoices <span class="small-count">1<\/span>/);
+  assert.match(page, /INV-1042/);
+  assert.doesNotMatch(page, /INV-2001/);
+  assert.doesNotMatch(page, /INV-1500/);
+});
+
+test('a search that matches nothing says so, without a table of headings — different words from an empty ledger', () => {
+  const some = load({ list: ledger(), route: ['finance', 'invoices'], query: 'not a real client' })();
+  assert.match(some, /No invoices match\. Try another search or status\./);
+  assert.doesNotMatch(some, /<table/);
+  const none = load({ list: [], route: ['finance', 'invoices'] })();
+  assert.match(none, /No invoices yet\./);
+});
+
+test('the Invoices tab while invoices have not loaded yet offers no search box, and says so, not an empty table', () => {
+  const page = load({ list: ledger(), route: ['finance', 'invoices'], loaded: [] })();
+  assert.match(page, /Invoices did not load\. They are tried again by themselves\./);
+  assert.doesNotMatch(page, /data-query="finance"/);
+  assert.doesNotMatch(page, /data-finance-status/);
+  assert.match(page, /Invoices <span class="small-count">—<\/span>/);
+});
+
+test('the Invoices tab can be filtered to one status', () => {
+  const h = start({ list: ledger(), route: ['finance', 'invoices'] });
+  const page = h.view();
+  assert.match(page, /data-finance-status="" class="active" aria-pressed="true">All statuses/);
+  h.click({ 'data-finance-status': 'paid' });
+  const filtered = h.view();
+  assert.match(filtered, /Invoices <span class="small-count">1<\/span>/);
+  assert.match(filtered, /INV-2001/);
+  assert.doesNotMatch(filtered, /INV-1042/);
+  assert.match(filtered, /data-finance-status="paid" class="active" aria-pressed="true">Paid/);
+});
+
+test('a column can be sorted, and sorting it again reverses it', () => {
+  const h = start({ list: ledger(), route: ['finance', 'invoices'] });
+  h.click({ 'data-finance-sort': 'amount' });
+  const asc = h.view();
+  const order = n => asc.indexOf(n);
+  assert.ok(order('INV-2001') < order('INV-1042') && order('INV-1042') < order('INV-1500'), 'ascending: 500, 1234.50, 9999');
+  assert.match(asc, /<th aria-sort="ascending"><button type="button" class="sort-header" data-finance-sort="amount">Amount ▲<\/button><\/th>/);
+
+  h.click({ 'data-finance-sort': 'amount' });
+  const desc = h.view();
+  const order2 = n => desc.indexOf(n);
+  assert.ok(order2('INV-1500') < order2('INV-1042') && order2('INV-1042') < order2('INV-2001'), 'the same column again reverses it');
+  assert.match(desc, /aria-sort="descending"/);
+
+  h.click({ 'data-finance-sort': 'client' });
+  const byClient = h.view();
+  assert.match(byClient, /data-finance-sort="client">Client ▲/, 'a different column starts ascending again');
+});
+
+test('sorting by "Due / paid" reads whichever date the column itself shows: paid_on once paid, due_on otherwise', () => {
+  const h = start({ list: ledger(), route: ['finance', 'invoices'] });
+  h.click({ 'data-finance-sort': 'due' });
+  const page = h.view();
+  const order = n => page.indexOf(n);
+  /* INV-2001 paid 2026-09-05; INV-1042 due 2026-09-20; INV-1500 (draft) has no date at all, and sorts first as the empty string. */
+  assert.ok(order('INV-1500') < order('INV-2001') && order('INV-2001') < order('INV-1042'));
+});
+
+test('a page of invoices, not all of them at once: "Show more" reveals the rest, and a new search starts over at the first page', () => {
+  const many = Array.from({ length: 51 }, (_, i) => invoice({ id: `a0000000-0000-4000-8000-${String(i).padStart(12, '0')}`, number: `INV-${1000 + i}` }));
+  const h = start({ list: many, route: ['finance', 'invoices'] });
+  const first = h.view();
+  assert.equal([...first.matchAll(/<tr data-action="invoice"/g)].length, 50);
+  assert.match(first, /Show 1 more<\/button> — showing 50 of 51/);
+  h.click({ 'data-finance-more': '' });
+  const all = h.view();
+  assert.equal([...all.matchAll(/<tr data-action="invoice"/g)].length, 51);
+  assert.doesNotMatch(all, /list-limit/);
+
+  h.click({ 'data-finance-status': 'draft' });
+  const filteredAfterPaging = h.view();
+  assert.doesNotMatch(filteredAfterPaging, /list-limit/, 'a filter that leaves fewer than a page needs no "Show more" left over from before');
+});
+
+test('the Overview tab\'s own "Recent invoices" has none of the Invoices tab\'s controls', () => {
+  const page = load({ list: ledger() })();
+  assert.doesNotMatch(page, /data-finance-status/);
+  assert.doesNotMatch(page, /data-finance-sort/);
+  assert.match(page, /Recent invoices <span class="small-count">3<\/span>/);
 });
