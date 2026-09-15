@@ -63,7 +63,13 @@ const companyForms = (function () {
 
   function openInvite() {
     if (!ready()) return;
-    const roles = M.inviteForm({}, viewer(), team).roles;
+    /* The button that opens this is already manager-only; asked directly —
+       a stale page, a crafted click — the same rule that would refuse the
+       send refuses opening the dialog at all, exactly as openEmployeeChange
+       already does for a change nothing here would accept. */
+    const blank = M.inviteForm({}, viewer(), team);
+    if (blank.refusal) { toast(blank.refusal); return; }
+    const roles = blank.roles;
     showModal('COMPANY · INVITE', '<h2>Invite someone</h2>'
       + '<p class="form-note">They get an email to set a password and sign in.</p>'
       + dialogForms.form('invite-form',
