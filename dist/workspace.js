@@ -103,8 +103,15 @@ document.addEventListener('click', e => {
   render();
 }, true);
 
-document.addEventListener('click',e=>{const view=e.target.closest('[data-view]');if(view){const {view:key,value}=view.dataset;if(key==='ticketScope')ticketScope=value;if(key==='projectMode')projectMode=value;if(key==='agendaMode')agendaMode=value;repaintKeepingFocus();return;}const star=e.target.closest('[data-star]');if(star){mails[Number(star.dataset.star)].starred=!mails[Number(star.dataset.star)].starred;render();return;}if(e.target.closest('[data-print-invoice]'))window.print();});
-document.addEventListener('change',e=>{const target=e.target;if(target.matches('[data-project-task]')){e.stopImmediatePropagation();const p=projects.find(p=>String(p.id)===target.dataset.projectTask),i=Number(target.dataset.task);p.checked??=[];p.checked=target.checked?[...new Set([...p.checked,i])]:p.checked.filter(n=>n!==i);activityRecord((target.checked?'Completed: ':'Reopened: ')+p.tasks[i]);render();toast(target.checked?'Task completed':'Task reopened');return;}if(target.matches('[data-record-kind]')){const {recordKind:kind,recordId,field}=target.dataset;const collection={tickets,projects,crm:contacts}[kind];const record=collection.find(r=>String(r.id)===String(recordId));if(record){record[field]=target.value;activityRecord('Updated '+(record.title||record.name));render();toast('Updated in this demo session');}return;}if(target.id==='compact-setting'||target.id==='motion-setting'){const compact=target.id==='compact-setting';document.body.classList.toggle(compact?'compact':'no-motion',compact?target.checked:!target.checked);try{localStorage.setItem(compact?'veyago-compact':'veyago-motion',String(target.checked));}catch{}toast('Preference updated');}},true);
+document.addEventListener('click',e=>{const view=e.target.closest('[data-view]');if(view){const {view:key,value}=view.dataset;if(key==='ticketScope')ticketScope=value;if(key==='projectMode')projectMode=value;if(key==='agendaMode')agendaMode=value;repaintKeepingFocus();return;}if(e.target.closest('[data-print-invoice]'))window.print();});
+/* The last resort, once writes.js — which loads first and claims every field
+   and tick it knows how to save for real — has had its turn: a record field
+   or a task tick that reaches here has no write behind it (a new select this
+   handler was never taught, or workspaceStore itself missing). It used to
+   flip the value in memory and say "Updated in this demo session" or "Task
+   completed", which looked like it worked; now it changes nothing and says
+   so, so the gap is noticed rather than silently shipped. */
+document.addEventListener('change',e=>{const target=e.target;if(target.matches('[data-project-task]')||target.matches('[data-record-kind]')){e.stopImmediatePropagation();render();toast('Not saved: nothing here is connected yet.');return;}if(target.id==='compact-setting'||target.id==='motion-setting'){const compact=target.id==='compact-setting';document.body.classList.toggle(compact?'compact':'no-motion',compact?target.checked:!target.checked);try{localStorage.setItem(compact?'veyago-compact':'veyago-motion',String(target.checked));}catch{}toast('Preference updated');}},true);
 /* Notes and ticket replies are saved by data/writes.js, and tasks added by tasks-ui.js. */
 
 projectRows = function(){
