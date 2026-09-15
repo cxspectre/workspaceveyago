@@ -711,6 +711,66 @@ test('a blank enquiry field reads as empty text, never null in the page', async 
   assert.equal(enquiry.status, 'Spam');
 });
 
+/* ── Finance ──────────────────────────────────────────────────────────── */
+
+test('an invoice arrives with when it last changed, its tax and its lines, oldest line first', async () => {
+  const { data, queries } = loadTables(table => (table !== 'finance_invoices' ? [] : [{
+    id: 'inv-1', number: 'INV-1042', client: 'Northline', amount: 1200, currency: 'USD', status: 'sent',
+    updated_at: '2026-09-10T12:00:00Z', tax_rate: 8.875, tax_amount: 106.5,
+    finance_invoice_lines: [
+      { id: 'line-2', description: 'Development', quantity: 10, unit_amount: 100, amount: 1000, sort_order: 1 },
+      { id: 'line-1', description: 'Design', quantity: 2, unit_amount: 100, amount: 200, sort_order: 0 }
+    ]
+  }]));
+  const [invoice] = await data.invoices();
+  assert.equal(invoice.row.updated_at, '2026-09-10T12:00:00Z');
+  assert.equal(invoice.row.tax_rate, 8.875);
+  assert.equal(invoice.row.tax_amount, 106.5);
+  assert.equal(invoice.row.finance_invoice_lines.length, 2, 'the row carries the lines exactly as fetched');
+  const select = queries[0].calls.find(([method]) => method === 'select')[1];
+  ['updated_at', 'tax_rate', 'tax_amount'].forEach(column =>
+    assert.ok(select.includes(column), `${column} is asked for`));
+  assert.ok(select.includes('finance_invoice_lines'), 'the lines are embedded, not fetched separately');
+  assert.ok(queries[0].calls.some(call => call[0] === 'order' && call[1] === 'sort_order'
+    && call[2] && call[2].foreignTable === 'finance_invoice_lines' && call[2].ascending === true),
+    'lines come back in the order the invoice lists them, not however finance_invoice_lines happens to be stored');
+});
+
+test('an invoice with no lines yet — every one made before 0060 has at least one, but a test row need not — is not asked to have any', async () => {
+  const { data } = loadTables(table => (table !== 'finance_invoices' ? [] : [{
+    id: 'inv-2', number: 'INV-1043', client: 'Acme', amount: 500, currency: 'USD', status: 'draft',
+    updated_at: null, tax_rate: null, tax_amount: null, finance_invoice_lines: []
+  }]));
+  const [invoice] = await data.invoices();
+  assert.deepEqual(invoice.row.finance_invoice_lines, []);
+  assert.equal(invoice.row.tax_rate, null);
+});
+
+test('every transaction in the window loads, past the thousand rows the API hands back at once, in a fixed order', async () => {
+  let served = 0;
+  const { data, queries } = loadTables(table => {
+    if (table !== 'finance_transactions') return [];
+    served += 1;
+    return served === 1
+      ? Array.from({ length: 1000 }, (_, i) => ({ id: `tx${i}`, posted_at: '2026-09-01', amount: 10, currency: 'USD' }))
+      : [{ id: 'tx-last', posted_at: '2026-08-01', amount: -5, currency: 'USD' }];
+  });
+  const rows = await data.transactions('2026-01-01');
+  assert.equal(rows.length, 1001);
+  assert.equal(rows[1000].id, 'tx-last');
+  assert.deepEqual(queries.map(q => q.calls.filter(([method]) => method === 'range').map(call => call.slice(1).join('-'))), [['0-999'], ['1000-1999']]);
+  assert.ok(queries[0].calls.some(call => call.join(' ') === 'gte posted_at 2026-01-01'), 'the window given is the one asked for');
+  assert.ok(queries[0].calls.some(call => call[0] === 'order' && call[1] === 'id'), 'pages in a fixed order do not overlap');
+});
+
+test('with no window given, transactions default to the last 180 days', async () => {
+  const { data, queries } = loadTables(() => []);
+  await data.transactions();
+  const since = queries[0].calls.find(([method]) => method === 'gte')[2];
+  const expected = new Date(Date.now() - 180 * 86400000).toISOString().slice(0, 10);
+  assert.equal(since, expected);
+});
+
 test('an amount is written in its currency, and a code Intl cannot format goes beside it rather than throwing', () => {
   const { data } = load(() => ({ data: null, error: null }));
   assert.equal(data.money(1200, 'eur'), '€1,200');

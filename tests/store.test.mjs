@@ -310,6 +310,66 @@ test('archived projects that did not load say so until asked again, or until a l
   assert.equal(s.store.archivedProjects().state, 'ready');
 });
 
+/* ── Transactions (0060) ──────────────────────────────────────────────── */
+
+test('transactions load for a window when Finance\'s own page asks, once however often it is drawn, and it is drawn again when they land', async () => {
+  const asked = [];
+  const s = start(answers({ transactions: async since => { asked.push(since); return [{ id: 'tx1', amount: -20 }]; } }));
+  assert.equal(s.store.transactions('2026-01-01').state, 'loading', 'nothing is asked before the workspace has loaded');
+  assert.deepEqual(asked, []);
+  await s.store.load();
+  const repaintsBefore = s.read('idleRepaints');
+  assert.equal(s.store.transactions('2026-01-01').state, 'loading');
+  s.store.transactions('2026-01-01');
+  await tick();
+  assert.deepEqual(asked, ['2026-01-01'], 'asked once');
+  const ready = s.store.transactions('2026-01-01');
+  assert.equal(ready.state, 'ready');
+  assert.deepEqual(ready.rows.map(r => r.id), ['tx1']);
+  assert.ok(s.read('idleRepaints') > repaintsBefore, 'the page is drawn again once they land, as a background repaint that keeps what is being typed');
+  s.store.transactions('2026-06-01');
+  await tick();
+  assert.equal(asked.length, 2, 'a different window asks again');
+});
+
+test('transactions that did not load say so until asked again, and a write asks for them afresh', async () => {
+  let fail = true;
+  let asked = 0;
+  const s = start(answers({ transactions: async () => {
+    asked += 1;
+    if (fail) throw new Error('Could not load transactions: Failed to fetch');
+    return [];
+  } }));
+  await s.store.load();
+  s.store.transactions('2026-01-01');
+  await tick();
+  assert.equal(s.store.transactions('2026-01-01').state, 'failed');
+  await tick();
+  assert.equal(asked, 1, 'a failure is not asked again by every draw of the page');
+  fail = false;
+  s.store.retryTransactions('2026-01-01');
+  s.store.transactions('2026-01-01');
+  await tick();
+  assert.equal(s.store.transactions('2026-01-01').state, 'ready');
+  assert.equal(asked, 2);
+  await s.store.after(Promise.resolve({}));
+  s.store.transactions('2026-01-01');
+  await tick();
+  assert.equal(asked, 3, 'after a write they are asked for again: what was written may be among them');
+});
+
+test('a write that failed clears transactions too: it may still have changed something', async () => {
+  let asked = 0;
+  const s = start(answers({ transactions: async () => { asked += 1; return []; } }));
+  await s.store.load();
+  s.store.transactions('2026-01-01');
+  await tick();
+  await assert.rejects(s.store.after(Promise.reject(new Error('That was not saved.'))));
+  s.store.transactions('2026-01-01');
+  await tick();
+  assert.equal(asked, 2);
+});
+
 test('a client\'s past meetings load when their page asks, once however often it is drawn, and it is drawn again when they land', async () => {
   const asked = [];
   const s = start(answers({ pastMeetings: async filter => { asked.push(filter); return { meetings: [{ id: 'e1', title: 'Kickoff' }], more: false }; } }));
@@ -1094,6 +1154,46 @@ test('the scoped reload\'s own part failing is not the write failing — after()
   const result = await s.store.after(Promise.resolve('saved'), { only: ['events'], toast: false });
   assert.equal(result, 'saved');
   assert.deepEqual([...s.store.state.failed], ['the agenda']);
+});
+
+test('after() narrowed by `only` reloads just those parts, not the whole workspace (0060)', async () => {
+  const s = start(answers());
+  await s.store.load();
+  const before = { ...s.calls };
+  await s.store.after(Promise.resolve('saved'), { only: ['invoices'] });
+  await tick();
+  assert.equal(s.calls.invoices, before.invoices + 1, 'the part named is reloaded');
+  assert.equal(s.calls.tickets, before.tickets, 'an unrelated part is not');
+  assert.equal(s.calls.revenueSeries, before.revenueSeries, 'nor a finance part that was not named either');
+  assert.equal(s.calls.revenueMix, before.revenueMix);
+});
+
+test('after() with `only` still draws the page, even where the one part it named came back unchanged', async () => {
+  const s = start(answers());
+  await s.store.load();
+  const painted = s.context.renders + s.context.idleRepaints;
+  await s.store.after(Promise.resolve('saved'), { only: ['tickets'] });
+  await tick();
+  assert.ok(s.context.renders + s.context.idleRepaints > painted,
+    'a write closed its dialog on the strength of this landing: the page must not stay as it was before it');
+});
+
+test('after() with no `only` still reloads everything, exactly as it always has', async () => {
+  const s = start(answers());
+  await s.store.load();
+  const before = { ...s.calls };
+  await s.store.after(Promise.resolve('saved'));
+  await tick();
+  for (const name of Object.keys(before)) assert.equal(s.calls[name], before[name] + 1, name + ' reloads too');
+});
+
+test('after() ignores an empty or malformed `only` and reloads everything, the same as none at all', async () => {
+  const s = start(answers());
+  await s.store.load();
+  const before = { ...s.calls };
+  await s.store.after(Promise.resolve('saved'), { only: [] });
+  await tick();
+  assert.equal(s.calls.tickets, before.tickets + 1, 'an empty list is not "nothing": it falls back to the whole workspace');
 });
 
 test('a part loaded since a mark arrived from a load begun after it — not from one begun before, even one ending after, nor from one that did not bring it back', async () => {

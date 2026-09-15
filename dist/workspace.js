@@ -11,7 +11,7 @@ let ticketScope = 'All tickets', financeTab = 'overview', companyTab = 'team';
    Either way the repaint waits for any half-written draft — see
    repaintWhenIdle in app.js. */
 CAL.onChange(()=>{if(!(window.workspaceStore&&workspaceStore.state.loaded))repaintWhenIdle();});
-const queries = {tickets:'', projects:'', crm:'', mail:''};
+const queries = {tickets:'', projects:'', crm:'', mail:'', finance:''};
 
 
 const originalOverview = overview, originalAction = action;

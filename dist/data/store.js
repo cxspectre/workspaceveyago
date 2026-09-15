@@ -439,7 +439,13 @@
     state.notice = noticeFor(lastFailures, state.loaded, CORE.filter(function (k) { return !arrivedAt[k]; }));
     paintNotice();
     if (applied.changed || !quiet) regroupNotes();
-    if (applied.changed || applied.failures.length) repaint(quiet && state.loaded);
+    /* A load someone asked for repaints regardless of changed — loadOnce does
+       the same for the whole workspace (after(), with `only`, is the one
+       caller that reaches here not quiet: a write's own dialog has already
+       closed by the time this runs, and a write that happened to change
+       nothing the signature could tell apart must not leave the page as it
+       was before it). */
+    if (!quiet || applied.changed || applied.failures.length) repaint(quiet && state.loaded);
     if (applied.failures.length) scheduleRetry(applied.failures.map(function (o) { return o.part.key; }));
     /* Nothing left failing: no retry is needed, and the next failure starts
        from the first delay — a retry that has just fired included. */
@@ -797,6 +803,33 @@
     return entry;
   }
 
+  /* Transactions in a window, asked for only once Finance's own page wants
+     them (finance-ui.js): a manager who never opens Finance this session
+     never asks for one, and a write anywhere else in the workspace does not
+     refetch them either — after() clears this cache like the others below
+     rather than folding it into the whole-workspace reload every write does.
+     Kept by the window's since-date, until a write. */
+  var transactionsBy = {};
+  var TX_LOADING = Object.freeze({ state: 'loading', rows: Object.freeze([]) });
+
+  function loadTransactions(since) {
+    var entry = { state: 'loading', rows: [] };
+    transactionsBy[since] = entry;
+    Promise.resolve()
+      .then(function () { return window.workspaceData.transactions(since); })
+      .then(function (rows) {
+        if (transactionsBy[since] !== entry) return;
+        transactionsBy[since] = { state: 'ready', rows: rows || [] };
+        repaint(true);
+      }, function (err) {
+        if (transactionsBy[since] !== entry) return;
+        console.error('[workspace] transactions did not load:', err);
+        transactionsBy[since] = { state: 'failed', rows: [] };
+        repaint(true);
+      });
+    return entry;
+  }
+
   /* Events asked for one at a time by a page the weeks loaded do not reach —
      a link to a client's past meeting — kept by id until a write, and found by
      eventById once they land. */
@@ -1136,6 +1169,18 @@
       if (archivedProjectsBy && archivedProjectsBy.state === 'failed') archivedProjectsBy = null;
     },
 
+    /* Transactions since a day (finance-ui.js), as { state: 'loading' |
+       'ready' | 'failed', rows }. The first ask for a window starts the
+       load; the page is drawn again when it lands. */
+    transactions: function (since) {
+      if (!state.loaded || !window.workspaceData || typeof window.workspaceData.transactions !== 'function') return TX_LOADING;
+      return transactionsBy[since] || loadTransactions(since);
+    },
+    /* Ask again for a window of transactions that did not load. */
+    retryTransactions: function (since) {
+      if (transactionsBy[since] && transactionsBy[since].state === 'failed') delete transactionsBy[since];
+    },
+
     /* Views call this after a write so the screen and the database agree. A
        refusal is said in a toast — unless the view says it itself, where it
        happened, and asks for none with { toast: false }: a dialog's error
@@ -1144,15 +1189,21 @@
        save touches only contacts and companies, an event save only
        ['events'] (and ['events','projectEvents'] for one on a project), not
        the other parts a note or a task save still reloads whole; named ones
-       reload quietly, in the background, rather than the whole workspace.
+       are reloaded on their own, fewer requests for the same repaint.
        Left out, every part reloads exactly as it always has: `only` is
        something a caller opts INTO, never assumed. A write that FAILS
-       always reloads everything regardless — a refusal can still land after
-       an earlier step of a multi-step write went through, and `only` naming
-       what the caller expected to change is not proof nothing else did. */
+       always reloads everything regardless, in a full, quiet reload — a
+       refusal can still land after an earlier step of a multi-step write
+       went through, and `only` naming what the caller expected to change is
+       not proof nothing else did. */
     async after(promise, options) {
       var only = options && Array.isArray(options.only) && options.only.length ? options.only : null;
-      var reload = only ? { quiet: true, only: only } : undefined;
+      /* Not quiet: a write's own dialog has already closed by the time this
+         runs, and loadParts() only skips its repaint on a quiet load that
+         changed nothing — a write that happened to change nothing the
+         signature could tell apart must still redraw, or the page is left
+         showing the record as still saving. */
+      var reload = only ? { only: only } : undefined;
       try {
         var out = await promise;
         pastMeetingsBy = {};
@@ -1161,6 +1212,7 @@
         ticketFilesAskedFor = {};
         projectActivityBy = {};
         archivedProjectsBy = null;
+        transactionsBy = {};
         await load(reload);
         return out;
       } catch (err) {
@@ -1170,6 +1222,7 @@
         ticketFilesAskedFor = {};
         projectActivityBy = {};
         archivedProjectsBy = null;
+        transactionsBy = {};
         if (typeof toast === 'function' && !(options && options.toast === false)) toast(err.message);
         /* A write that failed may still have changed something — a row saved
            before a later step was refused — so the page is brought back to

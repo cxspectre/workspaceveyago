@@ -138,12 +138,20 @@ if(!series||!series.length){
 
 const rows=series.slice(year?-12:-6);
 const values=rows.map(r=>Number(r.revenue)||0);
+/* revenue_series() already works these out (0041) — expenses is what the
+   audit found this chart never drew, so the line beside income was always
+   half the story it could tell from one round trip it was already making. */
+const expenseValues=rows.map(r=>Number(r.expenses)||0);
 const total=values.reduce((a,b)=>a+b,0);
+const expenseTotal=expenseValues.reduce((a,b)=>a+b,0);
 const last=values[values.length-1], prev=values[values.length-2];
 /* No previous month, or a previous month of nothing, means there is no
    percentage to state. Silence beats inventing one. */
 const trend=(prev>0)?((last-prev)/prev)*100:null;
-const peak=Math.max(...values,1);
+/* Both lines share one axis, scaled to whichever of the two months went
+   higher: an expense line taller than the axis meant for revenue alone would
+   run off the top of the chart. */
+const peak=Math.max(...values,...expenseValues,1);
 /* Round the axis up to something a person would choose. */
 const step=Math.pow(10,Math.floor(Math.log10(peak)));
 const top=Math.max(Math.ceil(peak/step)*step,step);
@@ -152,6 +160,10 @@ const x=i=>rows.length===1?W/2:(i/(rows.length-1))*W;
 const y=v=>H-2-((v/top)*(H-12));
 const line=values.map((v,i)=>`${i?'L':'M'}${x(i).toFixed(1)} ${y(v).toFixed(1)}`).join('');
 const area=`${line}L${W} ${H}L0 ${H}Z`;
+const expenseLine=expenseValues.map((v,i)=>`${i?'L':'M'}${x(i).toFixed(1)} ${y(v).toFixed(1)}`).join('');
+/* Nothing spent this window is not worth a second line lying flat on the
+   axis, or a legend entry and a foot figure for a line nobody drew. */
+const hasExpenses=expenseValues.some(v=>v>0);
 /* One currency, and the series says which (0041); before that it was USD. A
    code Intl cannot format is written beside the number rather than thrown. */
 const currency=(rows[0]&&rows[0].currency)||'USD';
@@ -160,7 +172,12 @@ const MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','De
 const labelFor=r=>MON[new Date(r.month+'T00:00:00').getMonth()];
 const usdFull=v=>workspaceData.money(v,currency);
 
-return `<section class="panel revenue-panel">${head}<div class="revenue-total"><strong>${usdFull(total)}</strong>${trend===null?'':`<span class="trend" style="${trend<0?'color:#b94438':''}">${trend<0?'↘':'↗'} ${Math.abs(trend).toFixed(1)}%</span>`}<span class="chart-legend"><i class="legend-line"></i> Revenue</span></div><div class="chart" role="img" aria-label="Revenue, ${labelFor(rows[0])} to ${labelFor(rows[rows.length-1])}, ${usdFull(last)} in the latest month"><div class="y-axis"><span>${fmt(top)}</span><span>${fmt(top*2/3)}</span><span>${fmt(top/3)}</span><span>${fmt(0)}</span></div><svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><defs><linearGradient id="chart-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#0071e3" stop-opacity=".15"/><stop offset="100%" stop-color="#0071e3" stop-opacity="0"/></linearGradient></defs><path d="M0 1H${W}M0 46H${W}M0 92H${W}M0 138H${W}" stroke="#edf1f3" stroke-width="1" stroke-dasharray="3 4" fill="none"/><path d="${area}" fill="url(#chart-fill)"/><path d="${line}" stroke="#0071e3" stroke-width="2.8" fill="none" vector-effect="non-scaling-stroke"/><circle cx="${x(values.length-1).toFixed(1)}" cy="${y(last).toFixed(1)}" r="4" fill="#0071e3"/></svg><div class="chart-labels">${rows.map(r=>`<span>${labelFor(r)}</span>`).join('')}</div></div><div class="chart-foot"><span>Income<b>${usdFull(total)}</b></span><span>Latest month<b>${usdFull(last)}</b></span><span>${esc(currency)}</span></div></section>`}
+const expenseLast=expenseValues[expenseValues.length-1];
+const legend=`<span class="chart-legend"><i class="legend-line"></i> Revenue${hasExpenses?'<i class="legend-line" style="border-top-color:#eb6834;border-top-style:dashed"></i> Expenses':''}</span>`;
+const expensePath=hasExpenses?`<path d="${expenseLine}" stroke="#eb6834" stroke-width="2" stroke-dasharray="5 3" fill="none" vector-effect="non-scaling-stroke"/><circle cx="${x(expenseValues.length-1).toFixed(1)}" cy="${y(expenseLast).toFixed(1)}" r="3.5" fill="#eb6834"/>`:'';
+const ariaLabel=`Revenue, ${labelFor(rows[0])} to ${labelFor(rows[rows.length-1])}, ${usdFull(last)} in the latest month`+(hasExpenses?`, against ${usdFull(expenseLast)} spent`:'');
+const footExpenses=hasExpenses?`<span>Expenses<b>${usdFull(expenseTotal)}</b></span>`:'';
+return `<section class="panel revenue-panel">${head}<div class="revenue-total"><strong>${usdFull(total)}</strong>${trend===null?'':`<span class="trend" style="${trend<0?'color:#b94438':''}">${trend<0?'↘':'↗'} ${Math.abs(trend).toFixed(1)}%</span>`}${legend}</div><div class="chart" role="img" aria-label="${ariaLabel}"><div class="y-axis"><span>${fmt(top)}</span><span>${fmt(top*2/3)}</span><span>${fmt(top/3)}</span><span>${fmt(0)}</span></div><svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><defs><linearGradient id="chart-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#0071e3" stop-opacity=".15"/><stop offset="100%" stop-color="#0071e3" stop-opacity="0"/></linearGradient></defs><path d="M0 1H${W}M0 46H${W}M0 92H${W}M0 138H${W}" stroke="#edf1f3" stroke-width="1" stroke-dasharray="3 4" fill="none"/><path d="${area}" fill="url(#chart-fill)"/><path d="${line}" stroke="#0071e3" stroke-width="2.8" fill="none" vector-effect="non-scaling-stroke"/><circle cx="${x(values.length-1).toFixed(1)}" cy="${y(last).toFixed(1)}" r="4" fill="#0071e3"/>${expensePath}</svg><div class="chart-labels">${rows.map(r=>`<span>${labelFor(r)}</span>`).join('')}</div></div><div class="chart-foot"><span>Income<b>${usdFull(total)}</b></span><span>Latest month<b>${usdFull(last)}</b></span>${footExpenses}<span>${esc(currency)}</span></div></section>`}
 function ticketTable(items,full=false){return `<div class="table-wrap"><table class="${full?'module-table':''}"><thead><tr><th>Ticket</th>${full?'<th>Product / client</th>':''}<th>Priority</th><th>Status</th><th>Owner</th></tr></thead><tbody>${items.map(t=>`<tr data-action="ticket" data-id="${esc(t.id)}"><td><div class="cell-main"><span class="ticket-symbol">${icon('tickets')}</span><div><a class="ticket-link" href="#tickets/${esc(t.id)}"><strong>${esc(t.title)}</strong></a><small><span class="ticket-id">#VYG-${t.id}</span> &nbsp;·&nbsp; ${esc(t.client)}</small></div></div></td>${full?`<td class="muted">${esc(t.product)}</td>`:''}<td>${pill(t.priority)}</td><td>${pill(t.status)}</td><td><div class="avatar sm">${esc(t.owner)}</div></td></tr>`).join('')}</tbody></table>${!items.length?'<div class="empty-state">No tickets in this view.</div>':''}</div>`}
 function projectRows(){if(!projects.length)return '<p class="quiet-text" style="padding:4px 19px 20px">No projects yet. Create one and it will show here with its progress.</p>';
 return `<div class="project-list">${projects.slice(0,3).map(p=>`<div class="project-row" role="button" tabindex="0" data-action="project" data-id="${p.id}"><div class="project-logo ${p.style}">${p.initial}</div><div><div class="project-name">${esc(p.name)}</div><div class="project-meta">${esc(p.client)} &nbsp;·&nbsp; Due ${esc(p.due)}</div></div><div><div class="progress-caption">${p.progress}%</div><div class="progress"><i style="width:${p.progress}%"></i></div></div><div class="avatar sm">${esc((team.filter(m=>m.row&&m.row.id===(p.row&&p.row.owner_id))[0]||{}).initial||'')}</div></div>`).join('')}</div>`}
