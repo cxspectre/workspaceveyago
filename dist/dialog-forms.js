@@ -133,10 +133,14 @@ const dialogForms = (function () {
      toast would say it a second time — unless the dialog was closed while the
      write went, when a toast is where it can still be read. `record` names
      what the write changes, and `part` the part of the store it comes back in,
-     or a list of them; stillSaving() answers for them. What the view does once
-     the change is in — drawing the page it goes to — is not the change:
-     something going wrong there is logged, never said as a refusal. */
-  function sending(target, work, done, { record = null, part = null } = {}) {
+     or a list of them; stillSaving() answers for them. `only`, separately,
+     scopes the reload itself (store.js after()'s own `only`) to just those
+     parts — left out, the reload stays the whole workspace, exactly as
+     before: a caller opts into a narrower one, nothing is narrowed by
+     default. What the view does once the change is in — drawing the page it
+     goes to — is not the change: something going wrong there is logged,
+     never said as a refusal. */
+  function sending(target, work, done, { record = null, part = null, only = null } = {}) {
     const button = target.querySelector('[type="submit"]');
     if (button.disabled) return;
     button.disabled = true;
@@ -161,7 +165,7 @@ const dialogForms = (function () {
       }
       closeDialog(target);
     }, () => {});
-    workspaceStore.after(write, { toast: false }).then(done, err => {
+    workspaceStore.after(write, { toast: false, only: only === null ? null : [].concat(only) }).then(done, err => {
       const reason = sentence((err && err.message) || 'That was not saved');
       button.disabled = false;
       shut.forEach(input => { input.readOnly = false; });

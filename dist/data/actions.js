@@ -644,21 +644,34 @@
       });
     },
 
-    /* Only a hand-made event, by whoever booked it or an owner or admin (0048).
+    /* A hand-made event, by whoever booked it or an owner or admin (0048):
        RLS refuses anything else by removing nothing, so the rows removed are
-       asked back: none is a refusal, and is said as one. */
-    async deleteEvent(eventId) {
+       asked back; none is a refusal, and is said as one. A SYNCED event
+       (connectionId given) is nobody's to delete straight through RLS —
+       delete-calendar-event removes it in Outlook first, then here (0057,
+       "Edits and deletes need to reach Outlook"). */
+    async deleteEvent(eventId, connectionId) {
+      if (connectionId) {
+        var res = await sb().functions.invoke('delete-calendar-event', { body: { eventId: eventId } });
+        if (res.error) throw new Error(await functionError(res, 'The event was not removed.'));
+        return res.data;
+      }
       touched(await sb().from('calendar_events').delete().eq('id', eventId).select('id'), 'remove the event',
-        'The event was not removed: it has been removed already, or only whoever booked it, or an owner or admin, can remove it — an event from a connected calendar is removed there.');
+        'The event was not removed: it has been removed already, or only whoever booked it, or an owner or admin, can remove it.');
     },
 
     /* Changing a hand-made event, by whoever booked it or an owner or admin
        (0048): only what an edit may change — its title, times, place and
-       details. `since` is the updated_at the change was made against, which
-       0026's trigger moves on every change: an event changed meanwhile is not
-       overwritten. RLS refuses by changing nothing, as do the connection_id and
-       updated_at filters; none changed is a refusal, and is said as one. */
-    async updateEvent(eventId, changes, since) {
+       details, checked here whichever event this is, since update-calendar-
+       event trusts this same allowlist rather than repeating the check for a
+       different reason to disagree. `since` is the updated_at the change was
+       made against, which 0026's trigger moves on every change: an event
+       changed meanwhile is not overwritten. For a hand-made event RLS refuses
+       by changing nothing, as do the connection_id and updated_at filters;
+       none changed is a refusal, said as one. A SYNCED event (connectionId
+       given) is nobody's to PATCH straight through RLS — update-calendar-
+       event changes it in Outlook first, then here (0057). */
+    async updateEvent(eventId, changes, since, connectionId) {
       var EDITABLE = ['title', 'detail', 'location', 'starts_at', 'ends_at'];
       var fields = changes || {};
       var keys = Object.keys(fields);
@@ -667,6 +680,13 @@
       if ('title' in fields) must(String(fields.title || '').trim(), 'An event needs a title.');
       if ('starts_at' in fields) must(!isNaN(Date.parse(fields.starts_at)), 'An event needs a start time.');
       if (fields.starts_at && fields.ends_at) must(Date.parse(fields.ends_at) > Date.parse(fields.starts_at), 'An event cannot end before it starts.');
+      if (connectionId) {
+        var synced = await sb().functions.invoke('update-calendar-event', {
+          body: { eventId: eventId, changes: fields, since: since || null }
+        });
+        if (synced.error) throw new Error(await functionError(synced, 'The event was not changed.'));
+        return synced.data;
+      }
       var update = sb().from('calendar_events').update(fields).eq('id', eventId).is('connection_id', null);
       if (since) update = update.eq('updated_at', since);
       return touched(await update.select(), 'change the event',
@@ -742,6 +762,33 @@
       var url = String(res.data && res.data.consentUrl || '');
       must(/^https:\/\/login\.microsoftonline\.com\//.test(url), 'Microsoft did not send a sign-in page back.');
       return url;
+    },
+
+    /* Starts connecting — or reconnecting — a calendar: the same call as
+       reconnectMailbox, for the other provider (0057, "No way to connect a
+       calendar or see its last sync"). `employeeId` is left out for a plain
+       reconnect, which keeps whose calendar it already is; passed as null it
+       says a brand new connection is the studio's, an owner or admin only —
+       microsoft-connect itself decides who may say so. */
+    async connectCalendar(address, employeeId) {
+      must(address && String(address).trim(), 'Say which calendar to connect.');
+      var body = { provider: 'microsoft_calendar', accountLabel: String(address).trim() };
+      if (employeeId !== undefined) body.employeeId = employeeId;
+      var res = await sb().functions.invoke('microsoft-connect', { body: body });
+      if (res.error) throw new Error(await functionError(res, 'Connecting could not start.'));
+      var url = String(res.data && res.data.consentUrl || '');
+      must(/^https:\/\/login\.microsoftonline\.com\//.test(url), 'Microsoft did not send a sign-in page back.');
+      return url;
+    },
+
+    /* Asks sync-outlook-calendar to pull this connection now, rather than
+       waiting for the schedule (0057 §3, every 15 minutes) or the next time
+       the Agenda happens to be opened. */
+    async syncCalendar(connectionId) {
+      must(connectionId, 'Which calendar to sync was not given.');
+      var res = await sb().functions.invoke('sync-outlook-calendar', { body: { connectionId: connectionId } });
+      if (res.error) throw new Error(await functionError(res, 'Syncing could not start.'));
+      return res.data;
     },
 
     /* ── Mail: sending ───────────────────────────────────────────────── */

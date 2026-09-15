@@ -17,7 +17,7 @@ process.env.TZ = 'Europe/Amsterdam';
 const NOW = new Date(2026, 8, 16, 9).getTime();
 const TYPED = '<img src=x onerror=alert(1)>';
 const WAIT = 'The last change to that event is still on its way. Try again in a moment.';
-const REMOVAL_REFUSED = 'The event was not removed: it has been removed already, or only whoever booked it, or an owner or admin, can remove it — an event from a connected calendar is removed there.';
+const REMOVAL_REFUSED = 'The event was not removed: it has been removed already, or only whoever booked it, or an owner or admin, can remove it.';
 
 const escape = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const at = (day, hour = 0, minute = 0, month = 8) => new Date(2026, month, day, hour, minute).toISOString();
@@ -33,6 +33,13 @@ function event(id, startsAt, endsAt, over = {}) {
   return { id, title: row.title, detail: row.detail || row.location || '', row };
 }
 
+/* A tab window.open('', '_blank') hands back, the way mail.js's own reconnect
+   flow already uses one — a title to set while Microsoft loads, a location
+   to send it to, and a close() for a call that never gets that far. */
+function fakeTab() {
+  return { closed: false, opener: undefined, document: { title: '' }, location: { href: '' }, close() { this.closed = true; } };
+}
+
 /* An element a click lands on, with one data attribute. */
 function target(attribute, value) {
   const key = attribute.replace(/^data-/, '').replace(/-([a-z])/g, (_, c) => c.toUpperCase());
@@ -42,7 +49,9 @@ function target(attribute, value) {
 
 /* refuseRemove: the database removes nothing. */
 function load({ list = [], projectEvents = [], route = ['agenda'], mode = 'week', loaded = true, me = 'e-me', manager = false, contacts = [], projects = [], weeks = null, failed = [], failedWeeks = null, ask = null, refuseRemove = false,
-  team = [], companies = [], parts = ['events', 'team'], invitees = null, storage = null, phone = false, legacyStore = false } = {}) {
+  team = [], companies = [], calendars = [], parts = ['events', 'team'], invitees = null, storage = null, phone = false, legacyStore = false,
+  syncCalendar = null, connectCalendar = null, openTab = () => fakeTab(), months = null } = {}) {
+  const monthsShown = [];
   const invitesAsked = [];
   const heading = { attributes: {}, focused: 0, setAttribute(name, value) { this.attributes[name] = value; }, focus() { this.focused += 1; } };
   /* The page's own heading, and the events a page asked the store for by id. */
@@ -59,12 +68,20 @@ function load({ list = [], projectEvents = [], route = ['agenda'], mode = 'week'
   const toasts = [];
   const removed = [];
   const repaints = [];
+  const synced = [];
+  const connected = [];
+  const opened = [];
+  const locationAssigns = [];
+  const loads2 = [];
   const handlers = {};
-  /* The Remove dialog's form, as dialog-forms.js reaches into it. */
+  /* The one form a dialog on screen has — the Remove dialog's, or the
+     Connect dialog's — as dialog-forms.js reaches into it. `fields`: what a
+     test has "typed", read by the FormData stand-in below. */
   const button = { disabled: false };
   const error = { textContent: '', id: 'agenda-remove-form-error' };
   const form = {
     isConnected: true,
+    fields: {},
     addEventListener: (type, fn) => { handlers[type] = fn; },
     querySelector: selector => (selector === '.form-error' ? error : selector === '.form-candidates' ? null : button)
   };
@@ -105,7 +122,7 @@ function load({ list = [], projectEvents = [], route = ['agenda'], mode = 'week'
     matchMedia: query => ({ matches: Boolean(phone) && /max-width:\s*840px/.test(query) }),
     workspaceSession: { employee: me ? { id: me } : null, isManager: () => manager },
     workspaceStore: {
-      state: { loaded, companies, projectEvents, failed },
+      state: { loaded, companies, projectEvents, failed, calendars },
       /* As store.js looks an event up: the weeks loaded, then the project meetings. */
       eventById: id => [...context.events, ...context.workspaceStore.state.projectEvents]
         .find(e => String(e.id).toLowerCase() === String(id).toLowerCase()) || null,
@@ -119,6 +136,8 @@ function load({ list = [], projectEvents = [], route = ['agenda'], mode = 'week'
          whole-agenda list) is treated as every week failing, matching what
          agenda-ui.js's own fallback would have said before this existed. */
       weekFailed: key => (failedWeeks ? failedWeeks.includes(key) : failed.includes('the agenda')),
+      showMonth: range => monthsShown.push(range ? range.key : null),
+      monthLoaded: key => (months ? months.includes(key) : true),
       /* As store.js's after() does: once the write is in, the workspace is
          loaded again, bringing the weeks and the project meetings back; a
          refusal is said in a toast unless the caller says it itself. */
@@ -131,14 +150,34 @@ function load({ list = [], projectEvents = [], route = ['agenda'], mode = 'week'
         err => { if (!(options && options.toast === false)) toasts.push(err.message); throw err; }),
       mark: () => loads.begun,
       loadedSince: (part, mark) => loads.arrived[part] !== undefined && loads.arrived[part] > mark,
+      /* A plain background refresh — "Sync now" asks for this directly, not
+         through after(), since nothing here was itself a write. */
+      load: options => { loads2.push(options); return Promise.resolve(); },
+      reload: () => { loads2.push(undefined); return Promise.resolve(); },
       askEvent: id => { asks.push(id); return ask ? ask(id) : { state: 'missing', event: null }; },
       retryEvent: id => retried.push(id)
     },
     workspaceActions: {
-      deleteEvent: async id => {
-        removed.push(id);
+      deleteEvent: async (id, connectionId) => {
+        removed.push([id, connectionId]);
         if (refuseRemove) throw Object.assign(new Error(REMOVAL_REFUSED), { refused: true });
+      },
+      syncCalendar: async id => {
+        synced.push(id);
+        return syncCalendar ? syncCalendar(id) : { ok: true, events: 2, skipped: 0 };
+      },
+      connectCalendar: async (address, employeeId) => {
+        connected.push([address, employeeId]);
+        return connectCalendar ? connectCalendar(address, employeeId) : 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize?x';
       }
+    },
+    open: (...args) => { opened.push(args); return openTab(); },
+    location: { assign: url => locationAssigns.push(url) },
+    /* As a browser's, for the one field-reading dialog this file's own forms
+       need (the Connect dialog): what h.type() last set. */
+    FormData: class {
+      constructor(f) { this.f = f; }
+      get(name) { return Object.prototype.hasOwnProperty.call(this.f.fields || {}, name) ? this.f.fields[name] : ''; }
     },
     CAL: { onChange: fn => dateChanges.push(fn) },
     document: {
@@ -176,13 +215,17 @@ function load({ list = [], projectEvents = [], route = ['agenda'], mode = 'week'
     changeDate: () => dateChanges.forEach(fn => fn()),
     submit: async () => { handlers.submit({ preventDefault() {} }); await settle(); },
     mode: () => context.agendaMode,
+    setMode: value => { context.agendaMode = value; },
     setRoute: parts => { context.routeParts = parts; },
     canChange: e => context.agendaUi.canChange(e),
     partsOf: e => [...context.agendaUi.partsOf(e)],
     hiddenCalendar: kind => context.agendaUi.hiddenCalendar(kind),
     /* Holds the load after the next write open until the function it returns is called. */
     holdReload: () => { let release; holds.reload = { promise: new Promise(resolve => { release = resolve; }) }; return () => { holds.reload = null; release(); }; },
-    shown, modals, navigated, toasts, removed, repaints, button, error, title, asks, retried, invitesAsked, kindButton, modal: context.modal
+    /* Fills in the dialog currently open's form fields, for the next submit(). */
+    type: fields => { form.fields = fields; },
+    shown, modals, navigated, toasts, removed, repaints, button, error, title, asks, retried, invitesAsked, kindButton, modal: context.modal,
+    synced, connected, opened, locationAssigns, loads2, monthsShown
   };
 }
 
@@ -640,6 +683,46 @@ test('an event\'s page says when it is only tentative, and who booked one made h
   assert.doesNotMatch(load({ list: [unknown], route: ['agenda', 'u'], team }).view(), /Booked by/, 'no guess when the column did not load');
 });
 
+/* 0057, "Loaded details stay hidden — which connected calendar an event came
+   from still isn't named": the event page now looks the connection up
+   (state.calendars) and says which calendar, and whose, rather than the bare
+   "In a connected calendar" it always fell back to before. */
+test('the event page names the connected calendar it came from, once the calendars have loaded', () => {
+  const calendars = [
+    { id: 'conn-1', label: 'hello@veyago.cloud', employeeId: null, ownerName: 'Studio' },
+    { id: 'conn-2', label: 'ana@veyago.cloud', employeeId: 'e-ana', ownerName: 'Ana Lima' }
+  ];
+  const view = over => load({ list: [event('k', at(17, 14), at(17, 15), over)], route: ['agenda', 'k'], calendars }).view();
+  assert.match(view({ connection_id: 'conn-1' }), /<span>Booked<\/span><div>hello@veyago\.cloud \(studio calendar\)<\/div>/);
+  assert.match(view({ connection_id: 'conn-2' }), /<span>Booked<\/span><div>ana@veyago\.cloud \(Ana Lima\)<\/div>/);
+  assert.match(view({ connection_id: null }), /<span>Booked<\/span><div>In the workspace only<\/div>/);
+  assert.match(
+    load({ list: [event('u', at(17, 14), at(17, 15), { connection_id: 'conn-9' })], route: ['agenda', 'u'], calendars }).view(),
+    /<span>Booked<\/span><div>In a connected calendar<\/div>/,
+    'a calendar not among those loaded (or not loaded yet): a plain fallback, not a guess'
+  );
+});
+
+/* 0057: the join link, the organiser and the zone a synced event was booked
+   in, kept by graph-message.ts and no longer thrown away — shown here for
+   the first time. */
+test('a synced event\'s join link, organiser and booking zone are shown, each only when there is one', () => {
+  const view = over => load({ list: [event('k', at(17, 14), at(17, 15), over)], route: ['agenda', 'k'] }).view();
+  const withAll = view({ meeting_url: 'https://teams.microsoft.com/l/meetup-join/abc', organizer_name: 'Dana Reyes', organizer_email: 'dana@northline.example', time_zone: 'Europe/Amsterdam' });
+  assert.match(withAll, /<span>Video call<\/span><div><a href="https:\/\/teams\.microsoft\.com\/l\/meetup-join\/abc" target="_blank" rel="noopener noreferrer">Join<\/a><\/div>/);
+  assert.match(withAll, /<span>Organiser<\/span><div>Dana Reyes<\/div>/);
+  assert.match(withAll, /<span>Booked in<\/span><div>Europe\/Amsterdam<\/div>/);
+
+  assert.match(view({ organizer_name: '', organizer_email: 'dana@northline.example' }), /<span>Organiser<\/span><div>dana@northline\.example<\/div>/, 'the address, when there is no name');
+  assert.doesNotMatch(view({}), /Video call|Organiser|Booked in/, 'nothing to show for a hand-made event, or one the sync left blank');
+
+  const unsafe = view({ meeting_url: 'javascript:alert(1)' });
+  assert.doesNotMatch(unsafe, /Video call/, 'never trusted twice — only https, even if something upstream slipped');
+  const escaped = view({ meeting_url: 'https://x.example/?a="onmouseover="alert(1)', organizer_name: TYPED });
+  assert.match(escaped, /href="https:\/\/x\.example\/\?a=&quot;onmouseover=&quot;alert\(1\)"/, 'a quote in the link cannot break out of the attribute');
+  assert.doesNotMatch(escaped, /<img/i, 'the organiser\'s name is escaped too');
+});
+
 test('the company an event is filed under is linked by its id, beside its person and project', () => {
   const companies = [{ id: 'co-2', name: 'Name Twin' }, { id: 'co-1', name: 'Northline' }];
   const filed = event('k', at(17, 14), at(17, 15), { title: 'Kickoff', company_id: 'co-1' });
@@ -690,7 +773,7 @@ test('removing asks first, then removes the event, reloads and goes back to the 
     'a dialog with a line to say a refusal on');
   assert.deepEqual(h.removed, [], 'nothing is removed before it is confirmed');
   await h.submit();
-  assert.deepEqual(h.removed, ['m']);
+  assert.deepEqual(h.removed, [['m', null]], 'a hand-made event is removed with no connection id');
   assert.deepEqual(h.navigated, ['agenda']);
   assert.deepEqual(h.toasts, ['Event removed.']);
 });
@@ -713,7 +796,7 @@ test('until the workspace is loaded again after a removal, the event\'s Remove w
   const reloaded = h.holdReload();
   h.click(target('data-agenda-delete', 'm'));
   await h.submit();
-  assert.deepEqual(h.removed, ['m']);
+  assert.deepEqual(h.removed, [['m', null]]);
   assert.equal(h.modal.open, false, 'the dialog closes once the database has it');
   h.click(target('data-agenda-delete', 'M'));
   assert.equal(h.modals.length, 1, 'not asked again while the page still shows it');
@@ -735,15 +818,45 @@ test('an event that may not be removed is refused, even if its button is forged'
 test('an event made in the workspace offers Edit to whoever may remove it, and the page says who may change one', () => {
   const mine = event('m', at(15, 9), at(15, 10), { connection_id: null, created_by: 'e-me' });
   const theirs = event('t', at(15, 9), at(15, 10), { connection_id: null, created_by: 'e-you' });
-  const synced = event('s', at(15, 9), at(15, 10), { connection_id: 'conn-1', created_by: 'e-me' });
   assert.match(load({ list: [mine], route: ['agenda', 'm'] }).view(),
     /<button type="button" class="btn" data-agenda-edit="m">Edit event<\/button><button type="button" class="btn" data-agenda-delete="m">Remove event<\/button>/);
   assert.doesNotMatch(load({ list: [theirs], route: ['agenda', 't'] }).view(), /data-agenda-edit=/);
   assert.match(load({ list: [theirs], route: ['agenda', 't'], manager: true }).view(), /data-agenda-edit="t"/, 'an owner or admin may');
-  assert.doesNotMatch(load({ list: [synced], route: ['agenda', 's'], manager: true }).view(), /data-agenda-edit=/, 'a synced event is changed in its calendar');
   const h = load({ list: [mine, theirs] });
   assert.equal(h.canChange(mine), true);
   assert.equal(h.canChange(theirs), false);
+});
+
+/* A synced event (0057, "Events can't be edited, moved or deleted") belongs
+   to whoever may act on its CALENDAR — the studio's, for any member of
+   staff, or a personal one for its own owner alone — never to whoever it
+   happens to be created_by, and a manager gets no special say over someone
+   else's personal calendar either: mayActOn on the backend draws the same
+   line (_shared/connection-rules.ts). */
+test('a synced event is changed by whoever may act on the calendar it is in — the studio\'s, or your own', () => {
+  const studio = { id: 'conn-1', employeeId: null, live: true };
+  const own = { id: 'conn-2', employeeId: 'e-me', live: true };
+  const colleagues = { id: 'conn-3', employeeId: 'e-you', live: true };
+  const inStudio = event('s', at(15, 9), at(15, 10), { connection_id: 'conn-1', created_by: 'e-you' });
+  const inOwn = event('o', at(15, 9), at(15, 10), { connection_id: 'conn-2', created_by: null });
+  const inColleagues = event('c', at(15, 9), at(15, 10), { connection_id: 'conn-3', created_by: 'e-me' });
+  const calendars = [studio, own, colleagues];
+
+  assert.match(load({ list: [inStudio], route: ['agenda', 's'], calendars }).view(), /data-agenda-edit="s"/,
+    'the studio calendar is shared, so any member of staff acts on it');
+  assert.match(load({ list: [inOwn], route: ['agenda', 'o'], calendars }).view(), /data-agenda-edit="o"/,
+    'your own connected calendar, whoever is recorded as having created the row');
+  assert.doesNotMatch(load({ list: [inColleagues], route: ['agenda', 'c'], calendars }).view(), /data-agenda-edit=/,
+    'a colleague\'s personal calendar is never acted on from here, created_by notwithstanding');
+  assert.doesNotMatch(load({ list: [inColleagues], route: ['agenda', 'c'], calendars, manager: true }).view(), /data-agenda-edit=/,
+    'a manager gets no override over somebody else\'s personal calendar either');
+  assert.doesNotMatch(load({ list: [inStudio], route: ['agenda', 's'], calendars: [] }).view(), /data-agenda-edit=/,
+    'the calendar has not loaded (or was not found): no guessing, so no button');
+
+  const h = load({ list: [inStudio, inOwn, inColleagues], calendars });
+  assert.equal(h.canChange(inStudio), true);
+  assert.equal(h.canChange(inOwn), true);
+  assert.equal(h.canChange(inColleagues), false);
 });
 
 test('an event comes back with the weeks, and a project meeting with the project meetings too', () => {
@@ -751,4 +864,205 @@ test('an event comes back with the weeks, and a project meeting with the project
   assert.deepEqual(h.partsOf(event('a', at(15, 9), at(15, 10))), ['events']);
   assert.deepEqual(h.partsOf(event('p', at(15, 9), at(15, 10), { project_id: 'p-1' })), ['events', 'projectEvents'],
     'out of the weeks, its page finds it among the project meetings');
+});
+
+/* ── Month view (0057, "No way to change weeks, and no month view") ─────
+   Week navigation already existed (Previous/Today/Next, the mini month); the
+   gap the audit's own re-check found was a month AT A GLANCE. Now is
+   Wednesday, September 16, 2026 (NOW, above). */
+
+test('Month is a view, and shows the whole month as a grid of days, the spill from August and October included', () => {
+  const h = load({ mode: 'month' });
+  const html = h.view();
+  assert.match(html, /<button data-view="agendaMode" data-value="month" class="active">Month<\/button>/);
+  assert.equal((html.match(/class="month-cell/g) || []).length, 35, 'Monday August 31 through Sunday October 4: five whole weeks');
+  assert.equal((html.match(/class="month-cell outside/g) || []).length, 5, 'the August and October days spilling into the grid');
+  assert.match(html, /<h2>September 2026<\/h2>/);
+  assert.doesNotMatch(html, /Loading the month|did not load/);
+});
+
+test('an event shows on its own day in the month grid, and a clash there reads exactly as it does everywhere else', () => {
+  const first = event('a', at(3, 9), at(3, 10), { title: 'Kickoff' });
+  const second = event('b', at(3, 9, 30), at(3, 10, 30), { title: 'Overlap', kind: 'client' });
+  const html = load({ list: [first, second], mode: 'month' }).view();
+  assert.match(html, /<a class="month-event type-team clash" href="#agenda\/a"><small>09:00 – 10:00<\/small> Kickoff<\/a>/);
+  assert.match(html, /<a class="month-event type-client clash" href="#agenda\/b"><small>09:30 – 10:30<\/small> Overlap<\/a>/);
+});
+
+test('a hidden calendar\'s events are left out of the month grid too, and counted the same way a week counts them', () => {
+  const shown = event('a', at(3, 9), at(3, 10), { title: 'Kept', kind: 'team' });
+  const hiddenOne = event('b', at(3, 11), at(3, 12), { title: 'Gone', kind: 'personal' });
+  const h = load({ list: [shown, hiddenOne], mode: 'month' });
+  h.click(target('data-agenda-kind', 'personal'));
+  const html = h.view();
+  assert.match(html, /Kept/);
+  assert.doesNotMatch(html, /Gone/);
+  assert.match(html, /<small class="hidden-note">1 more in a hidden calendar<\/small>/);
+});
+
+test('a day busier than three events shows the rest as "+N more", which opens Day view for it like any other day does', () => {
+  const many = Array.from({ length: 5 }, (_, i) => event('e' + i, at(10, 9 + i), at(10, 9 + i, 30), { title: 'Meeting ' + i }));
+  const h = load({ list: many, mode: 'month' });
+  const html = h.view();
+  assert.equal((html.match(/class="month-event /g) || []).length, 3, 'at most three shown in the cell (not "month-events", the wrapper div every cell has)');
+  assert.match(html, /<button type="button" class="month-more" data-agenda-day="2026-09-10">\+2 more<\/button>/);
+  h.click(target('data-agenda-day', '2026-09-10'));
+  assert.equal(h.mode(), 'day', 'the same data-agenda-day click that opens a day from the mini calendar opens one here too');
+});
+
+test('a day with nothing on it is simply blank; a month with nothing anywhere says so once', () => {
+  assert.match(load({ mode: 'month' }).view(), /Nothing this month: room to focus\./);
+  assert.doesNotMatch(load({ list: [event('a', at(3, 9), at(3, 10))], mode: 'month' }).view(), /Nothing this month/);
+});
+
+test('Previous and Next step by a whole month; Today returns to the month showing today', () => {
+  const h = load({ mode: 'month' });
+  h.click(target('data-agenda-week', 'next'));
+  assert.match(h.view(), /<h2>October 2026<\/h2>/);
+  h.click(target('data-agenda-week', 'next'));
+  assert.match(h.view(), /<h2>November 2026<\/h2>/, 'anchored on the 1st, not on whichever week it happens to fall in');
+  h.click(target('data-agenda-week', 'previous'));
+  assert.match(h.view(), /<h2>October 2026<\/h2>/);
+  h.click(target('data-agenda-week', 'today'));
+  assert.match(h.view(), /<h2>September 2026<\/h2>/);
+});
+
+test('the shown month is asked for from the store by its own key; leaving month view asks for none', () => {
+  const h = load({ mode: 'month' });
+  h.view();
+  assert.deepEqual(h.monthsShown, ['2026-09']);
+  h.setMode('week');
+  h.view();
+  assert.deepEqual(h.monthsShown, ['2026-09', null], 'nobody is looking at a month any more, so nothing keeps loading one');
+});
+
+test('a month still on its way says so; one that failed says that instead, and does not look merely empty', () => {
+  const loading = load({ mode: 'month', months: [] }).view();
+  assert.match(loading, /Loading the month…/);
+  assert.doesNotMatch(loading, /month-cell/, 'no grid drawn over a loading message');
+  const failedView = load({ mode: 'month', months: [], failed: ['the agenda'] }).view();
+  assert.match(failedView, /The agenda did not load/);
+});
+
+/* ── Connected calendars (0057, "No way to connect a calendar or see its
+   last sync") ────────────────────────────────────────────────────────── */
+
+test('the connections panel names every calendar, whose it is, and when it last synced', () => {
+  const calendars = [
+    { id: 'conn-1', label: 'hello@veyago.cloud', employeeId: null, ownerName: 'Studio', live: true, status: 'connected', lastSyncedAt: new Date(NOW - 5 * 60000).toISOString() },
+    { id: 'conn-2', label: 'ana@veyago.cloud', employeeId: 'e-ana', ownerName: 'Ana Lima', live: false, status: 'needs_reauth', lastSyncedAt: null }
+  ];
+  const view = load({ calendars, parts: ['events', 'team', 'calendars'] }).view();
+  assert.match(view, /<h2>Connected calendars<\/h2>/);
+  assert.match(view, /<p>hello@veyago\.cloud<\/p>/);
+  assert.match(view, /Studio/);
+  assert.match(view, /Synced 5 min ago/);
+  assert.match(view, /<p>ana@veyago\.cloud<\/p>/);
+  assert.match(view, /Ana Lima/);
+  assert.match(view, /Needs reconnecting/);
+});
+
+test('no calendar connected says so plainly, and a calendars part that has not loaded says it is loading', () => {
+  assert.match(load({ calendars: [], parts: ['events', 'team', 'calendars'] }).view(), /No calendar is connected yet/);
+  assert.match(load({ calendars: [], parts: ['events', 'team'] }).view(), /Connected calendars[\s\S]*Loading/);
+});
+
+test('Sync now is offered for every calendar shown, whoever is asking — mayActOn already allows it', () => {
+  const calendars = [{ id: 'conn-1', label: 'hello@veyago.cloud', employeeId: null, live: true, status: 'connected' }];
+  assert.match(load({ calendars, manager: false, parts: ['events', 'team', 'calendars'] }).view(), /data-agenda-calendar-sync="conn-1"/);
+});
+
+test('Reconnect is offered for your own calendar always, and for the studio\'s only to an owner or admin', () => {
+  const own = { id: 'conn-2', label: 'me@veyago.cloud', employeeId: 'e-me', live: false };
+  const studio = { id: 'conn-1', label: 'hello@veyago.cloud', employeeId: null, live: false };
+  const parts = ['events', 'team', 'calendars'];
+  assert.match(load({ calendars: [own], manager: false, parts }).view(), /data-agenda-calendar-reconnect="conn-2"/);
+  assert.doesNotMatch(load({ calendars: [studio], manager: false, parts }).view(), /data-agenda-calendar-reconnect=/,
+    'reconnecting the studio\'s calendar is an owner or admin\'s to do, as connecting one is');
+  assert.match(load({ calendars: [studio], manager: true, parts }).view(), /data-agenda-calendar-reconnect="conn-1"/);
+});
+
+test('Connect a calendar is offered only to an owner or admin, since microsoft-connect refuses anyone else', () => {
+  assert.doesNotMatch(load({ manager: false }).view(), /data-agenda-calendar-connect/);
+  assert.match(load({ manager: true }).view(), /data-agenda-calendar-connect/);
+});
+
+test('Sync now asks for that connection, then refreshes the calendars and events parts — not the whole workspace', async () => {
+  const h = load({ calendars: [{ id: 'conn-1', label: 'hello@veyago.cloud', employeeId: null, live: true }] });
+  h.click(target('data-agenda-calendar-sync', 'conn-1'));
+  await settle();
+  assert.deepEqual(h.synced, ['conn-1']);
+  /* An object made inside the sandbox has the sandbox's own Object prototype,
+     which strict deep-equality rejects even for otherwise identical values —
+     the same reason tests/actions.test.mjs spreads before comparing. */
+  assert.deepEqual(JSON.parse(JSON.stringify(h.loads2)), [{ quiet: true, only: ['calendars', 'events'] }]);
+  assert.match(h.toasts.at(-1), /Synced: 2 events/);
+});
+
+test('Sync now says why a sync could not be started, in the function\'s own words', async () => {
+  const h = load({
+    calendars: [{ id: 'conn-1', label: 'hello@veyago.cloud', employeeId: null, live: true }],
+    syncCalendar: () => { throw new Error('That calendar is not connected. Reconnect it first.'); }
+  });
+  h.click(target('data-agenda-calendar-sync', 'conn-1'));
+  await settle();
+  assert.deepEqual(h.toasts, ['That calendar is not connected. Reconnect it first.']);
+});
+
+test('Reconnect opens a tab before asking, so a popup blocker does not eat the click, then sends it to Microsoft', async () => {
+  const h = load({ calendars: [{ id: 'conn-2', label: 'me@veyago.cloud', employeeId: 'e-me', live: false }] });
+  h.click(target('data-agenda-calendar-reconnect', 'conn-2'));
+  await settle();
+  assert.equal(h.opened.length, 1, 'the tab is opened synchronously, before the async call');
+  assert.deepEqual(h.connected, [['me@veyago.cloud', undefined]], 'no employeeId: a reconnect keeps whose calendar it is');
+  assert.match(h.toasts.at(-1), /Finish in the Microsoft tab/);
+});
+
+test('a reconnect that could not start closes the tab it opened and says why, rather than leaving a blank one open', async () => {
+  const h = load({
+    calendars: [{ id: 'conn-2', label: 'me@veyago.cloud', employeeId: 'e-me', live: false }],
+    connectCalendar: () => { throw new Error('Only an owner or admin can reconnect a studio mailbox or calendar.'); }
+  });
+  h.click(target('data-agenda-calendar-reconnect', 'conn-2'));
+  await settle();
+  assert.deepEqual(h.toasts, ['Only an owner or admin can reconnect a studio mailbox or calendar.']);
+});
+
+test('Connect a calendar asks for an address and whose it is; Studio is the default, sent as employeeId null', async () => {
+  const team = [{ id: 'e-ana', name: 'Ana Lima' }];
+  const h = load({ manager: true, team });
+  h.click(target('data-agenda-calendar-connect', ''));
+  assert.equal(h.modals.length, 1);
+  assert.match(h.modals[0].body, /<h2>Connect a calendar<\/h2>/);
+  assert.match(h.modals[0].body, /<option value="">Studio \(shared with everyone\)<\/option>/);
+  assert.match(h.modals[0].body, /<option value="e-ana">Ana Lima<\/option>/);
+});
+
+test('connecting sends the address and, for a named team member, their id as employeeId', async () => {
+  const team = [{ id: 'e-ana', name: 'Ana Lima' }];
+  const h = load({ manager: true, team });
+  h.click(target('data-agenda-calendar-connect', ''));
+  h.type({ address: ' ana@veyago.cloud ', whose: 'e-ana' });
+  await h.submit();
+  assert.deepEqual(h.connected, [['ana@veyago.cloud', 'e-ana']]);
+  assert.equal(h.opened.length, 1, 'a tab is reserved before the async call, as Reconnect does');
+  assert.match(h.toasts.at(-1), /Finish in the Microsoft tab/);
+});
+
+test('leaving "whose" on Studio sends employeeId null, explicitly — leaving it out would mean "keep the owner it has"', async () => {
+  const h = load({ manager: true });
+  h.click(target('data-agenda-calendar-connect', ''));
+  h.type({ address: 'hello@veyago.cloud', whose: '' });
+  await h.submit();
+  assert.deepEqual(h.connected, [['hello@veyago.cloud', null]]);
+});
+
+test('connecting needs an address, said on the dialog rather than sent to Microsoft empty', async () => {
+  const h = load({ manager: true });
+  h.click(target('data-agenda-calendar-connect', ''));
+  h.type({ address: '  ', whose: '' });
+  await h.submit();
+  assert.equal(h.connected.length, 0, 'nothing was sent to Microsoft');
+  assert.equal(h.opened.length, 0, 'and no blank tab was left open either');
+  assert.match(h.error.textContent, /address/i);
 });

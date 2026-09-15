@@ -16,19 +16,24 @@
  * here, that nobody was invited. While one is being booked, New event waits:
  * a dialog closed with Esc cannot book it a second time.
  *
- * Whoever booked an event made here, or an owner or admin, changes it (0048,
- * as agenda-ui.js reads it: agendaUi.canChange); an event from a connected
- * calendar is changed in that calendar. The dialog is filled in with the event
- * as the page drew it, on the clock of whoever edits it, and sends only what
- * they changed. A time still reading as the dialog filled it in is not sent:
- * read back, a time in the hour the clocks repeat in autumn names the other
+ * Whoever may act on an event's calendar changes it (0048, 0057, as
+ * agenda-ui.js reads it: agendaUi.canChange) — whoever booked a hand-made
+ * one, or an owner or admin; the studio's or your own for one synced from a
+ * connected calendar, which workspaceActions.updateEvent then sends to
+ * update-calendar-event rather than the table directly, since a synced row is
+ * nobody's to write there. The dialog is filled in with the event as the page
+ * drew it, on the clock of whoever edits it, and sends only what they
+ * changed. A time still reading as the dialog filled it in is not sent: read
+ * back, a time in the hour the clocks repeat in autumn names the other
  * instant, and would move the event. The change is made against the event's
  * updated_at, so one someone made meanwhile is refused, not overwritten. The
  * end moves with the start, keeping how long the event is. An all-day event
- * keeps its day. A refusal is said on the dialog (dialog-forms.js); once
- * saved, the keyboard goes back to Edit — or to the page's heading, when the
- * event moved out of the weeks loaded and its page is fetching it. Until the
- * page has the change, Edit waits. Tested in tests/event-edit.test.mjs.
+ * keeps its day. A refusal is said on the dialog (dialog-forms.js) — a
+ * synced event's own from update-calendar-event, which reads it back from the
+ * calendar first and refuses a cancelled, recurring or private one there too.
+ * Once saved, the keyboard goes back to Edit — or to the page's heading, when
+ * the event moved out of the weeks loaded and its page is fetching it. Until
+ * the page has the change, Edit waits. Tested in tests/event-edit.test.mjs.
  */
 const eventEdit = (function () {
   'use strict';
@@ -354,7 +359,7 @@ const eventEdit = (function () {
       sending(form, () => workspaceActions.createEvent(checked.event), outcome => {
         toast(booked(outcome, checked.event.attendees.length > 0) + hiddenFrom(checked.event.kind));
         refocus([{ selector: '#main [data-create="agenda"]' }, { selector: '#main h1', heading: true }]);
-      }, { record: NEW_RECORD });
+      }, { record: NEW_RECORD, only: newEventParts(checked.event) });
     });
   }
 
@@ -375,8 +380,14 @@ const eventEdit = (function () {
   /* What an event's change is saved under until the page has it
      (dialog-forms.js): the same event whatever case its address is in. */
   const recordOf = event => `event:${text(event && event.id).toLowerCase()}`;
-  /* The parts of the store the event comes back in (agenda-ui.js partsOf). */
+  /* The parts of the store the event comes back in (agenda-ui.js partsOf),
+     and — for a change that has not been saved yet — the same rule read off
+     newEvent()'s own shape (projectId, not the row's project_id) rather than
+     a saved row this new event does not have. Both used for `only`: reloading
+     the whole workspace for one event's save is the audit's own "Every event
+     save reloads the whole workspace". */
   const partsOf = event => (window.agendaUi && typeof agendaUi.partsOf === 'function' ? agendaUi.partsOf(event) : ['events']);
+  const newEventParts = event => (event && event.projectId ? ['events', 'projectEvents'] : ['events']);
 
   /* Moving the start moves the end with it, keeping how long the event is —
      from wherever the end was when the start last moved. Answers how to move
@@ -438,12 +449,14 @@ const eventEdit = (function () {
   function openEdit(event) {
     const row = rowOf(event);
     const timed = row.all_day !== true;
+    const synced = row.connection_id != null;
     const times = timed
       ? `<div class="form-pair">${field('Starts', `<input type="datetime-local" name="startsAt" required value="${esc(localValue(row.starts_at))}">`)}`
         + `${field('Ends', `<input type="datetime-local" name="endsAt" value="${esc(localValue(row.ends_at))}">`)}</div>`
       : '';
     showModal('AGENDA · EVENT', `<h2>Edit ${esc(text(row.title || event.title) || 'event')}</h2>`
       + (timed ? '' : '<p class="form-note">It is an all-day event, so its day stays as it is here.</p>')
+      + (synced ? '<p class="form-note">It is in a connected calendar: saving here changes it in Outlook too.</p>' : '')
       + dialogForms.form('event-edit-form',
         field('Title', `<input name="title" required maxlength="${TITLE_LIMIT}" autofocus value="${esc(row.title)}">`)
         + times
@@ -462,10 +475,10 @@ const eventEdit = (function () {
         toast('Nothing changed.');
         return;
       }
-      sending(form, () => workspaceActions.updateEvent(text(row.id || event.id), checked.changes, row.updated_at || null), () => {
-        toast('Event saved.');
+      sending(form, () => workspaceActions.updateEvent(text(row.id || event.id), checked.changes, row.updated_at || null, row.connection_id || null), () => {
+        toast(synced ? 'Event saved, and updated in Outlook.' : 'Event saved.');
         refocus([{ selector: `#main [data-agenda-edit="${attr(event.id)}"]` }, { selector: '#main h1', heading: true }]);
-      }, { record: recordOf(event), part: partsOf(event) });
+      }, { record: recordOf(event), part: partsOf(event), only: partsOf(event) });
     });
   }
 

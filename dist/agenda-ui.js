@@ -1,25 +1,37 @@
-/* agenda-ui.js — the Agenda: a week, a day or a schedule, and an event's page.
+/* agenda-ui.js — the Agenda: a week, a day, a schedule or a month, and an
+ * event's page.
  *
  * As agenda-model.js works them out. Any week can be shown: Previous, Today and
  * Next move a week at a time, and a day picked in the mini month opens that
  * day, in its own week. Saturday and Sunday are drawn whenever something is on
- * them, today is one of them, or one was picked. An event is on every day it
- * covers, at the time it has on that day, and one that overlaps another says
- * which. Kinds read in their own colours. A hand-made event can be removed by
- * whoever booked it, or by an owner or admin (0048); one synced from a
- * calendar is changed there. An event's page says who is invited and how each
- * answered, whether it is only tentative or cancelled, who booked it, and the
- * company, person and project it is filed under — each by its id. Each
- * calendar — a kind of event — can be hidden from the week, the day and the
- * schedule, and this browser remembers which.
+ * them, today is one of them, or one was picked. Month shows a whole month at
+ * a glance, spill from either side included, each day's events as compact
+ * chips — Previous and Next step by a month there instead. An event is on
+ * every day it covers, at the time it has on that day, and one that overlaps
+ * another says which. Kinds read in their own colours. Whoever may act on an
+ * event's calendar — whoever booked a hand-made one, or an owner or admin
+ * (0048); the studio's or your own for a synced one (0057) — can edit or
+ * remove it: a synced change or removal reaches Outlook first, through
+ * update-calendar-event and delete-calendar-event, before the local row
+ * follows. An event's page says who is invited and how each answered, whether
+ * it is only tentative or cancelled, who booked it and who organised it, its
+ * video-call link, the calendar it came from, and the company, person and
+ * project it is filed under — each by its id. Each calendar — a kind of event
+ * — can be hidden from the week, the day and the schedule, and this browser
+ * remembers which. A connections panel below the mini month names every
+ * calendar this session may act on, when it last synced, and lets it be
+ * reconnected, asked to sync now, or — an owner or admin only — a new one
+ * connected (0057).
  *
  * The agenda used to be one Monday-to-Friday week that could not move, found
  * each event by its day of the month, and never showed a weekend event, an
  * all-day event west of Greenwich, or an event that began before the week.
  *
  * The week on screen is the store's to load (workspaceStore.showWeek), beside
- * today's, which the Overview needs. These replace agendaView and eventDetail
- * from workspace.js, and load after it. Tested in tests/agenda-ui.test.mjs.
+ * today's, which the Overview needs; the month on screen, only while Month is
+ * the view, the same way (showMonth). These replace agendaView and
+ * eventDetail from workspace.js, and load after it. Tested in
+ * tests/agenda-ui.test.mjs.
  */
 (function () {
   'use strict';
@@ -39,7 +51,7 @@
      140px days, seven with the weekend (workspace.css) — the schedule, with
      Week a tap away. */
   const MODE_KEY = 'veyago.agenda.mode';
-  const MODES = ['week', 'day', 'schedule'];
+  const MODES = ['week', 'day', 'schedule', 'month'];
   let savedMode = null;
   try {
     const saved = window.localStorage ? window.localStorage.getItem(MODE_KEY) : null;
@@ -131,17 +143,46 @@
 
   /* ── The week ──────────────────────────────────────────────────────── */
 
-  function toolbar(drawn, now) {
-    const name = A.weekName(week, now);
-    const caption = [name, weekReady() ? '' : weekFailed() ? 'Did not load' : 'Loading…'].filter(Boolean).join(' · ');
+  /* `monthGrid`, `monthIsReady`: only while Month is the view on screen — the
+     month's own name and load state stand in for the week's. Previous, Today
+     and Next step by whole months there instead of weeks (the click handler,
+     below). */
+  function toolbar(drawn, now, monthGrid, monthIsReady) {
+    const unit = monthGrid ? 'month' : 'week';
+    const name = monthGrid ? '' : A.weekName(week, now);
+    const ready = monthGrid ? monthIsReady : weekReady();
+    const caption = [name, ready ? '' : weekFailed() ? 'Did not load' : 'Loading…'].filter(Boolean).join(' · ');
+    const heading = monthGrid ? `${monthGrid.name} ${monthGrid.year}` : A.rangeLabel(drawn);
     return '<div class="view-toolbar agenda-toolbar"><div class="agenda-week">'
-      + `<button type="button" class="btn agenda-step" data-agenda-week="previous" aria-label="Previous week">${icon('chevron')}</button>`
+      + `<button type="button" class="btn agenda-step" data-agenda-week="previous" aria-label="Previous ${unit}">${icon('chevron')}</button>`
       + '<button type="button" class="btn" data-agenda-week="today">Today</button>'
-      + `<button type="button" class="btn agenda-step" data-agenda-week="next" aria-label="Next week">${icon('chevron')}</button>`
-      + `<h2>${esc(A.rangeLabel(drawn))}${caption ? ` <small>${esc(caption)}</small>` : ''}</h2></div>`
-      + segments([['week', 'Week'], ['day', 'Day'], ['schedule', 'Schedule']], agendaMode, 'agendaMode')
+      + `<button type="button" class="btn agenda-step" data-agenda-week="next" aria-label="Next ${unit}">${icon('chevron')}</button>`
+      + `<h2>${esc(heading)}${caption ? ` <small>${esc(caption)}</small>` : ''}</h2></div>`
+      + segments([['week', 'Week'], ['day', 'Day'], ['schedule', 'Schedule'], ['month', 'Month']], agendaMode, 'agendaMode')
       + '</div>';
   }
+
+  /* The whole month a day belongs to, since eventsOverlapping() needs its
+     range, not just its cells: the day before the grid's first cell to the
+     day after its last, so a multi-day event crossing the grid's edge still
+     shows. `key` ("2026-10") is what store.js monthLoaded() is asked about —
+     the month the grid is actually FOR, not the possibly-different month its
+     spill-over first or last cell belongs to. */
+  function monthRangeOf(m) {
+    if (!m || !Array.isArray(m.cells) || !m.cells.length) return null;
+    const first = A.parseDay(m.cells[0].key);
+    const last = A.parseDay(m.cells[m.cells.length - 1].key);
+    if (!first || !last) return null;
+    const dayMs = 24 * 60 * 60 * 1000;
+    const anchor = m.cells.find(c => c.inMonth) || m.cells[0];
+    return Object.freeze({
+      key: anchor.key.slice(0, 7),
+      since: new Date(first.getTime() - dayMs).toISOString(),
+      to: new Date(last.getTime() + dayMs).toISOString()
+    });
+  }
+
+  const monthReady = range => !range || !store() || typeof store().monthLoaded !== 'function' || store().monthLoaded(range.key);
 
   function miniMonth(chosen, drawn, now) {
     const m = A.month(chosen ? chosen.key : null, week, now);
@@ -157,6 +198,58 @@
       + `<div class="mini-week" aria-hidden="true">${['M', 'T', 'W', 'T', 'F', 'S', 'S'].map(d => `<span>${d}</span>`).join('')}</div>`
       + `<div class="mini-days">${m.cells.map(cell).join('')}</div>`
       + `<p class="quiet-text">${esc([A.weekName(week, now), A.rangeLabel(drawn, false)].filter(Boolean).join(' · '))}</p></section>`;
+  }
+
+  /* ── Connected calendars (0057, "No way to connect a calendar or see its
+     last sync") — a small panel below the mini month: every calendar this
+     session may act on (state.calendars, filtered by RLS the same way
+     mailboxes() already is), when it last synced, and a way to reconnect one
+     or ask it to sync now, without waiting for the schedule (sync-
+     calendar-scheduled, every 15 minutes) or the next time the Agenda opens.
+     "Connect a calendar" mirrors microsoft-connect's own rule: an owner or
+     admin, saying whose (0057 actions.connectCalendar; connection-rules.ts
+     connectRefusal on the backend, which this only avoids a doomed round
+     trip to). ──────────────────────────────────────────────────────────── */
+
+  const MINUTE = 60 * 1000;
+  /* Whether this session may reconnect a calendar (microsoft-connect's own
+     rule, connection-rules.ts connectRefusal): the studio's needs an owner
+     or admin; state.calendars never carries a colleague's personal one — the
+     query is filtered by RLS the same way mailboxesFor() already is — so
+     anything else here is already this person's own. */
+  const canReconnect = cal => (cal.employeeId === null ? isManager() : true);
+
+  function syncedNote(cal) {
+    if (!cal.live) return cal.status === 'needs_reauth' ? 'Needs reconnecting' : 'Not syncing';
+    if (!cal.lastSyncedAt) return 'Not synced yet';
+    const minutes = Math.round((Date.now() - new Date(cal.lastSyncedAt).getTime()) / MINUTE);
+    if (minutes < 1) return 'Synced just now';
+    if (minutes < 60) return `Synced ${minutes} min ago`;
+    const hours = Math.round(minutes / 60);
+    return hours < 24 ? `Synced ${hours} h ago` : `Synced ${Math.round(hours / 24)} d ago`;
+  }
+
+  function connectionRow(cal) {
+    const sync = `<button type="button" class="btn text-btn" data-agenda-calendar-sync="${esc(cal.id)}">Sync now</button>`;
+    const reconnect = canReconnect(cal)
+      ? `<button type="button" class="btn" data-agenda-calendar-reconnect="${esc(cal.id)}">Reconnect</button>` : '';
+    return `<div class="calendar-connection"><p>${esc(cal.label)}</p>`
+      + `<small>${esc(cal.employeeId === null ? 'Studio' : (cal.ownerName || 'Personal'))}</small>`
+      + `<small class="${cal.live ? '' : 'mailbox-warning'}">${esc(syncedNote(cal))}</small>`
+      + `<div class="calendar-connection-actions">${sync}${reconnect}</div></div>`;
+  }
+
+  function connectionsPanel() {
+    const s = store();
+    const known = Boolean(s && typeof s.has === 'function' && s.has('calendars'));
+    const list = (known && s.state && s.state.calendars) || [];
+    const body = !known
+      ? '<p class="quiet-text" aria-busy="true">Loading…</p>'
+      : list.length ? list.map(connectionRow).join('')
+        : '<p class="quiet-text">No calendar is connected yet.</p>';
+    const connect = isManager()
+      ? '<button type="button" class="btn agenda-calendar-connect" data-agenda-calendar-connect>Connect a calendar</button>' : '';
+    return `<section class="panel calendar-connections"><div class="section-title"><h2>Connected calendars</h2></div>${body}${connect}</section>`;
   }
 
   /* Each calendar a toggle in its colour — the key to the colours as well —
@@ -221,6 +314,46 @@
         : `<p class="quiet-text schedule-empty">${d.hiddenCount ? inHidden(d.hiddenCount, false) : 'No events scheduled'}.</p>`)).join('')
     + '</section>';
 
+  /* A month at a glance ("No way to change weeks, and no month view"): every
+     day of the whole grid (agendaModel.month, the spill from the months
+     either side included, as the mini calendar already draws it), each day's
+     events placed the way any other view's are (agendaModel.eventsOn) — so a
+     clash, a hidden calendar or a tentative event reads the same everywhere.
+     A day busier than MAX_MONTH_EVENTS shows the rest as "+N more"; either
+     the number or a day's own events reuses data-agenda-day, so clicking any
+     of it opens Day view for that date, exactly as the mini calendar does. */
+  const MAX_MONTH_EVENTS = 3;
+
+  function monthCell(c) {
+    const key = c.key;
+    const placed = eventsLoaded() ? A.eventsOn(events, key) : [];
+    const day = shownOn({ events: placed });
+    const shown = day.events.slice(0, MAX_MONTH_EVENTS);
+    const extra = day.events.length - shown.length;
+    const names = A.dayNames(key);
+    const classes = ['month-cell', c.inMonth ? '' : 'outside', c.today ? 'today' : '', picked === key ? 'selected' : '']
+      .filter(Boolean).join(' ');
+    const html = `<div class="${classes}">`
+      + `<button type="button" class="month-day-number" data-agenda-day="${key}"`
+      + ` aria-label="${esc(names.weekday + ', ' + names.full + (picked === key ? ', picked' : ''))}"${c.today ? ' aria-current="date"' : ''}>${c.number}</button>`
+      + '<div class="month-events">'
+      + shown.map(p => `<a class="month-event type-${p.kind.value}${p.clash ? ' clash' : ''}" href="#agenda/${esc(p.id)}">`
+          + `${p.allDay ? '' : `<small>${esc(p.time)}</small> `}${esc(p.title)}</a>`).join('')
+      + (extra > 0 ? `<button type="button" class="month-more" data-agenda-day="${key}">+${extra} more</button>` : '')
+      + (day.hiddenCount ? `<small class="hidden-note">${inHidden(day.hiddenCount, shown.length > 0)}</small>` : '')
+      + '</div></div>';
+    return { html, empty: !placed.length };
+  }
+
+  function monthView(m) {
+    const cells = m.cells.map(monthCell);
+    return (cells.every(c => c.empty) ? '<p class="quiet-text week-empty">Nothing this month: room to focus.</p>' : '')
+      + '<section class="panel month-view">'
+      + `<div class="month-weekdays" aria-hidden="true">${['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map(d => `<span>${d}</span>`).join('')}</div>`
+      + `<div class="month-grid">${cells.map(c => c.html).join('')}</div>`
+      + '</section>';
+  }
+
   agendaView = function () {
     /* An address typed as #agenda/today, before this file could make it #agenda. */
     if (routeParts[1] === 'today') {
@@ -232,34 +365,65 @@
     const drawn = A.weekDays(eventsLoaded() ? events : [], week, { now, selected: picked });
     const shown = drawn.map(shownOn);
     const chosen = shown.find(d => d.selected) || shown[0] || null;
-    /* Loading until the week's events arrive or its load fails: a week still
-       on its way does not look free, nor one not yet asked for failed. */
-    const failedToLoad = (!eventsLoaded() || !weekReady()) && weekFailed();
-    const loading = !failedToLoad && (!eventsLoaded() || !weekReady());
+
+    /* Month mode's grid is anchored on `picked` — set to the 1st of the month
+       Previous/Next moved to, which need not be one of `week`'s own seven
+       days — falling back to `week`/today exactly as the mini calendar's own
+       A.month() call already does. showMonth(range) tells the store which
+       month to load, or that none is shown any more (leaving month view):
+       cheap either way when nothing changed (store.js), so calling it on
+       every render, not only when the view is switched, is how showWeek's
+       own callers already treat it too. */
+    const monthGrid = agendaMode === 'month' ? A.month(picked, week, now) : null;
+    const monthRange = monthGrid ? monthRangeOf(monthGrid) : null;
+    if (store() && typeof store().showMonth === 'function') store().showMonth(monthRange);
+
+    /* Loading until the week's or month's events arrive or the load fails: a
+       week or month still on its way does not look free, nor one not yet
+       asked for failed. */
+    const ready = monthGrid ? monthReady(monthRange) : weekReady();
+    const failedToLoad = (!eventsLoaded() || !ready) && weekFailed();
+    const loading = !failedToLoad && (!eventsLoaded() || !ready);
     const body = failedToLoad
       ? `<section class="panel agenda-waiting">${empty('The agenda did not load', 'It is tried again by itself.')}</section>`
-      : loading ? `<section class="panel agenda-waiting" aria-busy="true">${empty('Loading the week…', 'Its events are on their way.')}</section>`
+      : loading ? `<section class="panel agenda-waiting" aria-busy="true">${empty(monthGrid ? 'Loading the month…' : 'Loading the week…', 'Its events are on their way.')}</section>`
         : agendaMode === 'day' ? dayView(chosen)
           : agendaMode === 'schedule' ? scheduleView(shown)
-            : weekView(shown);
+            : monthGrid ? monthView(monthGrid)
+              : weekView(shown);
     return titlebar('A little space for what’s next.', 'Your meetings and focused work, together.', createButton('New event', 'agenda'))
-      + toolbar(drawn, now)
+      + toolbar(drawn, now, monthGrid, ready)
       + (failedToLoad || loading ? '' : kindFilter())
-      + `<div class="calendar-layout"><aside class="calendar-side">${miniMonth(chosen, drawn, now)}</aside>`
+      + `<div class="calendar-layout"><aside class="calendar-side">${miniMonth(chosen, drawn, now)}${connectionsPanel()}</aside>`
       + `<div class="calendar-primary">${body}</div></div>`;
   };
 
   /* ── An event's page ───────────────────────────────────────────────── */
 
   /* A hand-made event — no calendar connection — can be changed or removed by
-     whoever booked it, or an owner or admin (0048). A synced one belongs to its
-     calendar: changed or removed here, the next sync would put it back. An
-     event whose columns did not load shows no button rather than a guess. */
+     whoever booked it, or an owner or admin (0048). A synced one is nobody's
+     to PATCH straight through RLS (0026): update-calendar-event and delete-
+     calendar-event change it in Outlook first, then here (0057), for
+     whoever may act on the CALENDAR it is in — the studio's, shared, for any
+     member of staff, or a personal one for its own owner alone, the same
+     line the backend draws (_shared/connection-rules.ts mayActOn). Who
+     created the row is beside the point for a synced event; a manager gets
+     no special say over a colleague's own calendar either. An event whose
+     columns did not load, or whose calendar has not (state.calendars),
+     shows no button rather than a guess. */
   function canChange(event) {
     const row = rowOf(event);
-    if (row.connection_id !== null) return false;
-    return isManager() || (row.created_by != null && row.created_by === meId());
+    if (row.connection_id === null) {
+      return isManager() || (row.created_by != null && row.created_by === meId());
+    }
+    const cal = calendarOf(row.connection_id);
+    return Boolean(cal) && (cal.employeeId === null || cal.employeeId === meId());
   }
+
+  /* A connected calendar by its connection id (store.js state.calendars,
+     0057): what canChange, and the event page's "Calendar" property, read to
+     say whose it is. */
+  const calendarOf = id => (id == null ? null : ((store() && store().state && store().state.calendars) || []).find(c => c && c.id === id) || null);
 
   /* The store's lookup (workspaceStore.eventById): the weeks loaded, then the
      project meetings coming up. Before the store is on the page, nothing is. */
@@ -336,7 +500,16 @@
     const actions = canChange(e)
       ? `<button type="button" class="btn" data-agenda-edit="${eventId}">Edit event</button><button type="button" class="btn" data-agenda-delete="${eventId}">Remove event</button>`
       : '';
-    const booked = row.connection_id === undefined ? [] : [['Booked', esc(row.connection_id ? 'In a connected calendar' : 'In the workspace only')]];
+    /* Which calendar, and whose (0057): the connection's own label once
+       state.calendars has it, "studio calendar" for the shared one, else the
+       team member it belongs to. A connection not among those loaded — the
+       calendars part failed, or this is not one the session can see — falls
+       back to the same plain word the page always said, rather than a guess. */
+    const calendar = row.connection_id ? calendarOf(row.connection_id) : null;
+    const calendarNote = calendar
+      ? `${calendar.label} (${calendar.employeeId === null ? 'studio calendar' : (calendar.ownerName || 'personal calendar')})`
+      : 'In a connected calendar';
+    const booked = row.connection_id === undefined ? [] : [['Booked', esc(row.connection_id ? calendarNote : 'In the workspace only')]];
     /* The lists never load a cancelled event, but one opened by its link can
        be one: it says so, as a tentative one does. One made in Outlook was
        booked by no one here; until the team has loaded, no one is said to have
@@ -344,6 +517,18 @@
     const statusRow = STATUS_WORDS.has(row.status) ? [['Status', esc(STATUS_WORDS.get(row.status))]] : [];
     const teamLoaded = Boolean(store() && typeof store().has === 'function' && store().has('team'));
     const booker = row.created_by && teamLoaded ? [['Booked by', esc(nameOf(row.created_by) || 'Someone no longer on the team')]] : [];
+    /* A synced event's own organiser, video-call link and booking zone (0057:
+       graph-message.ts kept these instead of throwing them away). Checked for
+       https here too, on the values as this session actually has them — never
+       trusting a single layer, the way esc() is never skipped because a value
+       "should" already be safe. */
+    const meetingRow = row.meeting_url && /^https:\/\//i.test(row.meeting_url)
+      ? [['Video call', `<a href="${esc(row.meeting_url)}" target="_blank" rel="noopener noreferrer">Join</a>`]]
+      : [];
+    const organizerRow = (row.organizer_name || row.organizer_email)
+      ? [['Organiser', esc(row.organizer_name || row.organizer_email)]]
+      : [];
+    const zoneRow = row.time_zone ? [['Booked in', esc(row.time_zone)]] : [];
     const company = row.company_id ? companyOf(row.company_id) : null;
     return detailHeader('agenda', 'Calendar', title, A.dateLabel(e), actions)
       + '<div class="record-layout"><div class="record-main">'
@@ -358,8 +543,11 @@
         ...statusRow,
         ['Calendar', pill(kind.label, kind.tone)],
         ['Where', esc(row.location || 'Not given')],
+        ...meetingRow,
         ...booked,
-        ...booker
+        ...booker,
+        ...organizerRow,
+        ...zoneRow
       ])}`
       + linkedPanel('Connected work', [
         ...(company ? [[`crm/companies/${company.id}`, company.name, 'Company', 'crm']] : []),
@@ -381,17 +569,94 @@
      dialog, and until the page no longer has the event its Edit and Remove
      wait (the click handler below, and event-edit.js). */
   function openRemove(event) {
+    const connectionId = rowOf(event).connection_id || null;
     showModal('AGENDA · REMOVE', `<h2>Remove ${esc(titleOf(event))}?</h2>`
-      + '<p class="form-note">It leaves the agenda for everyone.</p>'
+      + `<p class="form-note">${connectionId ? 'It is also removed from the calendar it is in.' : 'It leaves the agenda for everyone.'}</p>`
       + dialogForms.form('agenda-remove-form', '', 'Remove event'));
     const form = document.getElementById('agenda-remove-form');
     form.addEventListener('submit', submitted => {
       submitted.preventDefault();
       dialogForms.quiet(form);
-      dialogForms.sending(form, () => workspaceActions.deleteEvent(String(event.id)), () => {
+      dialogForms.sending(form, () => workspaceActions.deleteEvent(String(event.id), connectionId), () => {
         navigate('agenda');
         toast('Event removed.');
-      }, { record: `event:${String(event.id).toLowerCase()}`, part: partsOf(event) });
+      }, { record: `event:${String(event.id).toLowerCase()}`, part: partsOf(event), only: partsOf(event) });
+    });
+  }
+
+  /* A tab reserved before the async call, the way mail.js's own mailbox
+     Reconnect already does: opened on the click itself, so a browser does
+     not treat it as an unrequested pop-up once microsoft-connect answers a
+     moment later. Not itself unit-tested past this call: coming back to this
+     tab and reloading the workspace is DOM-only, the same as mail.js's
+     identical, already-shipped mechanism, which this project has never had a
+     harness for either (no jsdom, no window to leave and return to). */
+  function openTab() {
+    try {
+      return typeof window.open === 'function' ? window.open('', '_blank') : null;
+    } catch (err) {
+      return null;
+    }
+  }
+  function toMicrosoft(tab, url) {
+    if (tab) { tab.opener = null; tab.location.href = url; return; }
+    if (window.location && typeof window.location.assign === 'function') window.location.assign(url);
+  }
+
+  function openReconnect(button, cal) {
+    const tab = openTab();
+    if (tab) tab.document.title = 'Connecting to Microsoft…';
+    button.disabled = true;
+    workspaceActions.connectCalendar(cal.label)
+      .then(url => {
+        toMicrosoft(tab, url);
+        toast(`Finish in the Microsoft tab. ${cal.label} updates when you come back.`);
+      })
+      .catch(err => {
+        if (tab) tab.close();
+        toast((err && err.message) || 'Reconnecting could not start.');
+      })
+      .then(() => { button.disabled = false; });
+  }
+
+  /* Connecting a NEW calendar — never a reconnect — is an owner or admin's
+     to do, saying whose it is (microsoft-connect's own rule,
+     connection-rules.ts connectRefusal): "Studio" is the form's default, sent
+     as employeeId null explicitly, since leaving it out would mean "keep
+     whatever owner it already has" — right for a reconnect, wrong for a
+     brand new row that has none yet. */
+  function openConnect() {
+    const offered = (typeof team !== 'undefined' && Array.isArray(team) ? team : []).filter(m => m && m.id);
+    showModal('AGENDA · CONNECT', '<h2>Connect a calendar</h2>'
+      + dialogForms.form('agenda-connect-form',
+        dialogForms.field('Address', '<input name="address" type="email" required autofocus placeholder="name@veyago.cloud">')
+        + dialogForms.field('Whose', '<select name="whose"><option value="">Studio (shared with everyone)</option>'
+          + dialogForms.options(offered.map(m => ({ value: m.id, label: m.name })), null) + '</select>'),
+        'Continue to Microsoft'));
+    const form = document.getElementById('agenda-connect-form');
+    form.addEventListener('submit', submitted => {
+      submitted.preventDefault();
+      const button = form.querySelector('[type="submit"]');
+      if (button.disabled) return;
+      dialogForms.quiet(form);
+      const data = new FormData(form);
+      const address = String(data.get('address') || '').trim();
+      if (!address) { dialogForms.say(form, 'Say which address to connect.', 'address'); return; }
+      const whose = String(data.get('whose') || '');
+      button.disabled = true;
+      const tab = openTab();
+      if (tab) tab.document.title = 'Connecting to Microsoft…';
+      workspaceActions.connectCalendar(address, whose || null)
+        .then(url => {
+          toMicrosoft(tab, url);
+          dialogForms.closeDialog(form);
+          toast(`Finish in the Microsoft tab. ${address} updates when you come back.`);
+        })
+        .catch(err => {
+          if (tab) tab.close();
+          button.disabled = false;
+          dialogForms.say(form, (err && err.message) || 'Connecting could not start.');
+        });
     });
   }
 
@@ -404,7 +669,16 @@
       const now = new Date();
       const to = step.dataset.agendaWeek;
       if (to === 'today') show(A.weekOf(now), A.dayKey(now));
-      else show(A.shiftWeek(week, to === 'previous' ? -1 : 1), null);
+      else if (agendaMode === 'month') {
+        /* A month, not a week: the 1st of the one before or after whichever
+           the grid is showing now (picked, else week's own Monday) — passed
+           as `picked`, which A.month() reads before it falls back to `week`,
+           so the grid moves even when that 1st falls in a week still mostly
+           in the OLD month. */
+        const anchor = A.parseDay(picked) || A.parseDay(week.key) || now;
+        const target = A.dayKey(new Date(anchor.getFullYear(), anchor.getMonth() + (to === 'previous' ? -1 : 1), 1));
+        show(A.weekOf(target), target);
+      } else show(A.shiftWeek(week, to === 'previous' ? -1 : 1), null);
       repaintKeepingFocus();
       return;
     }
@@ -464,6 +738,43 @@
         title.setAttribute('tabindex', '-1');
         title.focus({ preventScroll: true });
       }
+      return;
+    }
+    const sync = e.target.closest && e.target.closest('[data-agenda-calendar-sync]');
+    if (sync) {
+      e.preventDefault();
+      if (sync.disabled) return;
+      if (!store() || !store().state.loaded) { toast('Not yet: the workspace is still loading.'); return; }
+      const id = sync.dataset.agendaCalendarSync;
+      sync.disabled = true;
+      workspaceActions.syncCalendar(id)
+        .then(result => {
+          const n = result && typeof result.events === 'number' ? result.events : null;
+          toast(n === null ? 'Synced.' : `Synced: ${n} event${n === 1 ? '' : 's'}.`);
+          /* calendars for its fresh last-synced time, events for anything new —
+             not the whole workspace: the audit's own "every save reloads the
+             whole workspace" applies here too. */
+          return store().load({ quiet: true, only: ['calendars', 'events'] });
+        })
+        .catch(err => { toast((err && err.message) || 'Syncing could not start.'); })
+        .then(() => { sync.disabled = false; });
+      return;
+    }
+    const reconnect = e.target.closest && e.target.closest('[data-agenda-calendar-reconnect]');
+    if (reconnect) {
+      e.preventDefault();
+      if (reconnect.disabled) return;
+      if (!store() || !store().state.loaded) { toast('Not yet: the workspace is still loading.'); return; }
+      const cal = ((store().state.calendars) || []).find(c => c && c.id === reconnect.dataset.agendaCalendarReconnect);
+      if (!cal) return;
+      openReconnect(reconnect, cal);
+      return;
+    }
+    const connect = e.target.closest && e.target.closest('[data-agenda-calendar-connect]');
+    if (connect) {
+      e.preventDefault();
+      if (!store() || !store().state.loaded) { toast('Not yet: the workspace is still loading.'); return; }
+      openConnect();
       return;
     }
     const remove = e.target.closest && e.target.closest('[data-agenda-delete]');
