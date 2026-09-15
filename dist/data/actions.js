@@ -74,6 +74,27 @@
   /* Every status a task can be reopened to — everything but 'done' itself. */
   var REOPEN_STATUSES = ['todo', 'in_progress', 'blocked'];
 
+  /* Text after a JSON parse, or null when it is not JSON: an RPC's `detail`
+     (create_contact_with_company, 0053) names the record it clashed with, but
+     only when the database sent one — an unrelated failure has none. */
+  function parsedDetail(text) {
+    if (!text) return null;
+    try {
+      var parsed = JSON.parse(text);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  /* A duplicate key on one of the CRM's own unique indexes, read as the
+     sentence a person typed something wrong would want — never the
+     database's "duplicate key value violates unique constraint …", which
+     names a constraint, not what was typed. */
+  function crmDuplicate(res, index) {
+    return Boolean(res.error) && new RegExp(index, 'i').test(res.error.message);
+  }
+
   /* Read or starred, through update-mail-state, which changes Outlook, the
      stored messages and the thread together. There is deliberately no fallback
      to writing the thread row: that never reached Outlook and was undone by the
@@ -539,13 +560,21 @@
       var domain = (fields.domain || '').trim().toLowerCase()
         .replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/.*$/, '') || null;
       /* In the currency it was given (crmModel.companyForm), or the column's own default. */
-      return one(await sb().from('crm_companies').insert(Object.assign({
+      var res = await sb().from('crm_companies').insert(Object.assign({
         name: fields.name.trim(), domain: domain,
         kind: fields.kind || 'prospect', stage: fields.stage || 'lead',
         value: fields.value ?? null, notes: fields.notes || null,
         /* No owner, when the form says none; the person adding it, when nothing says. */
         owner_id: fields.ownerId !== undefined ? fields.ownerId : (me() ? me().id : null)
-      }, fields.currency ? { currency: fields.currency } : {})).select().single(), 'add the company');
+      }, fields.currency ? { currency: fields.currency } : {})).select().single();
+      /* The client already asks crmModel.duplicateCompanies before sending this
+         (crm-forms.js); this is only the same domain landing here anyway — a
+         race, or data that had not loaded yet — and the raw index name is not
+         a sentence anyone typed something wrong would understand. */
+      if (crmDuplicate(res, 'crm_companies_domain_idx')) {
+        throw new Error('A company at that domain is already in the CRM.');
+      }
+      return one(res, 'add the company');
     },
 
     /* What an edit to a company changes (crmModel.companyChanges), and only
@@ -560,13 +589,56 @@
 
     async createContact(fields) {
       must(fields && fields.fullName && fields.fullName.trim(), 'A contact needs a name.');
-      return one(await sb().from('crm_contacts').insert({
+      var res = await sb().from('crm_contacts').insert({
         full_name: fields.fullName.trim(),
         company_id: fields.companyId || null,
         email: (fields.email || '').trim().toLowerCase() || null,
         phone: fields.phone || null, title: fields.title || null,
         notes: fields.notes || null
-      }).select().single(), 'add the contact');
+      }).select().single();
+      /* Same reasoning as createCompany's domain check, above: the client
+         already asked crmModel.duplicateContacts, so this is a race or stale
+         data, not a typo — say so in a sentence, not the index's name. */
+      if (crmDuplicate(res, 'crm_contacts_email_idx')) {
+        throw new Error('That email address is already used by another contact.');
+      }
+      return one(res, 'add the contact');
+    },
+
+    /* A contact and, when none was picked, their company, in one transaction
+       (create_contact_with_company, 0053): the workspace used to add the two
+       with two requests (createCompany then createContact, above), so a
+       contact refused after its company was made — an address already in the
+       CRM, say — left the company behind, for a retry to add again. Exactly
+       one of companyId or companyName is sent, matching what the database
+       takes; neither means no company, as createContact's does. A refusal
+       that names the record it clashed with (a duplicate address, or more
+       than one company by that name) carries that id or those ids along, so
+       the dialog can point at it rather than only saying so. */
+    async createContactWithCompany(fields) {
+      var f = fields || {};
+      var res = await sb().rpc('create_contact_with_company', {
+        p_full_name: f.fullName || '',
+        p_email: f.email || null,
+        p_phone: f.phone || null,
+        p_title: f.title || null,
+        p_is_primary: Boolean(f.isPrimary),
+        p_notes: f.notes || null,
+        p_enquiry_id: f.enquiryId || null,
+        p_company_id: f.companyId || null,
+        p_company_name: f.companyName || null
+      });
+      if (res.error) {
+        var err = new Error('Could not add the contact: ' + res.error.message);
+        var detail = parsedDetail(res.error.details);
+        if (detail && detail.contact_id) err.conflictContactId = detail.contact_id;
+        if (detail && detail.company_ids) err.matchingCompanyIds = detail.company_ids;
+        throw err;
+      }
+      /* A function with OUT parameters answers one row: as a bare object from
+         most Postgres versions, as a one-row array from some — read either. */
+      var row = Array.isArray(res.data) ? res.data[0] : res.data;
+      return { contactId: row && row.contact_id, companyId: row && row.company_id };
     },
 
     /* What an edit to a contact changes (crmModel.contactChanges), and only that,
@@ -582,6 +654,29 @@
     async promoteEnquiry(enquiryId) {
       var res = await sb().rpc('promote_enquiry_to_crm', { p_enquiry_id: enquiryId });
       if (res.error) throw new Error('Could not promote the enquiry: ' + res.error.message);
+      return res.data;
+    },
+
+    /* Merging two companies, or two contacts, into one (merge_companies() /
+       merge_contacts(), 0053; owners and admins only): everything that
+       pointed at the one merged away — its projects, tickets, mail, events,
+       invoices, notes and, for a contact, project links — points at the one
+       kept afterwards, and the merged record is deleted and marked where it
+       went. `keepId` stays in the CRM; `dropId` is folded into it. Answers
+       what the database moved, so the dialog can say so. */
+    async mergeCompanies(keepId, dropId) {
+      must(keepId && dropId, 'Pick the company to keep and the company to merge into it.');
+      must(keepId !== dropId, 'A company cannot be merged into itself.');
+      var res = await sb().rpc('merge_companies', { p_keep: keepId, p_drop: dropId });
+      if (res.error) throw new Error('Could not merge the companies: ' + res.error.message);
+      return res.data;
+    },
+
+    async mergeContacts(keepId, dropId) {
+      must(keepId && dropId, 'Pick the contact to keep and the contact to merge into it.');
+      must(keepId !== dropId, 'A contact cannot be merged into itself.');
+      var res = await sb().rpc('merge_contacts', { p_keep: keepId, p_drop: dropId });
+      if (res.error) throw new Error('Could not merge the contacts: ' + res.error.message);
       return res.data;
     },
 

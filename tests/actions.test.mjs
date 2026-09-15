@@ -44,13 +44,16 @@ const USER = 'a0000000-0000-4000-8000-000000000001';
 
 /* answer(name, options): what functions.invoke resolves to.
    storage(bucket): the stand-in for sb().storage.from(bucket).
-   purify: the stand-in for DOMPurify. */
+   purify: the stand-in for DOMPurify.
+   rpc(name, args): what sb().rpc(name, args) resolves to — { data, error } —
+   for an RPC an action calls directly rather than through a table write. */
 /* rows(table, what): the rows a write awaited without single() touched — [] is
    what a delete or update RLS quietly refused looks like.
    fail(table, what): the error a write comes back with, or null. */
-function workspace(answer, { storage, purify, manager = true, rows, fail } = {}) {
+function workspace(answer, { storage, purify, manager = true, rows, fail, rpc } = {}) {
   const invoked = [];
   const written = [];
+  const called = [];
   const record = (table, what) => (change, options) => {
     const index = written.push({ table, what, change: { ...change }, ...(options ? { options: { ...options } } : {}) }) - 1;
     const error = fail ? fail(table, what) : null;
@@ -96,7 +99,11 @@ function workspace(answer, { storage, purify, manager = true, rows, fail } = {})
       update: record(table, 'update'), insert: record(table, 'insert'), upsert: record(table, 'upsert'),
       delete: () => record(table, 'delete')({})
     }),
-    storage: { from: (bucket) => (storage ? storage(bucket) : {}) }
+    storage: { from: (bucket) => (storage ? storage(bucket) : {}) },
+    rpc: async (name, args) => {
+      called.push({ name, args: { ...args } });
+      return rpc ? rpc(name, args) : { data: null, error: null };
+    }
   };
   const session = {
     client, employee: { id: 'emp-1' }, session: { user: { id: USER } },
@@ -109,7 +116,7 @@ function workspace(answer, { storage, purify, manager = true, rows, fail } = {})
   for (const file of ['mail-model.js', 'projects-model.js', 'tickets-model.js', 'data/actions.js']) {
     vm.runInContext(readFileSync(new URL(`../dist/${file}`, import.meta.url), 'utf8'), context);
   }
-  return { actions: context.window.workspaceActions, invoked, written };
+  return { actions: context.window.workspaceActions, invoked, written, called };
 }
 
 /* ── Read and starred ─────────────────────────────────────────────────── */
@@ -349,6 +356,130 @@ test('a new company is added in the currency and with the owner it was given, or
   assert.equal('currency' in ws.written[1].change, false, 'the column\'s own default');
   assert.equal(ws.written[1].change.owner_id, 'emp-1', 'nothing said: whoever adds it');
   assert.equal(ws.written[2].change.owner_id, null, '"No owner" is no owner');
+});
+
+test('a company at a domain another already has says so plainly, not the database\'s own words', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }), {
+    fail: table => (table === 'crm_companies'
+      ? { message: 'duplicate key value violates unique constraint "crm_companies_domain_idx"' } : null)
+  });
+  await assert.rejects(ws.actions.createCompany({ name: 'Northline Two', domain: 'northline.example' }),
+    { message: 'A company at that domain is already in the CRM.' });
+  const otherFailure = workspace(async () => ({ data: null, error: null }),
+    { fail: () => ({ message: 'permission denied for table crm_companies' }) });
+  await assert.rejects(otherFailure.actions.createCompany({ name: 'Northline' }),
+    { message: 'Could not add the company: permission denied for table crm_companies' },
+    'a failure that is not the domain index keeps the database\'s own words');
+});
+
+test('a new contact is added with only a name required, its address lower case, and blanks kept as null', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }));
+  await ws.actions.createContact({ fullName: '  Ana Lima  ', companyId: 'co-1', email: ' Ana@Northline.EXAMPLE ', phone: '+31 20 000 0001', title: 'Producer', notes: 'Met at the fair' });
+  await ws.actions.createContact({ fullName: 'Ben Ortiz' });
+  assert.deepEqual(ws.written.map(w => [w.table, w.what, w.change]), [
+    ['crm_contacts', 'insert', {
+      full_name: 'Ana Lima', company_id: 'co-1', email: 'ana@northline.example',
+      phone: '+31 20 000 0001', title: 'Producer', notes: 'Met at the fair'
+    }],
+    ['crm_contacts', 'insert', { full_name: 'Ben Ortiz', company_id: null, email: null, phone: null, title: null, notes: null }]
+  ]);
+  await assert.rejects(ws.actions.createContact({ fullName: '  ' }), { message: 'A contact needs a name.' });
+  assert.equal(ws.written.length, 2, 'nothing sent for a name that is blank once trimmed');
+});
+
+test('a contact at an address another already has says so plainly, not the database\'s own words', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }), {
+    fail: table => (table === 'crm_contacts'
+      ? { message: 'duplicate key value violates unique constraint "crm_contacts_email_idx"' } : null)
+  });
+  await assert.rejects(ws.actions.createContact({ fullName: 'Ana Lima', email: 'ana@northline.example' }),
+    { message: 'That email address is already used by another contact.' });
+});
+
+test('promoting an enquiry calls the database\'s own function, and a refusal says why', async () => {
+  const ws = workspace(async () => ({}), { rpc: () => ({ data: 'contact-1', error: null }) });
+  const contactId = await ws.actions.promoteEnquiry('enq-1');
+  assert.equal(contactId, 'contact-1');
+  assert.deepEqual(ws.called, [{ name: 'promote_enquiry_to_crm', args: { p_enquiry_id: 'enq-1' } }]);
+  const refused = workspace(async () => ({}), { rpc: () => ({ data: null, error: { message: 'Only staff can promote an enquiry' } }) });
+  await assert.rejects(refused.actions.promoteEnquiry('enq-1'), { message: 'Could not promote the enquiry: Only staff can promote an enquiry' });
+});
+
+/* ── A contact with their company, in one step (create_contact_with_company, 0053) ── */
+
+test('a contact and a new company are added together, by name, and the pair comes back by id', async () => {
+  const ws = workspace(async () => ({}), { rpc: () => ({ data: { contact_id: 'c-1', company_id: 'co-1' }, error: null }) });
+  const made = await ws.actions.createContactWithCompany({ fullName: 'Ana Lima', email: 'ana@northline.example', companyName: 'Northline' });
+  assert.deepEqual({ ...made }, { contactId: 'c-1', companyId: 'co-1' });
+  assert.deepEqual(ws.called, [{
+    name: 'create_contact_with_company',
+    args: {
+      p_full_name: 'Ana Lima', p_email: 'ana@northline.example', p_phone: null, p_title: null,
+      p_is_primary: false, p_notes: null, p_enquiry_id: null, p_company_id: null, p_company_name: 'Northline'
+    }
+  }]);
+});
+
+test('a contact is added at a company already in the CRM, by id, with no name sent alongside it', async () => {
+  const ws = workspace(async () => ({}), { rpc: () => ({ data: { contact_id: 'c-2', company_id: 'co-9' }, error: null }) });
+  await ws.actions.createContactWithCompany({ fullName: 'Ben Ortiz', companyId: 'co-9' });
+  assert.equal(ws.called[0].args.p_company_id, 'co-9');
+  assert.equal(ws.called[0].args.p_company_name, null);
+});
+
+test('a reply that answers with a bare object or a one-row array is read the same way', async () => {
+  const asObject = workspace(async () => ({}), { rpc: () => ({ data: { contact_id: 'c-3', company_id: null }, error: null }) });
+  assert.deepEqual({ ...await asObject.actions.createContactWithCompany({ fullName: 'Cy' }) }, { contactId: 'c-3', companyId: null });
+  const asArray = workspace(async () => ({}), { rpc: () => ({ data: [{ contact_id: 'c-4', company_id: 'co-1' }], error: null }) });
+  assert.deepEqual({ ...await asArray.actions.createContactWithCompany({ fullName: 'Dee' }) }, { contactId: 'c-4', companyId: 'co-1' });
+});
+
+test('a contact refused for an address already in the CRM names which one, from the database\'s own detail', async () => {
+  const ws = workspace(async () => ({}), {
+    rpc: () => ({
+      data: null,
+      error: { message: 'A contact with that email address is already in the CRM.', details: JSON.stringify({ contact_id: 'existing-1' }) }
+    })
+  });
+  await assert.rejects(ws.actions.createContactWithCompany({ fullName: 'Ana Lima', email: 'ana@northline.example' }), (err) => {
+    assert.equal(err.message, 'Could not add the contact: A contact with that email address is already in the CRM.');
+    assert.equal(err.conflictContactId, 'existing-1');
+    return true;
+  });
+  const twoNamed = workspace(async () => ({}), {
+    rpc: () => ({
+      data: null,
+      error: { message: 'More than one company is called "Northline". Pick one of them.', details: JSON.stringify({ company_ids: ['a', 'b'] }) }
+    })
+  });
+  await assert.rejects(twoNamed.actions.createContactWithCompany({ fullName: 'Ben', companyName: 'Northline' }), (err) => {
+    assert.deepEqual([...err.matchingCompanyIds], ['a', 'b']);
+    return true;
+  });
+  const noDetail = workspace(async () => ({}), { rpc: () => ({ data: null, error: { message: 'A contact needs a name.' } }) });
+  await assert.rejects(noDetail.actions.createContactWithCompany({ fullName: ' ' }), (err) => {
+    assert.equal('conflictContactId' in err, false, 'nothing to read when the database sent no detail');
+    return true;
+  });
+});
+
+/* ── Merging companies and contacts (0053) ─────────────────────────────── */
+
+test('merging companies or contacts calls the database\'s own function and hands back what it moved', async () => {
+  const moved = { kept_id: 'co-1', merged_id: 'co-2', moved: { 'crm_contacts.company_id': 2 } };
+  const ws = workspace(async () => ({}), { rpc: (name) => ({ data: name === 'merge_companies' ? moved : { kept_id: 'c-1' }, error: null }) });
+  assert.deepEqual(await ws.actions.mergeCompanies('co-1', 'co-2'), moved);
+  assert.deepEqual(await ws.actions.mergeContacts('c-1', 'c-2'), { kept_id: 'c-1' });
+  assert.deepEqual(ws.called, [
+    { name: 'merge_companies', args: { p_keep: 'co-1', p_drop: 'co-2' } },
+    { name: 'merge_contacts', args: { p_keep: 'c-1', p_drop: 'c-2' } }
+  ]);
+  const refused = workspace(async () => ({}), { rpc: () => ({ data: null, error: { message: 'Only an owner or admin can merge companies.' } }) });
+  await assert.rejects(refused.actions.mergeCompanies('co-1', 'co-2'), { message: 'Could not merge the companies: Only an owner or admin can merge companies.' });
+  const before = ws.called.length;
+  await assert.rejects(ws.actions.mergeCompanies('co-1', 'co-1'), { message: 'A company cannot be merged into itself.' });
+  assert.equal(ws.called.length, before, 'refused before the database is asked');
+  await assert.rejects(ws.actions.mergeContacts('', 'c-2'), /Pick the contact to keep/);
 });
 
 test('an invoice marked paid or unpaid writes its status and the day it was paid to that invoice, and a refusal is said as one', async () => {

@@ -27,6 +27,7 @@ const EVERYTHING = ['contacts', 'companies', 'invoices', 'mail', 'team', 'projec
 
 const escape = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const isNotFound = html => /This record is unavailable\./.test(html);
+const settle = () => new Promise(resolve => setTimeout(resolve, 0));
 
 /* The page helpers crm-ui.js draws with, as workspace.js defines them: from
    `const matches` to notFound(). */
@@ -38,15 +39,34 @@ const HELPERS = (() => {
   return lines.slice(from, to + 1).join('\n');
 })();
 
+/* A hand-driven clock for the search debounce: setTimeout/clearTimeout that
+   do nothing until the test itself asks for the next one to fire, so a delay
+   is proven rather than raced against a real one. */
+function fakeClock() {
+  let nextId = 1;
+  const pending = new Map();
+  return {
+    setTimeout: fn => { const id = nextId++; pending.set(id, fn); return id; },
+    clearTimeout: id => { pending.delete(id); },
+    fire() { const fns = [...pending.values()]; pending.clear(); fns.forEach(fn => fn()); },
+    get pendingCount() { return pending.size; }
+  };
+}
+
 /* The page as it runs: workspace.js's helpers, the models and crm-ui.js, with
    the store's lists and app.js's globals as stand-ins. */
 function load({ route = ['crm'], query = '', contacts = [], companies = [], loaded = EVERYTHING,
   projects = [], projectContacts = [], tickets = [], invoices = [], mails = [], team = [], manager = true, overview = null,
-  events = [], projectEvents = [], past = {}, notes = {}, viewer = null, drafts = null } = {}) {
+  events = [], projectEvents = [], past = {}, notes = {}, viewer = null, drafts = null, workspaceLoaded = true,
+  refuse = null, clock = null, enquiries = null, enquiriesFail = false, promoteResult = 'new-contact-1', refusePromote = null } = {}) {
   /* What the page asked the store for past meetings, and asked again. */
   const pastAsked = [];
   const retried = [];
+  const promoted = [];
+  const navigated = [];
   const listeners = {};
+  const toasts = [];
+  const written = [];
   /* What was given the keyboard, by id. */
   const focused = [];
   let renders = 0;
@@ -58,12 +78,16 @@ function load({ route = ['crm'], query = '', contacts = [], companies = [], load
     page: 'crm',
     navs: [['crm', 'CRM']],
     queries: { crm: query },
+    toast: message => toasts.push(message),
     recordNotes: { tickets: {}, projects: {}, crm: {}, agenda: {}, companies: {}, ...notes },
     workspaceSession: viewer ? { employee: viewer } : undefined,
     /* The words notes-ui.js keeps for each note box, by kind and record. */
     noteDrafts: drafts ? { get: (kind, id) => drafts[`${kind}|${id}`] || '' } : undefined,
     workspaceActivity: [],
-    workspaceData: { initials: name => (String(name).trim()[0] || '?').toUpperCase() },
+    workspaceData: {
+      initials: name => (String(name).trim()[0] || '?').toUpperCase(),
+      enquiries: () => (enquiriesFail ? Promise.reject(new Error('Could not load enquiries: timeout')) : Promise.resolve(enquiries || []))
+    },
     financeDay: () => TODAY,
     isManagerNow: () => manager,
     mailModel: {
@@ -72,37 +96,78 @@ function load({ route = ['crm'], query = '', contacts = [], companies = [], load
       folderForThread: (thread, fallback) => thread.folder || fallback
     },
     routeParts: route,
+    navigate: to => navigated.push(to),
     contacts, projects, tickets, invoices, mails, team, events,
+    workspaceActions: {
+      updateCompany: async (id, changes) => {
+        written.push(['updateCompany', id, { ...changes }]);
+        if (refuse) throw new Error(refuse);
+        return { id };
+      },
+      promoteEnquiry: async id => {
+        promoted.push(id);
+        if (refusePromote) throw new Error(refusePromote);
+        return promoteResult;
+      }
+    },
     workspaceStore: {
       has: part => loaded.includes(part),
-      state: { companies, projectContacts, overview, projectEvents },
+      state: { companies, projectContacts, overview, projectEvents, loaded: workspaceLoaded },
       pastMeetings: (key, filter) => {
         pastAsked.push([key, JSON.parse(JSON.stringify(filter))]);
         return past[key] || { state: 'loading', meetings: [], more: false };
       },
-      retryPastMeetings: key => retried.push(key)
+      retryPastMeetings: key => retried.push(key),
+      /* As store.js's after() does: a refusal is toasted, a success is not. */
+      after: work => Promise.resolve(work).catch(err => { toasts.push(err.message); throw err; })
     },
     document: {
       addEventListener: (type, fn) => { (listeners[type] = listeners[type] || []).push(fn); },
       getElementById: id => ({ focus: () => focused.push(id) })
     },
     render: () => { renders += 1; },
+    repaintKeepingFocus: () => { renders += 1; },
+    redrawPreservingFocus: () => { renders += 1; },
     crmView: () => 'the page app.js drew'
   });
   context.window = context;
+  if (clock) { context.window.setTimeout = clock.setTimeout; context.window.clearTimeout = clock.clearTimeout; }
+  else { context.window.setTimeout = (...args) => setTimeout(...args); context.window.clearTimeout = (...args) => clearTimeout(...args); }
   vm.runInContext(HELPERS, context);
   for (const file of ['overview-model.js', 'finance-model.js', 'projects-model.js', 'crm-model.js', 'tasks-model.js', 'agenda-model.js', 'crm-ui.js']) {
     vm.runInContext(readFileSync(new URL(`../dist/${file}`, import.meta.url), 'utf8'), context);
   }
-  /* A click on an element with these data attributes. */
-  const click = attributes => {
+  /* A DOM event of `type` landing on an element with these data attributes,
+     with whatever else (value, dataTransfer) the handler reads off it. */
+  const fire = (type, attributes, extra = {}) => {
     const dataset = Object.fromEntries(Object.entries(attributes).map(([name, value]) =>
       [name.replace(/^data-/, '').replace(/-([a-z])/g, (_, ch) => ch.toUpperCase()), value]));
-    const element = { dataset };
-    const target = { closest: selector => (Object.keys(attributes).some(name => selector === `[${name}]`) ? element : null) };
-    (listeners.click || []).forEach(fn => fn({ target, preventDefault() {} }));
+    const matchesSelector = selector => Object.entries(attributes).some(([name, value]) => selector === `[${name}]` || selector === `[${name}="${value}"]`);
+    /* A real element answers both matches() and closest() the same way about
+       itself; this stand-in is the only element in the tree, so closest()
+       is just matches() with a self-reference. */
+    const element = { dataset, value: extra.value, matches: matchesSelector };
+    element.closest = selector => (matchesSelector(selector) ? element : null);
+    const target = extra.target || element;
+    let defaultPrevented = false;
+    const stopped = [];
+    (listeners[type] || []).forEach(fn => fn({
+      target, preventDefault: () => { defaultPrevented = true; }, stopPropagation: () => stopped.push('stop'),
+      stopImmediatePropagation: () => stopped.push('stop'), dataTransfer: extra.dataTransfer
+    }));
+    return { defaultPrevented, stopped: stopped.length > 0 };
   };
-  return { context, view: () => context.crmView(), pastAsked, retried, click, focused, renders: () => renders };
+  const click = attributes => fire('click', attributes);
+  const change = (attributes, value) => fire('change', attributes, { value });
+  /* A stand-in for the browser's DataTransfer: what was set on drag, read on drop. */
+  const dataTransfer = () => {
+    const store = {};
+    return { setData: (type, value) => { store[type] = value; }, getData: type => store[type], effectAllowed: '' };
+  };
+  return {
+    context, view: () => context.crmView(), pastAsked, retried, click, change, fire, dataTransfer,
+    focused, renders: () => renders, toasts, written, promoted, navigated
+  };
 }
 
 const base = load();
@@ -404,6 +469,24 @@ test('companies that did not load are a dash, not a zero, and the people who did
   }
 });
 
+test('contacts that did not load are a dash, not a zero, in the strip', () => {
+  for (const contactsList of [null, undefined]) {
+    const stats = ui.stats(contactsList, [company('lead', 500)]);
+    assert.deepEqual(figure(stats, 'Contacts'), { value: '—', caption: 'Contacts did not load' });
+    assert.equal(figure(stats, 'Pipeline value').value, money(500, 'USD'), 'companies loaded fine on their own');
+  }
+});
+
+test('before contacts have loaded the strip and the contacts tab say so, not that there are none', () => {
+  const withoutContacts = EVERYTHING.filter(part => part !== 'contacts');
+  const strip = load({ route: ['crm'], loaded: withoutContacts }).view();
+  assert.match(strip, /<span>Contacts<\/span><strong>—<\/strong><small>Contacts did not load<\/small>/);
+  const tab = load({ route: ['crm', 'contacts'], loaded: withoutContacts, contacts: [contact('Ana', 'ana@northline.example')] }).view();
+  assert.match(tab, /<h3>Contacts did not load<\/h3><p>They are tried again by themselves\.<\/p>/);
+  assert.doesNotMatch(tab, /No contacts yet/);
+  assert.doesNotMatch(tab, /Ana/, 'the stale global array is not drawn as if it had loaded');
+});
+
 test('with no deal to win the value is a dash that says so, a deal with no value adds nothing, and no clients is zero', () => {
   const none = ui.stats([], []);
   assert.deepEqual(figure(none, 'Pipeline value'), { value: '—', caption: 'No open deals' });
@@ -478,7 +561,8 @@ test('the pipeline has a column for each of the six stages, each named by its he
   assert.deepEqual([...html.matchAll(/<h2 id="crm-stage-[a-z]+">([^<]+)<\/h2>/g)].map(m => m[1]),
     ['Leads', 'Qualified', 'Proposals', 'Clients', 'Dormant', 'Lost']);
   for (const stage of STAGES) {
-    assert.ok(html.includes(`<section class="board-column" aria-labelledby="crm-stage-${stage}">`), `the ${stage} column is named by its heading`);
+    assert.match(html, new RegExp(`<section class="board-column"[^>]* aria-labelledby="crm-stage-${stage}"[^>]*>`), `the ${stage} column is named by its heading`);
+    assert.match(html, new RegExp(`<section class="board-column"[^>]* data-crm-column="${stage}"[^>]*>`), `the ${stage} column says which stage a drop onto it means`);
   }
   assert.match(column(html, 'lead'), new RegExp(`href="#crm/companies/${kite.id}"`), 'Kite Labs has nobody yet, and is on the board');
   assert.match(column(html, 'dormant'), /Quiet Co/, 'a dormant company is not dropped off the board');
@@ -574,10 +658,282 @@ test('a contact with no company has no company and no stage — not a lead — a
   assert.match(row('Olivia'), /<span class="pill">Proposal<\/span>/);
 });
 
+test('the pipeline\'s six columns narrow for a phone: the plain board\'s own phone rule is not specific enough to reach crm-board, so it needs, and has, its own', () => {
+  const css = readFileSync(new URL('../dist/workspace.css', import.meta.url), 'utf8');
+  const desktop = css.match(/\.project-board\.stage-board\.crm-board\s*\{\s*grid-template-columns:\s*repeat\(6,\s*minmax\((\d+)px/);
+  const at760 = css.match(/@media \(max-width: 760px\) \{ \.project-board\.stage-board\.crm-board \{ grid-template-columns: repeat\(6, minmax\((\d+)px/);
+  const at520 = css.match(/@media \(max-width: 520px\) \{ \.project-board\.stage-board\.crm-board \{ grid-template-columns: repeat\(6, minmax\((\d+)px/);
+  assert.ok(desktop && at760 && at520, 'an unconditional rule and an override at each breakpoint all exist');
+  assert.ok(Number(at760[1]) < Number(desktop[1]), '760px is narrower than the unconditional default');
+  assert.ok(Number(at520[1]) < Number(at760[1]), '520px narrower again');
+  /* Both overrides repeat the full three-class selector — the plain
+     .project-board rule elsewhere in these same breakpoints has only one
+     class, so it can never win a specificity tie against this one, at any
+     source order. */
+  assert.ok(css.indexOf(at760[0]) > css.indexOf(desktop[0]), 'declared after the unconditional rule, so it wins the tie at the same specificity');
+  assert.ok(css.indexOf(at520[0]) > css.indexOf(at760[0]), 'and 520px after 760px, so it wins at the smallest width');
+});
+
 test('while companies did not load the pipeline says so, rather than showing an empty board', () => {
   const html = load({ loaded: ['contacts'] }).view();
   assert.match(html, /Companies did not load/);
   assert.doesNotMatch(html, /crm-stage-/);
+});
+
+/* ── Filtering and sorting the companies list ────────────────────────────── */
+
+test('the filter bar narrows the pipeline and the companies table by stage, kind and owner, each an exact match', () => {
+  const sam = { id: 'e-sam', name: 'Sam Rivera' };
+  const northline = company('client', 100, 'USD', { name: 'Northline', owner_id: 'e-sam' });
+  const harbor = company('lead', 50, 'USD', { name: 'Harbor', kind: 'partner' });
+  const kite = company('lead', 20, 'USD', { name: 'Kite Labs' });
+  const list = [northline, harbor, kite];
+
+  const byStage = load({ route: ['crm', 'companies'], companies: list, team: [sam] });
+  byStage.change({ 'data-crm-filter': 'stage' }, 'lead');
+  const stageFiltered = byStage.view();
+  assert.match(stageFiltered, /Harbor/);
+  assert.match(stageFiltered, /Kite Labs/);
+  assert.doesNotMatch(stageFiltered, /Northline/);
+
+  const byKind = load({ route: ['crm', 'companies'], companies: list, team: [sam] });
+  byKind.change({ 'data-crm-filter': 'kind' }, 'partner');
+  const kindFiltered = byKind.view();
+  assert.match(kindFiltered, /Harbor/);
+  assert.doesNotMatch(kindFiltered, /Kite Labs|Northline/);
+
+  const byOwner = load({ route: ['crm', 'companies'], companies: list, team: [sam] });
+  byOwner.change({ 'data-crm-filter': 'owner' }, 'e-sam');
+  const ownerFiltered = byOwner.view();
+  assert.match(ownerFiltered, /Northline/);
+  assert.doesNotMatch(ownerFiltered, /Harbor|Kite Labs/);
+
+  const unowned = load({ route: ['crm', 'companies'], companies: list, team: [sam] });
+  unowned.change({ 'data-crm-filter': 'owner' }, 'unowned');
+  const unownedFiltered = unowned.view();
+  assert.doesNotMatch(unownedFiltered, /Northline/);
+  assert.match(unownedFiltered, /Harbor/);
+  assert.match(unownedFiltered, /Kite Labs/);
+});
+
+test('without the team loaded, only the owner filter is left out — a select with nobody to choose is worse than none', () => {
+  const html = load({ route: ['crm', 'companies'], loaded: EVERYTHING.filter(p => p !== 'team'), companies: [company('lead', 1)] }).view();
+  assert.doesNotMatch(html, /data-crm-filter="owner"/);
+  assert.match(html, /data-crm-filter="stage"/);
+  assert.match(html, /data-crm-sort/);
+});
+
+test('sort orders the companies table by name, by value, or by where each is in the pipeline, ties broken by name', () => {
+  const alpha = company('lead', 5, 'USD', { name: 'Alpha' });
+  const bravo = company('lead', 50, 'USD', { name: 'Bravo' });
+  const charlie = company('client', 10, 'USD', { name: 'Charlie' });
+  const h = load({ route: ['crm', 'companies'], companies: [bravo, alpha, charlie] });
+  const names = html => bodyRows(html).map(r => r.match(/<strong>([^<]+)<\/strong>/)[1]);
+  assert.deepEqual(names(h.view()), ['Alpha', 'Bravo', 'Charlie'], 'name is the default');
+  h.change({ 'data-crm-sort': '' }, 'value');
+  assert.deepEqual(names(h.view()), ['Bravo', 'Charlie', 'Alpha'], 'highest value first');
+  h.change({ 'data-crm-sort': '' }, 'stage');
+  assert.deepEqual(names(h.view()), ['Alpha', 'Bravo', 'Charlie'], 'two leads before the client, tied leads by name');
+});
+
+test('a Clear filters button appears only once a filter is set, and clears every one of them at once', () => {
+  const h = load({ route: ['crm', 'companies'], companies: [company('lead', 10, 'USD', { name: 'Alpha' }), company('client', 20, 'USD', { name: 'Beta' })] });
+  assert.doesNotMatch(h.view(), /data-crm-clear-filters/);
+  h.change({ 'data-crm-filter': 'stage' }, 'lead');
+  const filtered = h.view();
+  assert.match(filtered, /data-crm-clear-filters/);
+  assert.doesNotMatch(filtered, /Beta/);
+  h.click({ 'data-crm-clear-filters': '' });
+  const cleared = h.view();
+  assert.doesNotMatch(cleared, /data-crm-clear-filters/);
+  assert.match(cleared, /Beta/);
+});
+
+test('a filter or a search with nothing matching says so, kept apart from a CRM with nothing in it yet', () => {
+  const h = load({ route: ['crm', 'companies'], companies: [company('lead', 1, 'USD', { name: 'Alpha' })] });
+  h.change({ 'data-crm-filter': 'stage' }, 'lost');
+  assert.match(h.view(), /No companies found/);
+});
+
+/* ── Dragging a card to another stage ────────────────────────────────────── */
+
+test('dragging a card onto another column saves its new stage, and dropping it back on its own does nothing', async () => {
+  const northline = company('lead', 1000, 'USD', { id: U1, name: 'Northline' });
+  const h = load({ companies: [northline], route: ['crm'] });
+  const dt = h.dataTransfer();
+  h.fire('dragstart', { 'data-crm-card': U1 }, { dataTransfer: dt });
+  assert.equal(dt.getData('text/plain'), U1);
+  const over = h.fire('dragover', { 'data-crm-column': 'client' });
+  assert.equal(over.defaultPrevented, true, 'a drop is only ever allowed once this runs');
+  h.fire('drop', { 'data-crm-column': 'client' }, { dataTransfer: dt });
+  await settle();
+  assert.deepEqual(h.written, [['updateCompany', U1, { stage: 'client' }]]);
+  assert.equal(h.toasts.at(-1), 'Northline moved to Client.');
+
+  const same = load({ companies: [northline], route: ['crm'] });
+  const dt2 = same.dataTransfer();
+  same.fire('dragstart', { 'data-crm-card': U1 }, { dataTransfer: dt2 });
+  same.fire('drop', { 'data-crm-column': 'lead' }, { dataTransfer: dt2 });
+  await settle();
+  assert.deepEqual(same.written, [], 'already there: nothing to save');
+});
+
+test('a drop with no dragged id, no matching company, or before the workspace has loaded saves nothing', async () => {
+  const northline = company('lead', 1, 'USD', { id: U1, name: 'Northline' });
+  const noId = load({ companies: [northline], route: ['crm'] });
+  noId.fire('drop', { 'data-crm-column': 'client' }, { dataTransfer: noId.dataTransfer() });
+  await settle();
+  assert.deepEqual(noId.written, []);
+
+  const goneCompany = load({ companies: [northline], route: ['crm'] });
+  const dt = goneCompany.dataTransfer();
+  dt.setData('text/plain', 'not-a-real-id');
+  goneCompany.fire('drop', { 'data-crm-column': 'client' }, { dataTransfer: dt });
+  await settle();
+  assert.deepEqual(goneCompany.written, []);
+
+  const loading = load({ companies: [northline], route: ['crm'], workspaceLoaded: false });
+  const dt2 = loading.dataTransfer();
+  dt2.setData('text/plain', U1);
+  loading.fire('drop', { 'data-crm-column': 'client' }, { dataTransfer: dt2 });
+  await settle();
+  assert.deepEqual(loading.written, []);
+  assert.equal(loading.toasts.at(-1), 'Not yet: the workspace is still loading.');
+});
+
+test('a stage a drop refuses to save says so in a toast, as any other CRM write does', async () => {
+  const northline = company('lead', 1, 'USD', { id: U1, name: 'Northline' });
+  const h = load({ companies: [northline], route: ['crm'], refuse: 'The company was not saved: it has been removed from the CRM, or you may not change it.' });
+  const dt = h.dataTransfer();
+  dt.setData('text/plain', U1);
+  h.fire('drop', { 'data-crm-column': 'client' }, { dataTransfer: dt });
+  await settle();
+  assert.equal(h.toasts.at(-1), 'The company was not saved: it has been removed from the CRM, or you may not change it.');
+});
+
+/* ── Debouncing the search box ───────────────────────────────────────────── */
+
+test('typing in the search box waits before it redraws, and a further keystroke restarts the wait, not stacks another', () => {
+  const clock = fakeClock();
+  const h = load({ route: ['crm', 'contacts'], contacts: [contact('Ana', 'ana@northline.example')], clock });
+  const first = h.fire('input', { 'data-query': 'crm' }, { value: 'an' });
+  assert.equal(first.stopped, true, 'the shared, whole-page listener does not also run for this keystroke');
+  assert.equal(h.renders(), 0, 'not yet, on the keystroke alone');
+  assert.equal(clock.pendingCount, 1);
+  h.fire('input', { 'data-query': 'crm' }, { value: 'ana' });
+  assert.equal(clock.pendingCount, 1, 'the first wait is cancelled, not left running alongside a second');
+  clock.fire();
+  assert.equal(h.renders(), 1, 'one redraw for the settled word, not one per letter');
+  assert.equal(h.context.queries.crm, 'ana');
+});
+
+test('an input event on another view\'s search box is left to the shared listener', () => {
+  const clock = fakeClock();
+  const h = load({ route: ['crm'], clock });
+  const result = h.fire('input', { 'data-query': 'tickets' }, { value: 'urgent' });
+  assert.equal(result.stopped, false);
+  assert.equal(clock.pendingCount, 0);
+});
+
+/* ── Website enquiries ────────────────────────────────────────────────── */
+
+test('the Enquiries tab is offered to a manager and hidden from staff, in both the pipeline\'s subnav and the tab itself', () => {
+  const manager = load({ route: ['crm'], manager: true });
+  assert.match(manager.view(), /href="#crm\/enquiries"/);
+  const staff = load({ route: ['crm'], manager: false });
+  assert.doesNotMatch(staff.view(), /href="#crm\/enquiries"/);
+});
+
+test('a manager visiting Enquiries directly sees the list; staff visiting it directly are told plainly, not shown an empty inbox', () => {
+  const staff = load({ route: ['crm', 'enquiries'], manager: false }).view();
+  assert.match(staff, /Owners and admins only/);
+  assert.doesNotMatch(staff, /Promote/);
+  const manager = load({ route: ['crm', 'enquiries'], manager: true, enquiries: [] }).view();
+  assert.doesNotMatch(manager, /Owners and admins only/);
+});
+
+test('enquiries load once the page is drawn, list who wrote in, and a Promote button for each not already in the CRM', () => {
+  const bo = { id: 'enq-1', name: 'Bo Ahn', email: 'bo@example.com', business: 'Ahn Studio', message: 'Looking for a rebuild.', status: 'New', when: 'Sep 10', row: {} };
+  const h = load({ route: ['crm', 'enquiries'], enquiries: [bo] });
+  const first = h.view();
+  assert.match(first, /Loading enquiries/);
+  return settle().then(() => {
+    assert.equal(h.renders(), 1, 'drawn again once the answer lands');
+    const loaded = h.view();
+    assert.match(loaded, /Bo Ahn/);
+    assert.match(loaded, /bo@example\.com/);
+    assert.match(loaded, /Ahn Studio/);
+    assert.match(loaded, /Looking for a rebuild\./);
+    assert.match(loaded, /data-crm-promote="enq-1"/);
+  });
+});
+
+test('an enquiry already promoted links to the contact it became, instead of offering Promote again', async () => {
+  const bo = { id: 'enq-1', name: 'Bo Ahn', email: 'bo@example.com', business: '', message: '', status: 'New', when: 'Sep 10', row: {} };
+  const already = contact('Bo Ahn', 'bo@example.com', null, { enquiry_id: 'enq-1' });
+  const h = load({ route: ['crm', 'enquiries'], enquiries: [bo], contacts: [already] });
+  h.view();
+  await settle();
+  const loaded = h.view();
+  assert.doesNotMatch(loaded, /data-crm-promote/);
+  assert.match(loaded, new RegExp(`href="#crm/${already.id}">Already in the CRM<`));
+});
+
+test('no enquiries at all says so, and one that did not load can be asked for again', async () => {
+  const empty = load({ route: ['crm', 'enquiries'], enquiries: [] });
+  empty.view();
+  await settle();
+  assert.match(empty.view(), /No enquiries yet/);
+
+  const failed = load({ route: ['crm', 'enquiries'], enquiriesFail: true });
+  failed.view();
+  await settle();
+  const page = failed.view();
+  assert.match(page, /Enquiries did not load/);
+  assert.match(page, /data-crm-enquiries-retry/);
+  failed.click({ 'data-crm-enquiries-retry': '' });
+  await settle();
+  assert.match(failed.view(), /Enquiries did not load/, 'failing again says so again, rather than hanging on "Loading"');
+});
+
+test('Promote calls the same RPC the site admin uses, then opens the contact it made', async () => {
+  const bo = { id: 'enq-1', name: 'Bo Ahn', email: 'bo@example.com', business: '', message: '', status: 'New', when: 'Sep 10', row: {} };
+  const h = load({ route: ['crm', 'enquiries'], enquiries: [bo], promoteResult: 'new-contact-9' });
+  h.view();
+  await settle();
+  h.fire('click', { 'data-crm-promote': 'enq-1' });
+  await settle();
+  assert.deepEqual(h.promoted, ['enq-1']);
+  assert.equal(h.toasts.at(-1), 'Added to the CRM.');
+  assert.deepEqual(h.navigated, ['crm/new-contact-9']);
+});
+
+test('a refused promotion is toasted, and nothing is promoted before the workspace has loaded', async () => {
+  const bo = { id: 'enq-1', name: 'Bo Ahn', email: 'bo@example.com', business: '', message: '', status: 'New', when: 'Sep 10', row: {} };
+  const refused = load({ route: ['crm', 'enquiries'], enquiries: [bo], refusePromote: 'Only staff can promote an enquiry' });
+  refused.view();
+  await settle();
+  refused.fire('click', { 'data-crm-promote': 'enq-1' });
+  await settle();
+  assert.equal(refused.toasts.at(-1), 'Only staff can promote an enquiry');
+  assert.deepEqual(refused.navigated, []);
+
+  const loading = load({ route: ['crm', 'enquiries'], enquiries: [bo], workspaceLoaded: false });
+  loading.view();
+  await settle();
+  loading.fire('click', { 'data-crm-promote': 'enq-1' });
+  assert.deepEqual(loading.promoted, []);
+  assert.equal(loading.toasts.at(-1), 'Not yet: the workspace is still loading.');
+});
+
+test('what an enquiry carries stays text: a name, a business or a message with markup in it is shown, never run', async () => {
+  const evil = { id: 'enq-1', name: TYPED, email: TYPED, business: TYPED, message: TYPED, status: 'New', when: TYPED, row: {} };
+  const h = load({ route: ['crm', 'enquiries'], enquiries: [evil] });
+  h.view();
+  await settle();
+  const page = h.view();
+  assert.doesNotMatch(page, MARKUP);
+  assert.match(page, /&lt;img src=x onerror=alert\(1\)&gt;/);
 });
 
 /* ── A company's page ─────────────────────────────────────────────────── */
@@ -614,6 +970,16 @@ test('a client\'s number is on its page; a company not yet one has no such row',
   assert.match(numbered, /<span>Client No\.<\/span><div>42<\/div>/);
   const unnumbered = load({ route: ['crm', 'companies', prospect.id], companies: [prospect] }).view();
   assert.doesNotMatch(unnumbered, /Client No\./);
+});
+
+test('a company\'s page shows its currency, and a primary contact is named as one in the people panel', () => {
+  const northline = company('client', 12000, 'EUR', { id: U1, name: 'Northline' });
+  const ana = contact('Ana', 'ana@northline.example', northline, { id: U2, is_primary: true });
+  const ben = contact('Ben', 'ben@northline.example', northline, { id: U3 });
+  const html = load({ companies: [northline], contacts: [ana, ben], route: ['crm', 'companies', U1] }).view();
+  assert.match(html, /<span>Currency<\/span><div>EUR<\/div>/);
+  assert.match(html, /Primary contact · ana@northline\.example/, 'the primary contact is named as one');
+  assert.doesNotMatch(section(html, 'People'), /Ben.*Primary contact/s, 'not for someone who isn\'t');
 });
 
 test('an invoice sent to two of a company\'s people is listed once', () => {
@@ -664,6 +1030,17 @@ test('a contact\'s page puts the projects they are on first, with their role, th
   assert.match(html, /Head of product/);
   assert.match(html, /<span>Owner<\/span><div>Sam Rivera<\/div>/, 'their company\'s owner');
   assert.match(html, new RegExp(`href="#crm/companies/${northline.id}">Northline<`));
+});
+
+test('a contact\'s page names them as the primary contact, and as having come from a website enquiry', () => {
+  const olivia = contact('Olivia', 'olivia@northline.example', null, { is_primary: true, enquiry_id: 'enq-1' });
+  const html = load({ route: ['crm', olivia.id], contacts: [olivia] }).view();
+  assert.match(html, /<span>Primary contact<\/span><div>Yes<\/div>/);
+  assert.match(html, /<span>Source<\/span><div>A website enquiry<\/div>/);
+  const jo = contact('Jo', '');
+  const plain = load({ route: ['crm', jo.id], contacts: [jo] }).view();
+  assert.match(plain, /<span>Primary contact<\/span><div>—<\/div>/);
+  assert.match(plain, /<span>Source<\/span><div>—<\/div>/);
 });
 
 test('a contact\'s conversations are theirs by id or by address, and their invoices by address', () => {

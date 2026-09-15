@@ -1140,17 +1140,19 @@
        refusal is said in a toast — unless the view says it itself, where it
        happened, and asks for none with { toast: false }: a dialog's error
        line (dialog-forms.js), which a screen reader would otherwise hear
-       twice. `only`: the parts this write can have changed — an event save
-       needs only ['events'] (and ['events','projectEvents'] for one on a
-       project), not the other sixteen parts a note or a task save still
-       reloads whole. Left out, every part reloads exactly as it always has:
-       `only` is something a caller opts INTO, never assumed. A write that
-       FAILS always reloads everything regardless — a refusal can still land
-       after an earlier step of a multi-step write went through (the comment
-       below), and `only` naming what the caller expected to change is not
-       proof nothing else did. */
+       twice. options.only: the parts this write can have changed — a CRM
+       save touches only contacts and companies, an event save only
+       ['events'] (and ['events','projectEvents'] for one on a project), not
+       the other parts a note or a task save still reloads whole; named ones
+       reload quietly, in the background, rather than the whole workspace.
+       Left out, every part reloads exactly as it always has: `only` is
+       something a caller opts INTO, never assumed. A write that FAILS
+       always reloads everything regardless — a refusal can still land after
+       an earlier step of a multi-step write went through, and `only` naming
+       what the caller expected to change is not proof nothing else did. */
     async after(promise, options) {
-      var opts = options || {};
+      var only = options && Array.isArray(options.only) && options.only.length ? options.only : null;
+      var reload = only ? { quiet: true, only: only } : undefined;
       try {
         var out = await promise;
         pastMeetingsBy = {};
@@ -1159,7 +1161,7 @@
         ticketFilesAskedFor = {};
         projectActivityBy = {};
         archivedProjectsBy = null;
-        await load(opts.only ? { only: opts.only } : undefined);
+        await load(reload);
         return out;
       } catch (err) {
         pastMeetingsBy = {};
@@ -1168,10 +1170,14 @@
         ticketFilesAskedFor = {};
         projectActivityBy = {};
         archivedProjectsBy = null;
-        if (typeof toast === 'function' && !(opts.toast === false)) toast(err.message);
+        if (typeof toast === 'function' && !(options && options.toast === false)) toast(err.message);
         /* A write that failed may still have changed something — a row saved
            before a later step was refused — so the page is brought back to
-           what the database has, and a second try starts from the truth. */
+           what the database has, and a second try starts from the truth.
+           Always the whole workspace, never scoped to `only`: a caller
+           naming the parts it expected to change is not proof nothing else
+           did, and the safety net a failure needs is not narrower just
+           because the write happened to name a part. */
         load({ quiet: true });
         throw err;
       }

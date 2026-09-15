@@ -600,7 +600,11 @@
       var rows = await everyRow(function (from, to) {
         return sb()
           .from('crm_contacts')
-          .select('id, full_name, email, phone, title, notes, ' +
+          /* is_primary and enquiry_id ride along on the raw row (crm-ui.js
+             reads them from .row) rather than in the shape below, which
+             crm-model.js's shapeContact() already builds from these same
+             columns and is not this file's to change. */
+          .select('id, full_name, email, phone, title, notes, is_primary, enquiry_id, ' +
                   'company:crm_companies (id, name, stage, value, currency)')
           .is('deleted_at', null)
           .order('full_name')
@@ -637,6 +641,24 @@
           id: r.id, name: r.name, domain: r.domain || '',
           stage: label(r.stage), kind: label(r.kind), clientNumber: r.client_number == null ? null : r.client_number,
           value: money(r.value, r.currency) || '—', notes: r.notes || '', row: r
+        };
+      });
+    },
+
+    /* Leads from the public "Get a quote" form (managers only — RLS returns []
+       for anyone else, 0019). The site admin already lists these; this is the
+       same table, read for the workspace's own Promote button. */
+    async enquiries() {
+      var rows = unwrap(await sb()
+        .from('website_enquiries')
+        .select('id, kind, name, email, business, website, message, status, created_at')
+        .order('created_at', { ascending: false }), 'enquiries');
+      return rows.map(function (r) {
+        return {
+          id: r.id, name: r.name || '', email: r.email || '',
+          business: r.business || '', website: r.website || '',
+          message: r.message || '', status: label(r.status),
+          kind: label(r.kind), when: shortDate(r.created_at), row: r
         };
       });
     },
