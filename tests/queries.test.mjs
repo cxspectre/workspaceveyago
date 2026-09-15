@@ -131,6 +131,109 @@ test('Starred reaches conversations filed away in Outlook, and Inbox and Sent st
   ]);
 });
 
+test('mailThreads asks for the other party, and no longer for whoever sent most recently', async () => {
+  const { data, queries } = loadTables();
+  await data.mailThreads(['inbox'], ['box-1']);
+  const select = queries[0].calls.find(([method]) => method === 'select')[1];
+  assert.ok(select.includes('other_party_name'), 'asks for other_party_name');
+  assert.ok(select.includes('other_party_email'), 'asks for other_party_email');
+  assert.ok(!select.includes('last_from_name'), 'the renamed column is gone, not just supplemented');
+});
+
+test('a thread shows the OTHER party — never whoever wrote most recently — and a CRM contact outranks both', async () => {
+  const { data } = loadTables(table => (table !== 'mail_threads' ? [] : [
+    { id: 't1', connection_id: 'box-1', folder: 'inbox', message_count: 2, last_message_at: '2026-09-10T09:00:00Z',
+      subject: 'Kickoff', snippet: 'Looking forward', is_read: true, is_starred: false,
+      other_party_name: 'Ana Lima', other_party_email: 'ana@northline.example',
+      ticket_id: null, contact_id: null, contact: null },
+    { id: 't2', connection_id: 'box-1', folder: 'inbox', message_count: 1, last_message_at: '2026-09-09T09:00:00Z',
+      subject: 'Intro', snippet: 'Hello', is_read: true, is_starred: false,
+      other_party_name: null, other_party_email: 'prospect@newbiz.example',
+      ticket_id: null, contact_id: null, contact: null },
+    { id: 't3', connection_id: 'box-1', folder: 'inbox', message_count: 3, last_message_at: '2026-09-08T09:00:00Z',
+      subject: 'Renewal', snippet: 'Thanks', is_read: true, is_starred: false,
+      other_party_name: 'Stale Name', other_party_email: 'stale@x.example',
+      ticket_id: null, contact_id: 'c1', contact: { full_name: 'Real Contact', email: 'real@x.example' } },
+    { id: 't4', connection_id: 'box-1', folder: 'inbox', message_count: 0, last_message_at: null,
+      subject: 'Nothing known', snippet: '', is_read: true, is_starred: false,
+      other_party_name: null, other_party_email: null, ticket_id: null, contact_id: null, contact: null }
+  ]));
+  const { threads } = await data.mailThreads(['inbox'], ['box-1']);
+  const byId = Object.fromEntries(threads.map(t => [t.id, t]));
+  assert.equal(byId.t1.sender, 'Ana Lima', 'answered or not, a known name is shown');
+  assert.equal(byId.t2.sender, 'prospect@newbiz.example',
+    'a thread we started, nobody has answered yet: the address we wrote to, not our own name nor "Unknown sender"');
+  assert.equal(byId.t2.email, 'prospect@newbiz.example');
+  assert.equal(byId.t3.sender, 'Real Contact', 'a matched CRM contact outranks the other-party columns');
+  assert.equal(byId.t3.email, 'real@x.example');
+  assert.equal(byId.t4.sender, 'Unknown sender', 'nothing known about either party at all');
+});
+
+test('a message carries its importance, Bcc and its attachments\' metadata', async () => {
+  const { data, queries } = loadTables(table => (table !== 'mail_messages' ? [] : [
+    { id: 'm1', external_id: 'x1', direction: 'inbound', from_name: 'Ana Lima', from_email: 'ana@northline.example',
+      to_emails: ['hello@veyago.cloud'], cc_emails: [], bcc_emails: [], subject: 'Re: Kickoff',
+      body_text: 'See attached', body_html: '', sent_at: '2026-09-10T09:00:00Z', importance: 'high',
+      mail_attachments: [
+        { id: 'a1', name: 'brief.pdf', content_type: 'application/pdf', size: 4096, is_inline: false, content_id: null },
+        { id: 'a2', name: 'logo.png', content_type: 'image/png', size: 512, is_inline: true, content_id: 'logo1' }
+      ] }
+  ]));
+  const [m] = await data.mailMessages('t1');
+  const select = queries[0].calls.find(([method]) => method === 'select')[1];
+  for (const part of ['bcc_emails', 'importance', 'mail_attachments']) {
+    assert.ok(select.includes(part), `the query asks for ${part}`);
+  }
+  assert.equal(m.importance, 'high');
+  assert.deepEqual([...m.bcc], []);
+  assert.equal(m.attachments.length, 2);
+  /* Spread first: these objects were built inside the vm sandbox, a different
+     realm whose Object is not this file's — deepEqual (this file imports the
+     strict assert, whose deepEqual is deepStrictEqual) tells them apart by
+     that alone otherwise, however identical their own fields are. */
+  assert.deepEqual({ ...m.attachments[0] },
+    { id: 'a1', name: 'brief.pdf', size: 4096, contentType: 'application/pdf', isInline: false, contentId: null });
+  assert.equal(m.attachments[1].isInline, true);
+  assert.equal(m.attachments[1].contentId, 'logo1');
+});
+
+test('no importance reads as normal, and no attachments is an empty list, not missing', async () => {
+  const { data } = loadTables(table => (table !== 'mail_messages' ? [] : [
+    { id: 'm1', external_id: 'x1', direction: 'outbound', from_name: '', from_email: 'hello@veyago.cloud',
+      to_emails: [], cc_emails: [], bcc_emails: null, subject: '', body_text: '', body_html: '',
+      sent_at: '2026-09-10T09:00:00Z', importance: null, mail_attachments: null }
+  ]));
+  const [m] = await data.mailMessages('t1');
+  assert.equal(m.importance, 'normal');
+  assert.deepEqual([...m.bcc], []);
+  assert.deepEqual([...m.attachments], []);
+});
+
+test('searchMail reaches the database for a whole mailbox\'s words, and skips a blank query entirely', async () => {
+  const q = load((name, args) => (name === 'search_mail'
+    ? {
+      data: [{ thread_id: 't1', connection_id: 'box-1', subject: 'Kickoff', snippet: 'Looking forward to it', sent_at: '2026-01-05T09:00:00Z' }],
+      error: null
+    }
+    : { data: null, error: { message: 'unexpected rpc ' + name } }));
+
+  assert.deepEqual([...(await q.data.searchMail('   '))], [], 'blank (or whitespace-only) is not a search');
+  assert.equal(q.calls.length, 0, 'nothing was asked for it');
+
+  const [hit] = await q.data.searchMail('kickoff');
+  assert.deepEqual(q.calls[0], { name: 'search_mail', args: { p_query: 'kickoff', p_limit: 30 } });
+  assert.equal(hit.threadId, 't1');
+  assert.equal(hit.mailboxId, 'box-1');
+  assert.equal(hit.subject, 'Kickoff');
+  assert.equal(hit.preview, 'Looking forward to it');
+});
+
+test('a search failure is said in words', async () => {
+  const q = load(() => ({ data: null, error: { message: 'permission denied for function search_mail' } }));
+  await assert.rejects(q.data.searchMail('kickoff'),
+    { message: 'Could not search mail: permission denied for function search_mail' });
+});
+
 /* ── Tickets ──────────────────────────────────────────────────────────── */
 
 test('a ticket arrives with its owner by id, the customer\'s address, and who wrote each message', async () => {
