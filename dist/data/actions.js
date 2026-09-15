@@ -871,6 +871,61 @@
       return threadState(threadId, { starred: !!starred });
     },
 
+    /* ── Notifications ───────────────────────────────────────────────── */
+
+    /* Marks one bell item seen (notification_dismissals, 0061) — a plain
+       insert; there is nothing to change about a dismissal once it exists.
+       Dismissing the same key twice is a harmless repeat, not an error the
+       person needs to see: the table's own primary key catches it (23505). */
+    async dismissNotification(key) {
+      must(key && String(key).trim(), 'Nothing to dismiss.');
+      must(me(), 'You need to be signed in as a team member to dismiss this.');
+      var res = await sb().from('notification_dismissals')
+        .insert({ employee_id: me().id, notif_key: String(key) });
+      if (res.error && res.error.code !== '23505') {
+        throw new Error('Could not dismiss that: ' + res.error.message);
+      }
+    },
+
+    /* ── Company: the team, invitations and the studio profile ─────────── */
+
+    /* A role or status change on someone's employees row — the same guard as
+       0042 (companyModel.changeRefusal decides beforehand whether the form
+       offers it); a change RLS refuses touches no row, and the rows changed
+       are asked back so that is said as a refusal rather than a silent
+       success. Owner rows, and someone's own role or status, are refused the
+       same way the database refuses them. */
+    async updateEmployee(employeeId, changes) {
+      must(changes && Object.keys(changes).length, 'Nothing to save.');
+      return touched(await sb().from('employees').update(changes).eq('id', employeeId).select(),
+        'save that change',
+        'That was not saved: it changed since this was opened, or the database no longer allows it here.')[0];
+    },
+
+    /* Sends the invite-employee Edge Function exactly the fields it takes
+       (companyModel.inviteForm's payload); the function asks the same
+       questions the form already asked (_shared/team-rules.ts), so a refusal
+       here is either a race with someone else's change or the account's own
+       email delivery, never a surprise about who may invite whom. */
+    async inviteEmployee(fields) {
+      var res = await sb().functions.invoke('invite-employee', { body: fields });
+      if (res.error) throw new Error(await functionError(res, 'Could not send the invitation.'));
+      return res.data;
+    },
+
+    /* Only owners and admins may write workspace_settings (0016) — the same
+       upsert the admin already uses for any other setting, keyed so a value
+       already saved is replaced rather than duplicated. `changes` is
+       { workspace_settings key: new value }, built by whoever calls this from
+       companyModel.STUDIO_KEYS, not the model's own field names. */
+    async updateStudioProfile(changes) {
+      var keys = Object.keys(changes || {});
+      must(keys.length, 'Nothing to save.');
+      var rows = keys.map(function (key) { return { key: key, value: changes[key] }; });
+      return one(await sb().from('workspace_settings').upsert(rows, { onConflict: 'key' }).select(),
+        'save the studio profile');
+    },
+
     /* ── Connections ─────────────────────────────────────────────────── */
 
     /* Starts reconnecting a mailbox and resolves to Microsoft's consent page.

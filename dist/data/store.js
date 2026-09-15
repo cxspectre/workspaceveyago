@@ -52,7 +52,11 @@
        there being none. Threads still load (loadMail falls back to no
        connection filter at all), so `mail` still "arrives"; this is the only
        place that failure survives to be shown. */
-    mailboxes: [], mailboxesFailed: false, mailTruncated: [], calendars: []
+    mailboxes: [], mailboxesFailed: false, mailTruncated: [], calendars: [],
+    /* The Company page's own parts: connections (companyModel.connectionRows),
+       the studio's public profile (companyModel.studioProfile) and which bell
+       items this person has already dismissed. */
+    integrations: [], studioProfile: [], dismissedNotifications: []
   };
 
   /* When each part last arrived, and what it looked like then. */
@@ -252,7 +256,24 @@
        no calendars connected is exactly what a studio with none looks like. */
     part('calendars', 'connected calendars',
       function (d) { return d.calendars(); },
-      function (rows) { state.calendars = rows; })
+      function (rows) { state.calendars = rows; }),
+    /* The studio's and this person's own connections (0044), for the
+       Company/Studio integrations panel. */
+    part('integrations', 'integrations',
+      function (d) { return d.integrations(); },
+      function (rows) { state.integrations = rows; }),
+    /* The studio's public profile (studio_profile(), 0061): [] for a database
+       from before 0061 or for anyone it answers nothing to — either way
+       companyModel.studioProfile() reads that as the studio's own defaults. */
+    part('studioProfile', 'the studio profile',
+      function (d) { return d.studioProfile(); },
+      function (rows) { state.studioProfile = rows; }),
+    /* Which bell items this person has already dismissed (0061): [] for a
+       database from before 0061, which the bell then shows everything on, as
+       it always has. */
+    part('dismissedNotifications', 'dismissed notifications',
+      function (d) { return d.notificationDismissals(); },
+      function (rows) { state.dismissedNotifications = rows; })
   ];
 
   /* A load asked for while one is running is queued, not dropped: the running
@@ -975,6 +996,30 @@
     return entry;
   }
 
+  /* A person's phone and notes (employee_private(), 0043), asked for by their
+     page and kept by id until a write, as events asked for are — companyModel
+     reads a missing answer, whatever the reason, the same way it reads one it
+     was never entitled to: not shown, never "none on file". */
+  var employeePrivateAskedFor = {};
+
+  function loadEmployeePrivate(id) {
+    var entry = { state: 'loading', details: null };
+    employeePrivateAskedFor[id] = entry;
+    Promise.resolve()
+      .then(function () { return window.workspaceData.employeePrivate(id); })
+      .then(function (details) {
+        if (employeePrivateAskedFor[id] !== entry) return;
+        employeePrivateAskedFor[id] = { state: 'ready', details: details };
+        repaint(true);
+      }, function (err) {
+        if (employeePrivateAskedFor[id] !== entry) return;
+        console.error('[workspace] their phone and notes did not load:', err);
+        employeePrivateAskedFor[id] = { state: 'failed', details: null };
+        repaint(true);
+      });
+    return entry;
+  }
+
   /* A project's own activity (0052), asked for when its page is drawn rather
      than with the whole workspace — the studio-wide feed is capped to its
      most recent rows and a project's own history can reach further back than
@@ -1001,15 +1046,15 @@
   }
 
   /* Past meetings, events, invitees, a ticket's conversation and its
-     attachments, and a project's own activity, a page asked for that did not
-     load: a load that works tries them again, as everything else is tried
-     again by itself. Answers whether any were let go. A failed conversation
-     still carries the version it failed at (ticketThreadVersion), so this
-     does not undo that — the next askTicketThread simply finds nothing
-     cached and asks afresh. */
+     attachments, a project's own activity, and a person's phone and notes, a
+     page asked for that did not load: a load that works tries them again, as
+     everything else is tried again by itself. Answers whether any were let
+     go. A failed conversation still carries the version it failed at
+     (ticketThreadVersion), so this does not undo that — the next
+     askTicketThread simply finds nothing cached and asks afresh. */
   function clearFailedAsks() {
     var cleared = false;
-    [pastMeetingsBy, eventsAskedFor, inviteesAskedFor, ticketThreadsAskedFor, ticketFilesAskedFor, projectActivityBy].forEach(function (asks) {
+    [pastMeetingsBy, eventsAskedFor, inviteesAskedFor, ticketThreadsAskedFor, ticketFilesAskedFor, projectActivityBy, employeePrivateAskedFor].forEach(function (asks) {
       Object.keys(asks).forEach(function (id) {
         if (asks[id].state === 'failed') { delete asks[id]; cleared = true; }
       });
@@ -1181,6 +1226,18 @@
       if (transactionsBy[since] && transactionsBy[since].state === 'failed') delete transactionsBy[since];
     },
 
+    /* A person's phone and notes (company-forms.js, workspace.js personDetail),
+       by their employee id: the row employee_private() answered, or null while
+       it is on its way, was refused, or is not this person's to see —
+       companyModel.personDetails() treats every one of those the same way. */
+    askEmployeePrivate: function (id) {
+      var key = String(id == null ? '' : id).toLowerCase();
+      if (!UUID_TEXT.test(key) || !state.loaded || !window.workspaceData
+          || typeof window.workspaceData.employeePrivate !== 'function') return null;
+      var entry = employeePrivateAskedFor[key] || loadEmployeePrivate(key);
+      return entry.state === 'ready' ? entry.details : null;
+    },
+
     /* Views call this after a write so the screen and the database agree. A
        refusal is said in a toast — unless the view says it itself, where it
        happened, and asks for none with { toast: false }: a dialog's error
@@ -1213,6 +1270,7 @@
         projectActivityBy = {};
         archivedProjectsBy = null;
         transactionsBy = {};
+        employeePrivateAskedFor = {};
         await load(reload);
         return out;
       } catch (err) {
@@ -1223,6 +1281,7 @@
         projectActivityBy = {};
         archivedProjectsBy = null;
         transactionsBy = {};
+        employeePrivateAskedFor = {};
         if (typeof toast === 'function' && !(options && options.toast === false)) toast(err.message);
         /* A write that failed may still have changed something — a row saved
            before a later step was refused — so the page is brought back to

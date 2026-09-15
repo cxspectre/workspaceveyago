@@ -55,7 +55,12 @@ function workspace(answer, { storage, purify, manager = true, rows, fail, rpc } 
   const written = [];
   const called = [];
   const record = (table, what) => (change, options) => {
-    const index = written.push({ table, what, change: { ...change }, ...(options ? { options: { ...options } } : {}) }) - 1;
+    /* upsert() can be given a row or a list of rows (updateStudioProfile
+       sends several settings at once) — a list is copied as a real, host-realm
+       array of host-realm objects: [...] first, so the array itself is not
+       still the sandbox's, the way strict deepEqual would tell apart. */
+    const copy = Array.isArray(change) ? [...change].map(row => ({ ...row })) : { ...change };
+    const index = written.push({ table, what, change: copy, ...(options ? { options: { ...options } } : {}) }) - 1;
     const error = fail ? fail(table, what) : null;
     let selected = false;
     const chain = {
@@ -817,6 +822,77 @@ test('a refused private event, a 409 that is not localOnly, or no answer at all 
 test('a priority the database does not know is refused before anything is written', async () => {
   const ws = workspace(async () => ({ data: null, error: null }));
   await assert.rejects(ws.actions.setTicketPriority(TICKET, 'Medium'), /priority/);
+  assert.equal(ws.written.length, 0);
+});
+
+/* ── Company ──────────────────────────────────────────────────────────── */
+
+test('a role or status change writes only the columns given, and a refusal is said as one', async () => {
+  const saved = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: 'e-1', role: 'admin' }] });
+  assert.equal((await saved.actions.updateEmployee('e-1', { role: 'admin' })).role, 'admin');
+  assert.deepEqual(saved.written.map(w => [w.table, w.what, w.change, w.where]),
+    [['employees', 'update', { role: 'admin' }, [['id', 'e-1']]]]);
+  const refused = workspace(async () => ({ data: null, error: null }), { rows: () => [] });
+  await assert.rejects(refused.actions.updateEmployee('e-1', { status: 'inactive' }), { message: /^That was not saved/ });
+  const nothing = workspace(async () => ({ data: null, error: null }));
+  await assert.rejects(nothing.actions.updateEmployee('e-1', {}), { message: 'Nothing to save.' });
+  assert.equal(nothing.written.length, 0);
+});
+
+test('an invitation is sent through invite-employee, whole', async () => {
+  const fields = { email: 'ana@northline.example', full_name: 'Ana Lima', role: 'employee', title: null, start_date: null };
+  const ws = workspace(async () => ({ data: { ok: true, employee: { id: 'e-2' } }, error: null }));
+  const out = await ws.actions.inviteEmployee(fields);
+  assert.equal(out.employee.id, 'e-2');
+  assert.deepEqual(ws.invoked, [{ name: 'invite-employee', body: fields }]);
+});
+
+test('the function\'s own refusal to invite is said in its words', async () => {
+  const ws = workspace(async () => httpError(403, { error: 'Only an owner can make someone an owner.' }));
+  await assert.rejects(ws.actions.inviteEmployee({ email: 'x@y.example', full_name: 'X', role: 'owner' }),
+    { message: 'Only an owner can make someone an owner.' });
+});
+
+test('the studio profile is saved as workspace_settings rows, keyed so a value already saved is replaced', async () => {
+  const saved = workspace(async () => ({ data: null, error: null }),
+    { rows: () => [{ key: 'studio_name', value: 'Northline' }] });
+  await saved.actions.updateStudioProfile({ studio_name: 'Northline', studio_email: 'hello@northline.example' });
+  assert.deepEqual(saved.written, [{
+    table: 'workspace_settings', what: 'upsert',
+    change: [{ key: 'studio_name', value: 'Northline' }, { key: 'studio_email', value: 'hello@northline.example' }],
+    options: { onConflict: 'key' }
+  }]);
+  const nothing = workspace(async () => ({ data: null, error: null }));
+  await assert.rejects(nothing.actions.updateStudioProfile({}), { message: 'Nothing to save.' });
+});
+
+/* ── Notifications ────────────────────────────────────────────────────── */
+
+test('dismissing a notification inserts one row, under the signed-in person\'s own id', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }));
+  await ws.actions.dismissNotification('ticket:t1');
+  assert.deepEqual(ws.written, [{ table: 'notification_dismissals', what: 'insert',
+    change: { employee_id: 'emp-1', notif_key: 'ticket:t1' } }]);
+});
+
+test('dismissing the same key twice is a harmless repeat, not an error', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }), {
+    fail: () => ({ code: '23505', message: 'duplicate key value violates unique constraint' })
+  });
+  await ws.actions.dismissNotification('events:today');
+  assert.equal(ws.written.length, 1, 'still attempted — the constraint is what makes it a no-op');
+});
+
+test('any other failure to dismiss is said, not swallowed', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }), {
+    fail: () => ({ code: '42501', message: 'permission denied' })
+  });
+  await assert.rejects(ws.actions.dismissNotification('mail:unread'), { message: 'Could not dismiss that: permission denied' });
+});
+
+test('nothing is written for a blank key', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }));
+  await assert.rejects(ws.actions.dismissNotification(''), /Nothing to dismiss/);
   assert.equal(ws.written.length, 0);
 });
 

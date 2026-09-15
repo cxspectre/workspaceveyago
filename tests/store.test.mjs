@@ -73,6 +73,10 @@ function answers(over = {}) {
     projectBudgets: async () => [],
     notes: async () => [],
     calendars: async () => [],
+    employeePrivate: async () => null,
+    integrations: async () => [],
+    studioProfile: async () => [],
+    notificationDismissals: async () => [],
     ...over
   };
 }
@@ -249,6 +253,55 @@ test('a project\'s activity that did not load says so until a load works, then i
   s.store.projectActivity('p1');
   await tick();
   assert.equal(s.store.projectActivity('p1').state, 'ready');
+  assert.equal(asked, 2);
+});
+
+/* ── A person's phone and notes ───────────────────────────────────────── */
+
+const PRIVATE_EMPLOYEE = 'e9000000-0000-4000-8000-000000000002';
+
+test('a person\'s phone and notes load when their page asks, once however often it is drawn, and land on a redraw', async () => {
+  const asked = [];
+  let answer = { phone: '+1 555 0100', notes: 'Founder' };
+  const s = start(answers({ employeePrivate: async id => { asked.push(id); return answer; } }));
+  assert.equal(s.store.askEmployeePrivate(PRIVATE_EMPLOYEE), null, 'nothing is asked before the workspace has loaded');
+  assert.deepEqual(asked, []);
+  await s.store.load();
+  assert.equal(s.store.askEmployeePrivate(PRIVATE_EMPLOYEE), null, 'not yet: the request has only just gone out');
+  s.store.askEmployeePrivate(PRIVATE_EMPLOYEE.toUpperCase());
+  const drawn = s.read('renders') + s.read('idleRepaints');
+  await tick();
+  assert.deepEqual(asked, [PRIVATE_EMPLOYEE], 'asked once, whatever case their id is in');
+  const details = s.store.askEmployeePrivate(PRIVATE_EMPLOYEE);
+  assert.equal(details.phone, '+1 555 0100');
+  assert.ok(s.read('renders') + s.read('idleRepaints') > drawn, 'the page is drawn again once it lands');
+  assert.equal(s.store.askEmployeePrivate('not-an-id'), null, 'only an employee\'s id is asked for');
+  answer = null;
+  await s.store.after(Promise.resolve());
+  assert.equal(s.store.askEmployeePrivate(PRIVATE_EMPLOYEE), null, 'a write may have changed who may see it: asked again');
+  await tick();
+  assert.equal(s.store.askEmployeePrivate(PRIVATE_EMPLOYEE), null, 'nothing this person may see, once it lands — never "none on file"');
+});
+
+test('a failed ask for phone and notes reads as nothing to show, and is tried again once a load works', async () => {
+  let fail = true;
+  let asked = 0;
+  const s = start(answers({ employeePrivate: async () => {
+    asked += 1;
+    if (fail) throw new Error('Could not load their phone and notes: Failed to fetch');
+    return { phone: '+1 555 0100', notes: null };
+  } }));
+  await s.store.load();
+  s.store.askEmployeePrivate(PRIVATE_EMPLOYEE);
+  await tick();
+  assert.equal(s.store.askEmployeePrivate(PRIVATE_EMPLOYEE), null);
+  await tick();
+  assert.equal(asked, 1, 'a page drawn again does not ask again by itself');
+  fail = false;
+  await s.store.load();
+  s.store.askEmployeePrivate(PRIVATE_EMPLOYEE);
+  await tick();
+  assert.equal(s.store.askEmployeePrivate(PRIVATE_EMPLOYEE).phone, '+1 555 0100');
   assert.equal(asked, 2);
 });
 
@@ -1392,4 +1445,38 @@ test('activity entries keep who, when and what they are about — thirty of them
   assert.equal(entry.entityType, 'ticket');
   assert.equal(entry.entityId, 't1');
   assert.equal(asked, 30);
+});
+
+/* ── Company: connections, the studio profile, dismissed notifications ──── */
+
+test('the Company page\'s own parts land in state, and a database from before 0061 leaves them empty rather than failing', async () => {
+  const s = start(answers({
+    integrations: async () => [{ id: 'c1', provider: 'microsoft_mail', status: 'connected' }],
+    studioProfile: async () => [{ key: 'studio_name', value: 'Northline Studio' }],
+    notificationDismissals: async () => ['ticket:t1']
+  }));
+  await s.store.load();
+  assert.deepEqual([...s.store.state.integrations.map(c => c.id)], ['c1']);
+  assert.deepEqual([...s.store.state.studioProfile.map(r => r.key)], ['studio_name']);
+  assert.deepEqual([...s.store.state.dismissedNotifications], ['ticket:t1']);
+
+  /* A database that predates 0061 answers PGRST205/42P01 for the table and
+     function alike; queries.js turns that into a thrown error the same way
+     any other missing-table failure already is, so these three parts fail
+     quietly (state.failed) rather than blocking the workspace, which does not
+     wait on them — they are outside CORE, unlike tickets, projects, contacts
+     and companies. */
+  const missing = start(answers({
+    integrations: async () => { throw new Error('Could not load integrations: relation does not exist'); },
+    studioProfile: async () => { throw new Error('Could not load the studio profile: function does not exist'); },
+    notificationDismissals: async () => { throw new Error('Could not load dismissed notifications: relation does not exist'); }
+  }));
+  await missing.store.load();
+  assert.equal(missing.store.state.loaded, true, 'CORE still loaded; these three are not among it');
+  assert.deepEqual([...missing.store.state.integrations], []);
+  assert.deepEqual([...missing.store.state.studioProfile], []);
+  assert.deepEqual([...missing.store.state.dismissedNotifications], []);
+  assert.ok(missing.store.state.failed.includes('integrations'));
+  assert.ok(missing.store.state.failed.includes('the studio profile'));
+  assert.ok(missing.store.state.failed.includes('dismissed notifications'));
 });

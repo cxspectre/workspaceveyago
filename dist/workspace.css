@@ -352,9 +352,13 @@ body.mail-mode .reader-compose .composer-editor { flex: 1; min-height: 240px; ma
   border-radius: 8px; background: #0071e3; color: #fff; font-size: .6875rem; line-height: 16px; text-align: center;
 }
 .notification-list { display: grid; gap: 6px; margin-top: 14px; }
-.notification-item { display: grid; gap: 2px; padding: 10px 12px; border-radius: 12px; color: inherit; background: #f5f7fb; }
+/* Each item and its Dismiss button side by side, so dismissing one is never
+   the same tap target as opening it. */
+.notification-row { display: flex; align-items: center; gap: 4px; }
+.notification-item { flex: 1; min-width: 0; display: grid; gap: 2px; padding: 10px 12px; border-radius: 12px; color: inherit; background: #f5f7fb; }
 .notification-item:hover { background: #eaf3ff; }
 .notification-item span { font-size: .8125rem; color: #6e6e73; }
+.notification-row .text-btn { flex-shrink: 0; padding: 4px 10px; }
 #search-results button:focus-visible { outline-offset: -3px; background: #eaf3ff; }
 .search-more { padding: 8px 12px 4px; font-size: .75rem; color: #86868b; }
 /* The phone menu cannot be tabbed into while it is off screen, and has a

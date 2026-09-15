@@ -262,12 +262,24 @@ document.addEventListener('focusin',e=>{if(outsideMenu(e))setMenu(false);});
 document.addEventListener('click',e=>{if(!e.target.closest('[data-skip-to-main]'))return;const main=document.querySelector('#main');main.setAttribute('tabindex','-1');main.focus();});
 document.querySelector('#search-icon').innerHTML=icon('search');document.querySelector('#notifications').innerHTML=icon('bell');
 /* What needs someone, each entry leading to where it can be dealt with
-   (shell-model.js attention). The count on the bell is how many there are:
-   they go when they are dealt with, not when they are seen — nothing keeps
-   "seen" yet. */
-function attentionItems(){return shellModel.attention({tickets,invoices:shapedInvoices(),unreadMail:mailModel.unreadCount(mails,mailModel.ALL),eventsToday:(todayEvents()||[]).map(p=>p.event),isManager:isManagerNow()});}
+   (shell-model.js attention), never one this person has already dismissed
+   (data/store.js state.dismissedNotifications, from notification_dismissals,
+   0061 — [] on a database from before it, so the bell shows everything, as it
+   always has). The count on the bell is how many are left. */
+function attentionItems(){return shellModel.attention({tickets,invoices:shapedInvoices(),unreadMail:mailModel.unreadCount(mails,mailModel.ALL),eventsToday:(todayEvents()||[]).map(p=>p.event),isManager:isManagerNow(),dismissed:(window.workspaceStore&&workspaceStore.state.dismissedNotifications)||[]});}
 function paintBell(){const bell=document.querySelector('#notifications');if(!bell)return;const n=attentionItems().length;let count=bell.querySelector('.bell-count');if(!n){if(count)count.remove();bell.setAttribute('aria-label','Notifications');return;}if(!count){count=document.createElement('span');count.className='bell-count';count.setAttribute('aria-hidden','true');bell.appendChild(count);}count.textContent=overviewModel.badge(n);bell.setAttribute('aria-label',`Notifications: ${overviewModel.plural(n,'thing')} to look at`);}
-document.querySelector('#notifications').onclick=()=>{const items=attentionItems();showModal('WORKSPACE · NOTIFICATIONS',items.length?`<h2>${overviewModel.plural(items.length,'thing')} to look at.</h2><div class="notification-list">${items.map(i=>`<a class="notification-item" href="#${esc(i.route)}"><strong>${esc(i.title)}</strong><span>${esc(i.detail)}</span></a>`).join('')}</div>`:'<h2>You’re up to date.</h2><p class="quiet-text">Nothing needs attention right now.</p>');};
+/* Rebuilt on every open and after a dismissal — the dialog is not part of
+   #main, so render() never touches it. focusHeading moves the keyboard to the
+   dialog's own heading, the way a page change does to #main's (app.js
+   focusNewPage): a dismissal from the keyboard would otherwise leave it on a
+   button that just left the page. */
+function notificationsModal(focusHeading){const items=attentionItems();showModal('WORKSPACE · NOTIFICATIONS',items.length?`<h2>${overviewModel.plural(items.length,'thing')} to look at.</h2><div class="notification-list">${items.map(i=>`<div class="notification-row"><a class="notification-item" href="#${esc(i.route)}"><strong>${esc(i.title)}</strong><span>${esc(i.detail)}</span></a><button type="button" class="text-btn" data-dismiss-notification="${esc(i.key)}" aria-label="${esc('Dismiss: '+i.title)}">Dismiss</button></div>`).join('')}</div>`:'<h2>You’re up to date.</h2><p class="quiet-text">Nothing needs attention right now.</p>');if(focusHeading){const heading=document.querySelector('#modal-body h2');if(heading){heading.setAttribute('tabindex','-1');heading.focus();}}}
+document.querySelector('#notifications').onclick=()=>notificationsModal(false);
+/* Dismissing does not need the rest of the workspace reloaded — only this
+   person's own read state changed — so it asks for that one part rather than
+   going through store.after(), which (deliberately, for a write that changes
+   what a page shows) reloads everything. */
+document.addEventListener('click',e=>{const dismiss=e.target.closest('[data-dismiss-notification]');if(!dismiss)return;e.preventDefault();if(dismiss.disabled)return;dismiss.disabled=true;const key=dismiss.dataset.dismissNotification;workspaceActions.dismissNotification(key).then(()=>window.workspaceStore.load({quiet:true,only:['dismissedNotifications']})).then(()=>{if(modal.open)notificationsModal(true);},err=>{dismiss.disabled=false;toast(err.message);});});
 window.addEventListener('hashchange',()=>navigate(location.hash.slice(1)));
 /* The search box: everything loaded — people, companies, tasks and notes as
    well as records — best matches first, twelve at a time, and usable with the
