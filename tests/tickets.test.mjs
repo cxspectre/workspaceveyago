@@ -142,3 +142,96 @@ test('connected work is found by the ticket\'s ids, never by a matching name', (
   assert.equal(model.projectFor(ticket({ product: 'Kept' }), projects), null, 'no project id is no project');
   assert.equal(model.contactFor(ticket(), contacts), null);
 });
+
+/* ── Timing: age, first response, resolution (audit #3, #9) ─────────────── */
+
+test('a duration between two moments reads in the coarsest sensible unit', () => {
+  assert.equal(model.durationLabel('2026-09-14T09:00:00Z', '2026-09-14T09:00:20Z'), 'Under a minute');
+  assert.equal(model.durationLabel('2026-09-14T09:00:00Z', '2026-09-14T09:01:00Z'), '1 minute');
+  assert.equal(model.durationLabel('2026-09-14T09:00:00Z', '2026-09-14T09:45:00Z'), '45 minutes');
+  assert.equal(model.durationLabel('2026-09-14T09:00:00Z', '2026-09-14T10:00:00Z'), '1 hour');
+  assert.equal(model.durationLabel('2026-09-14T09:00:00Z', '2026-09-14T11:00:00Z'), '2 hours');
+  assert.equal(model.durationLabel('2026-09-14T09:00:00Z', '2026-09-15T09:00:00Z'), '1 day');
+  assert.equal(model.durationLabel('2026-09-14T09:00:00Z', '2026-09-16T09:00:00Z'), '2 days');
+});
+
+test('a duration going backwards, or missing an end, is nothing rather than a negative number', () => {
+  assert.equal(model.durationLabel(null, '2026-09-14T09:00:00Z'), null, 'no start');
+  assert.equal(model.durationLabel('2026-09-14T09:00:00Z', null), null, 'no end');
+  assert.equal(model.durationLabel('not a date', '2026-09-14T09:00:00Z'), null, 'an unreadable start');
+  assert.equal(model.durationLabel('2026-09-14T09:00:00Z', '2026-09-14T08:00:00Z'), 'Under a minute',
+    'a clock a moment behind the one that stamped the start reads as no time at all, not a negative one');
+});
+
+test('a response target is met, missed, still due, or overdue — never more than one at once', () => {
+  const due = '2026-09-14T12:00:00Z';
+  assert.equal(model.targetStatus(due, '2026-09-14T11:00:00Z', '2026-09-14T13:00:00Z'), 'met');
+  assert.equal(model.targetStatus(due, due, '2026-09-14T13:00:00Z'), 'met', 'exactly on time is met');
+  assert.equal(model.targetStatus(due, '2026-09-14T12:00:01Z', '2026-09-14T13:00:00Z'), 'missed');
+  assert.equal(model.targetStatus(due, null, '2026-09-14T11:00:00Z'), 'due');
+  assert.equal(model.targetStatus(due, null, due), 'due', 'exactly at the deadline, still not overdue');
+  assert.equal(model.targetStatus(due, null, '2026-09-14T12:00:01Z'), 'overdue');
+  assert.equal(model.targetStatus(null, null, '2026-09-14T13:00:00Z'), null, 'no target is nothing to judge');
+});
+
+/* ── Editing (audit #2): subject, contact, company, project, product ────── */
+
+test('an edit to a ticket changes only what the form sent, and only what actually differs', () => {
+  const t = ticket({ title: 'Checkout is broken', product: 'Kept' }, { contact_id: 'c1', company_id: 'co1', project_id: 'p1' });
+  assert.deepEqual({ ...model.ticketChanges(t, { subject: 'Checkout is broken' }).changes }, {},
+    'sent, but the same as it was, is nothing to save');
+  assert.deepEqual({ ...model.ticketChanges(t, {}).changes }, {}, 'a field never sent is not judged');
+  assert.deepEqual({ ...model.ticketChanges(t, { subject: 'Checkout is still broken' }).changes },
+    { subject: 'Checkout is still broken' });
+  assert.deepEqual({ ...model.ticketChanges(t, { contactId: '', companyId: 'co2', projectId: 'p2' }).changes },
+    { contact_id: null, company_id: 'co2', project_id: 'p2' });
+  assert.deepEqual({ ...model.ticketChanges(t, { product: '' }).changes }, { product: null });
+  assert.deepEqual({ ...model.ticketChanges(t, { product: '  Kept  ' }).changes }, {}, 'trimmed before it is compared');
+  const noProduct = ticket({ title: 'Checkout is broken', product: '—' }, {});
+  assert.deepEqual({ ...model.ticketChanges(noProduct, { product: '' }).changes }, {},
+    'queries.tickets() reads no product as the placeholder "—": leaving it blank is not a change');
+});
+
+test('a ticket cannot be saved with a blank subject', () => {
+  const refused = model.ticketChanges(ticket(), { subject: '   ' });
+  assert.deepEqual({ ...refused.changes }, {});
+  assert.match(refused.problem, /needs a subject/);
+  assert.equal(refused.field, 'subject');
+});
+
+/* ── Delete and restore (audit #4) ───────────────────────────────────────── */
+
+test('a ticket is deleted only when the database says so', () => {
+  assert.equal(model.isDeleted(ticket({}, { deleted_at: '2026-09-14T09:00:00Z' })), true);
+  assert.equal(model.isDeleted(ticket()), false);
+  assert.equal(model.isDeleted(ticket({}, { deleted_at: null })), false);
+});
+
+/* ── Merging (audit #8): who to merge into, typed however people write it ── */
+
+/* ── Attachments (audit #11) ─────────────────────────────────────────────── */
+
+test('a file size reads the way a person would say it', () => {
+  assert.equal(model.fileSize(0), '0 B');
+  assert.equal(model.fileSize(512), '512 B');
+  assert.equal(model.fileSize(2048), '2 KB');
+  assert.equal(model.fileSize(1.5 * 1024 * 1024), '1.5 MB');
+  assert.equal(model.fileSize(2 * 1024 * 1024), '2 MB', 'a whole number of megabytes has no trailing .0');
+});
+
+test('a file too large or empty cannot be attached to a ticket; a good one is fine', () => {
+  assert.match(model.fileProblem({ name: 'x.png', size: 0 }), /is empty/);
+  assert.match(model.fileProblem({ name: 'x.png', size: 30 * 1024 * 1024 }), /larger than 25 MB/);
+  assert.equal(model.fileProblem({ name: 'x.png', size: 1024 }), null);
+  assert.match(model.fileProblem(null), /Pick a file/);
+});
+
+test('a typed reference to a ticket reads its number however someone writes it', () => {
+  assert.equal(model.numberFromRef('142'), 142);
+  assert.equal(model.numberFromRef('VYG-142'), 142);
+  assert.equal(model.numberFromRef('#vyg-142'), 142);
+  assert.equal(model.numberFromRef('  #VYG-142  '), 142);
+  assert.equal(model.numberFromRef('nope'), null);
+  assert.equal(model.numberFromRef(''), null);
+  assert.equal(model.numberFromRef('142.5'), null, 'a ticket number is a whole number');
+});

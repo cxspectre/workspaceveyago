@@ -801,6 +801,71 @@
   var INVITEES_MISSING = Object.freeze({ state: 'missing', attendees: Object.freeze([]) });
   var inviteesAskedFor = {};
 
+  /* A ticket's whole conversation — every message, worded and attributed —
+     apart from the list, which carries only enough of each message to know
+     whether the conversation changed (queries.js: messageCount,
+     lastMessageAt). Kept by the ticket's uuid, alongside the version it was
+     fetched for: a background refresh that leaves both numbers the same
+     leaves the cached conversation alone, and ANY write anywhere reloads the
+     list (store.after()) without pulling every open ticket's thread with it —
+     the version comparison is what tells "this ticket changed" from "some
+     other save happened while this ticket's page was open" (audit #12). This
+     is deliberately NOT reset in after(), unlike pastMeetingsBy and the two
+     below: doing that would reload every open ticket's conversation after
+     every save in the workspace, which is the exact cost this exists to
+     avoid. A change to THIS ticket's own thread already moves its
+     messageCount or lastMessageAt on the next load, which is enough. */
+  var TICKET_THREAD_LOADING = Object.freeze({ state: 'loading', messages: Object.freeze([]) });
+  var ticketThreadsAskedFor = {};
+
+  function ticketThreadVersion(t) {
+    return String(t && t.messageCount != null ? t.messageCount : '') + '|' + String((t && t.lastMessageAt) || '');
+  }
+
+  function loadTicketThread(uuid, version) {
+    var entry = { state: 'loading', messages: [], version: version };
+    ticketThreadsAskedFor[uuid] = entry;
+    Promise.resolve()
+      .then(function () { return window.workspaceData.ticketMessages(uuid); })
+      .then(function (messages) {
+        if (ticketThreadsAskedFor[uuid] !== entry) return;
+        ticketThreadsAskedFor[uuid] = { state: 'ready', messages: messages, version: version };
+        repaint(true);
+      }, function (err) {
+        if (ticketThreadsAskedFor[uuid] !== entry) return;
+        console.error('[workspace] the ticket\'s conversation did not load:', err);
+        ticketThreadsAskedFor[uuid] = { state: 'failed', messages: [], version: version };
+        repaint(true);
+      });
+    return entry;
+  }
+
+  /* A ticket's attachments (0056), kept by uuid until a write — any write, as
+     pastMeetingsBy and inviteesAskedFor already are: there is no cheap
+     per-ticket signal for these the way messageCount and lastMessageAt are
+     for the conversation, and attachments are added and removed rarely
+     enough that reloading them after every save costs little. */
+  var TICKET_FILES_LOADING = Object.freeze({ state: 'loading', files: Object.freeze([]) });
+  var ticketFilesAskedFor = {};
+
+  function loadTicketFiles(uuid) {
+    var entry = { state: 'loading', files: [] };
+    ticketFilesAskedFor[uuid] = entry;
+    Promise.resolve()
+      .then(function () { return window.workspaceData.ticketAttachments(uuid); })
+      .then(function (files) {
+        if (ticketFilesAskedFor[uuid] !== entry) return;
+        ticketFilesAskedFor[uuid] = { state: 'ready', files: files };
+        repaint(true);
+      }, function (err) {
+        if (ticketFilesAskedFor[uuid] !== entry) return;
+        console.error('[workspace] the ticket\'s attachments did not load:', err);
+        ticketFilesAskedFor[uuid] = { state: 'failed', files: [] };
+        repaint(true);
+      });
+    return entry;
+  }
+
   function loadInvitees(key) {
     var entry = { state: 'loading', attendees: [] };
     inviteesAskedFor[key] = entry;
@@ -819,12 +884,15 @@
     return entry;
   }
 
-  /* Past meetings, events and invitees a page asked for that did not load: a load that
-     works tries them again, as everything else is tried again by itself.
-     Answers whether any were let go. */
+  /* Past meetings, events, invitees, a ticket's conversation and its
+     attachments a page asked for that did not load: a load that works tries
+     them again, as everything else is tried again by itself. Answers whether
+     any were let go. A failed conversation still carries the version it
+     failed at (ticketThreadVersion), so this does not undo that — the next
+     askTicketThread simply finds nothing cached and asks afresh. */
   function clearFailedAsks() {
     var cleared = false;
-    [pastMeetingsBy, eventsAskedFor, inviteesAskedFor].forEach(function (asks) {
+    [pastMeetingsBy, eventsAskedFor, inviteesAskedFor, ticketThreadsAskedFor, ticketFilesAskedFor].forEach(function (asks) {
       Object.keys(asks).forEach(function (id) {
         if (asks[id].state === 'failed') { delete asks[id]; cleared = true; }
       });
@@ -913,6 +981,37 @@
       return inviteesAskedFor[key] || loadInvitees(key);
     },
 
+    /* A ticket's whole conversation (tickets-ui.js), as { state: 'loading' |
+       'ready' | 'failed', messages }. Takes the ticket itself, not only its
+       id: the version that decides whether a cached copy still answers for it
+       (messageCount, lastMessageAt) lives on the ticket the list just loaded,
+       not in this cache. */
+    askTicketThread: function (ticket) {
+      var uuid = ticket && ticket.uuid;
+      if (!uuid) return TICKET_THREAD_LOADING;
+      var version = ticketThreadVersion(ticket);
+      var cached = ticketThreadsAskedFor[uuid];
+      if (cached && cached.version === version) return cached;
+      if (!state.loaded || !window.workspaceData || typeof window.workspaceData.ticketMessages !== 'function') return TICKET_THREAD_LOADING;
+      return loadTicketThread(uuid, version);
+    },
+    /* Ask again for a ticket's conversation that did not load. */
+    retryTicketThread: function (uuid) {
+      if (ticketThreadsAskedFor[uuid] && ticketThreadsAskedFor[uuid].state === 'failed') delete ticketThreadsAskedFor[uuid];
+    },
+
+    /* A ticket's attachments (tickets-ui.js), as { state: 'loading' | 'ready'
+       | 'failed', files }. */
+    askTicketAttachments: function (uuid) {
+      if (!uuid) return TICKET_FILES_LOADING;
+      if (!state.loaded || !window.workspaceData || typeof window.workspaceData.ticketAttachments !== 'function') return TICKET_FILES_LOADING;
+      return ticketFilesAskedFor[uuid] || loadTicketFiles(uuid);
+    },
+    /* Ask again for a ticket's attachments that did not load. */
+    retryTicketAttachments: function (uuid) {
+      if (ticketFilesAskedFor[uuid] && ticketFilesAskedFor[uuid].state === 'failed') delete ticketFilesAskedFor[uuid];
+    },
+
     /* Views call this after a write so the screen and the database agree. A
        refusal is said in a toast — unless the view says it itself, where it
        happened, and asks for none with { toast: false }: a dialog's error
@@ -923,12 +1022,14 @@
         pastMeetingsBy = {};
         eventsAskedFor = {};
         inviteesAskedFor = {};
+        ticketFilesAskedFor = {};
         await load();
         return out;
       } catch (err) {
         pastMeetingsBy = {};
         eventsAskedFor = {};
         inviteesAskedFor = {};
+        ticketFilesAskedFor = {};
         if (typeof toast === 'function' && !(options && options.toast === false)) toast(err.message);
         /* A write that failed may still have changed something — a row saved
            before a later step was refused — so the page is brought back to

@@ -161,9 +161,20 @@
     },
 
     async assignTicket(ticketId, employeeId) {
-      return one(await sb().from('support_tickets')
+      var row = one(await sb().from('support_tickets')
         .update({ assignee_id: employeeId || null }).eq('id', ticketId).select().single(),
         'reassign the ticket');
+      /* Told once, after the assignment itself has already saved — never
+         awaited into anything the caller does with the save, so a mail
+         failure here can never look like the reassignment failed. Only when
+         someone was actually given the ticket: notify-ticket (0056) decides
+         for itself whether they should hear about it (not themselves, not
+         inactive, an address on file) — this just starts the call. */
+      if (employeeId) {
+        sb().functions.invoke('notify-ticket', { body: { ticket_id: ticketId, event: 'assigned' } })
+          .catch(function (err) { console.warn('[workspace] could not tell the assignee:', err && err.message); });
+      }
+      return row;
     },
 
     async createTicket(fields) {
@@ -176,8 +187,114 @@
         product: fields.product || null,
         priority: fields.priority || 'normal',
         source: fields.source || 'manual',
-        assignee_id: fields.assigneeId || (me() ? me().id : null)
+        assignee_id: fields.assigneeId || (me() ? me().id : null),
+        /* A sender the CRM has no contact for (audit #1): the raw address so
+           a reply still has somewhere to go, kept as a fallback that yields
+           to a contact linked here or later on the ticket's edit dialog. */
+        requester_email: fields.requesterEmail || null,
+        requester_name: fields.requesterName || null
       }).select().single(), 'create the ticket');
+    },
+
+    /* What an edit to a ticket changes (ticketsModel.ticketChanges), and only
+       that — its subject, contact, company, project and product; status,
+       priority and owner keep their own selects and saves above. `since` is
+       the updated_at the change was made against (0023's own touch trigger
+       moves it on every update), so a change made meanwhile is refused, not
+       overwritten — the same rule updateEvent already uses. */
+    async updateTicket(ticketId, changes, since) {
+      var EDITABLE = ['subject', 'contact_id', 'company_id', 'project_id', 'product'];
+      var fields = changes || {};
+      var keys = Object.keys(fields);
+      must(keys.length, 'Nothing was changed.');
+      must(keys.every(function (key) { return EDITABLE.indexOf(key) !== -1; }),
+        'Only a ticket’s subject, contact, company, project and product can be changed here.');
+      if ('subject' in fields) must(String(fields.subject || '').trim(), 'A ticket needs a subject.');
+      var update = sb().from('support_tickets').update(fields).eq('id', ticketId);
+      if (since) update = update.eq('updated_at', since);
+      return touched(await update.select(), 'save the ticket',
+        'The ticket was not saved: it was changed since this was opened, or you may not change it. Close this and open the ticket again.')[0];
+    },
+
+    /* Soft delete: only a manager, and the database enforces the same rule
+       (guard_soft_delete, 0012) whichever way a ticket's deleted_at is
+       changed — this check just fails fast with a sentence a person can
+       read, the way archiveProject's own check does. .is('deleted_at', null)
+       makes an already-deleted ticket a refusal rather than a silent no-op. */
+    async deleteTicket(ticketId) {
+      must(window.workspaceSession.isManager && window.workspaceSession.isManager(),
+        'Only an owner or admin can delete a ticket.');
+      touched(await sb().from('support_tickets')
+        .update({ deleted_at: new Date().toISOString() }).eq('id', ticketId).is('deleted_at', null).select('id'),
+        'delete the ticket', 'The ticket was not deleted: it has been removed already, or only an owner or admin can remove one.');
+    },
+
+    /* By its number, the one a manager already has from the moment they
+       deleted it — deleted tickets are not listed anywhere in the workspace
+       for one to be picked from instead (0056). */
+    async restoreTicket(number) {
+      must(window.workspaceSession.isManager && window.workspaceSession.isManager(),
+        'Only an owner or admin can restore a ticket.');
+      must(Number.isInteger(number) && number > 0, 'That is not a ticket number.');
+      touched(await sb().from('support_tickets')
+        .update({ deleted_at: null }).eq('number', number).not('deleted_at', 'is', null).select('id'),
+        'restore the ticket', 'No deleted ticket has that number, or only an owner or admin can restore one.');
+    },
+
+    /* ── Ticket attachments (0056) ──────────────────────────────────────
+       Stored first, then recorded — the same order uploadProjectFile uses,
+       for the same reason: an upload whose record will not save is taken
+       away again, since without its record nobody would ever see it. */
+    async uploadTicketAttachment(ticketId, file) {
+      var problem = ticketsModel.fileProblem(file);
+      must(!problem, problem);
+      must(ticketId, 'That ticket has no id yet.');
+      var contentType = file.type || 'application/octet-stream';
+      var path = ticketId + '/' + window.crypto.randomUUID() + '/' + mailModel.storageName(file.name);
+      var stored = await sb().storage.from('ticket-attachments').upload(path, file, { contentType: contentType, upsert: false });
+      if (stored.error) throw new Error('Could not upload "' + file.name + '": ' + stored.error.message);
+      var res = await sb().from('ticket_attachments').insert({
+        ticket_id: ticketId, storage_path: path, name: String(file.name),
+        size_bytes: Number(file.size), content_type: contentType
+      }).select().single();
+      if (res.error) {
+        await sb().storage.from('ticket-attachments').remove([path]);
+        throw new Error('Could not add "' + file.name + '" to the ticket: ' + res.error.message);
+      }
+      return res.data;
+    },
+
+    /* The upload goes first, as removeProjectFile's does: a record left
+       without its upload shows as missing and can still be removed; an
+       upload left without its record would be found by nobody. */
+    async removeTicketAttachment(file) {
+      must(file && file.id && file.storagePath, 'That attachment is not loaded any more. Reload the page.');
+      var label = '"' + (file.name || 'the file') + '"';
+      var removed = await sb().storage.from('ticket-attachments').remove([file.storagePath]);
+      if (removed.error) throw new Error('Could not remove ' + label + ': ' + removed.error.message);
+      return touched(await sb().from('ticket_attachments').delete().eq('id', file.id).select(),
+        'remove ' + label,
+        'Only whoever uploaded it, or an owner or admin, can remove this attachment.');
+    },
+
+    /* A minute is long enough to start a download, and short enough that a
+       link copied out of the page soon stops working — the same choice
+       projectFileLink makes. */
+    async ticketAttachmentLink(path, name) {
+      var res = await sb().storage.from('ticket-attachments').createSignedUrl(path, 60, name ? { download: name } : undefined);
+      if (res.error) throw new Error('Could not open the file: ' + res.error.message);
+      must(res.data && /^https:\/\//.test(res.data.signedUrl || ''), 'Could not open the file.');
+      return res.data.signedUrl;
+    },
+
+    /* Two tickets about the same problem, made one (0056's merge_tickets()):
+       p_drop's thread, notes and conversations move to p_keep, p_drop closes
+       pointing at it. Any signed-in staff member, not managers only — the
+       same as everything else this page lets a team member do to a ticket. */
+    async mergeTickets(keepId, dropId) {
+      var res = await sb().rpc('merge_tickets', { p_keep: keepId, p_drop: dropId });
+      if (res.error) throw new Error('Could not merge the tickets: ' + res.error.message);
+      return res.data;
     },
 
     /* ── Tasks ───────────────────────────────────────────────────────── */

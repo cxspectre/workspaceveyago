@@ -360,6 +360,31 @@ body.mail-mode .reader-compose .composer-editor { flex: 1; min-height: 240px; ma
 .conversation-entry .delivery{display:inline-block;margin-top:4px;font-size:.75rem;color:#2f6f46}
 .conversation-entry .delivery.failed{color:#b3261e}
 .ticket-link{color:inherit;text-decoration:none}.ticket-link:hover strong,.ticket-link:focus-visible strong{text-decoration:underline}
+/* A queue row whose last reply never sent (audit #3): the same red the
+   conversation's own failed deliveries use, so the colour already means one
+   thing on this page. */
+.delivery-flag{display:block;margin-top:2px;font-size:.75rem;color:#b3261e}
+/* Newest/oldest (audit #3): plain text buttons beside the search box, the
+   picked one told apart the way the composer's own toggle buttons already
+   are — aria-pressed carries the state, not a class nobody else uses. */
+.ticket-sort{display:flex;gap:4px;margin-right:auto;margin-left:14px}
+.ticket-sort .text-btn{padding:4px 9px;border-radius:8px}
+.ticket-sort .text-btn[aria-pressed="true"]{background:#e3ebf6;color:#0b4fa0;font-weight:600}
+/* Restoring a deleted ticket by its number (audit #4): the only way to reach
+   one, since a deleted ticket is not listed anywhere here to click into. */
+.restore-ticket-form{display:flex;gap:6px;padding:12px 11px 0;border-top:1px solid var(--line);margin-top:12px}
+.restore-ticket-form input{flex:1;min-width:0;font-size:.8125rem;padding:7px 9px;border:1px solid var(--line);border-radius:8px;background:#fff}
+/* On a phone the queue used to be a column of titles with the rest of the
+   table scrolled to sideways: .module-table's own min-width (680px, set
+   unconditionally further up this file) never gave way to a narrow screen.
+   Below it, the table fits without scrolling at all, at the cost of two
+   columns a tap into the ticket already answers — Product/client (whose
+   client name is already in the title cell's own subtext) and Owner. */
+@media (max-width: 520px) {
+  .queue-layout .module-table { min-width: 0; }
+  .queue-layout .module-table th:nth-child(2), .queue-layout .module-table td:nth-child(2),
+  .queue-layout .module-table th:nth-child(5), .queue-layout .module-table td:nth-child(5) { display: none; }
+}
 .mailbox-connection small.mailbox-note{color:#b45309;margin-top:2px;overflow-wrap:anywhere}
 .record-link{color:inherit;text-decoration:none}.record-link:hover strong,.record-link:focus-visible strong{text-decoration:underline}
 

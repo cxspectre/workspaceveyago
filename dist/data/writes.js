@@ -445,15 +445,19 @@
         /* The requester is the customer, found by address or by a name only one
            contact has — never the product, where it used to be filed. One the
            CRM does not know is written into the opening note, so what was typed
-           is not lost. Looked up inside the chain, so a refusal is said. */
+           is not lost — and, when what was typed is itself an address, kept on
+           the ticket too (requesterEmail), so a reply still has somewhere to go
+           without waiting for someone to add them to the CRM (audit #1).
+           Looked up inside the chain, so a refusal is said. */
         work = Promise.resolve(context).then(contactFor).then(function (requester) {
+          var typedAddress = !requester && typeof mailModel !== 'undefined' && mailModel.isAddress(context) ? context.trim() : null;
           var opening = requester ? description
             : ['Requester: ' + context, description].filter(Boolean).join('\n\n');
-          return A.createTicket({
+          return A.createTicket(Object.assign({
             subject: name, product: null, priority: priority,
             contactId: requester ? requester.row.id : null,
             companyId: requester && requester.row.company ? requester.row.company.id : ticketCompany(context)
-          }).then(function (ticket) {
+          }, typedAddress ? { requesterEmail: typedAddress } : {})).then(function (ticket) {
             /* The description opens the thread, so it reads from the beginning
                rather than starting with our reply. */
             if (!opening) return { ticket: ticket };
@@ -528,6 +532,7 @@
       var body = String(data.get('body') || '').trim();
       if (!body) return;
       var internal = String(data.get('mode') || '') === 'note';
+      var thenWaiting = Boolean(data.get('thenWaiting'));
       var number = form.dataset.ticketReply;
       var ticket = window.workspaceStore.ticketByNumber(number);
       if (!ticket) { fail(new Error('That ticket is not loaded any more. Reload the page and try again.')); return; }
@@ -554,6 +559,23 @@
         .then(function (result) {
           var box = form.querySelector('textarea[name="body"]');
           if (box && box.value.trim() === body) box.value = '';
+          /* "Reply and set to Waiting": only once the reply is confirmed
+             sent — a status that says the studio is waiting on the customer
+             is not true of a reply that was only saved, or one whose
+             delivery is not known (result.sent is exactly that: false for
+             both, unlike a thrown, unknownOutcome error, which never reaches
+             here at all — see the catch below). A second save through the
+             same chain every other ticket field already uses. */
+          if (!internal && thenWaiting && result && result.sent) {
+            return window.workspaceStore.after(window.workspaceActions.setTicketStatus(ticket.uuid, 'waiting'))
+              .then(function () {
+                if (typeof toast === 'function') toast('Reply sent to ' + result.to + '. Status: Waiting.');
+              }, function (err) {
+                if (typeof toast === 'function') {
+                  toast('Reply sent to ' + result.to + ', but the status was not saved: ' + err.message);
+                }
+              });
+          }
           if (typeof toast !== 'function') return;
           /* Say what actually happened. "Reply posted" next to a reply that
              never left is the failure this whole path exists to avoid. */
