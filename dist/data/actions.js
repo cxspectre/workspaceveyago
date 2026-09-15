@@ -71,6 +71,9 @@
     return projectsModel.CONTACT_ROLES.some(function (r) { return r.value === role; });
   }
 
+  /* Every status a task can be reopened to — everything but 'done' itself. */
+  var REOPEN_STATUSES = ['todo', 'in_progress', 'blocked'];
+
   /* Read or starred, through update-mail-state, which changes Outlook, the
      stored messages and the thread together. There is deliberately no fallback
      to writing the thread row: that never reached Outlook and was undone by the
@@ -187,10 +190,19 @@
        a non-manager sends them, so do not bother sending them. RLS refuses a
        tick someone may not make by touching nothing (0050): the rows changed
        are asked back, and none is said as a refusal rather than as
-       supabase-js's "no rows returned". */
-    async setTaskDone(taskId, done) {
+       supabase-js's "no rows returned".
+
+       Unticking only ever knows "done" or "not done" — a checkbox has no room
+       for "in progress" or "blocked" — so on its own it cannot say which of
+       those a task should go back to. `revertTo` is that answer, when the
+       caller has one (data/writes.js reads it off the checkbox that ticked
+       the task done in the first place, from before the task became done): a
+       status a task can be reopened to, or it is ignored and the task goes
+       back to "to do", as it always has. */
+    async setTaskDone(taskId, done, revertTo) {
+      var reopenAs = REOPEN_STATUSES.indexOf(revertTo) !== -1 ? revertTo : 'todo';
       return touched(await sb().from('tasks').update({
-        status: done ? 'done' : 'todo',
+        status: done ? 'done' : reopenAs,
         completed_at: done ? new Date().toISOString() : null
       }).eq('id', taskId).select(), 'update the task',
         'The task was not changed: only its assignee, its project’s team, or an owner or admin can tick it off.')[0];
@@ -229,6 +241,10 @@
 
     /* ── Projects ────────────────────────────────────────────────────── */
 
+    /* ownerId: undefined means nothing was said, so whoever adds it owns it —
+       null is a deliberate "no owner", same as createCompany already reads
+       it. `fields.ownerId || me()` could not tell those apart, so "No owner"
+       picked in the New project dialog silently became the creator anyway. */
     async createProject(fields) {
       must(fields && fields.name && fields.name.trim(), 'A project needs a name.');
       return one(await sb().from('client_projects').insert({
@@ -238,8 +254,9 @@
         accent: fields.accent || 'default',
         status: fields.status || 'discovery',
         description: fields.description || null,
+        starts_on: fields.startsOn || null,
         due_on: fields.dueOn || null,
-        owner_id: fields.ownerId || (me() ? me().id : null)
+        owner_id: fields.ownerId !== undefined ? fields.ownerId : (me() ? me().id : null)
       }).select().single(), 'create the project');
     },
 
@@ -274,6 +291,20 @@
       return one(await sb().from('client_projects')
         .update({ deleted_at: new Date().toISOString() }).eq('id', projectId).select().single(),
         'archive the project');
+    },
+
+    /* The other direction: back onto the board and every list. guard_soft_delete
+       (0012) enforces owners and admins only for either direction of deleted_at,
+       so the check here is the same one archiving already makes, not a new
+       rule — and the row changed is asked back, so one already restored, or
+       gone outright, is a refusal rather than a silent no-op. */
+    async restoreProject(projectId) {
+      must(window.workspaceSession.isManager && window.workspaceSession.isManager(),
+        'Only an owner or admin can restore a project.');
+      return touched(await sb().from('client_projects')
+        .update({ deleted_at: null }).eq('id', projectId).select(),
+        'restore the project',
+        'The project was not restored: it is not archived any more, or only an owner or admin can restore it.')[0];
     },
 
     /* ── Projects: team, client people, files, budget (0039) ─────────── */

@@ -772,16 +772,70 @@
     return entry;
   }
 
-  /* Past meetings, events and invitees a page asked for that did not load: a load that
-     works tries them again, as everything else is tried again by itself.
-     Answers whether any were let go. */
+  /* Archived projects (deleted_at set): left out of `projects` entirely, the
+     same way the client_project_progress view leaves them out, so there was
+     no way to see or restore one again. Asked for only when the Projects
+     page switches to its Archived view — not with the rest of the workspace,
+     since most visits never need it — and kept until a write, which may add
+     to or shrink the list (archiving, restoring). One shared entry: unlike
+     project activity there is only ever one archived list, not one per id. */
+  var archivedProjectsBy = null;
+  var ARCHIVED_PROJECTS_LOADING = Object.freeze({ state: 'loading', projects: Object.freeze([]) });
+
+  function loadArchivedProjects() {
+    var entry = { state: 'loading', projects: [] };
+    archivedProjectsBy = entry;
+    Promise.resolve()
+      .then(function () { return window.workspaceData.archivedProjects(); })
+      .then(function (rows) {
+        if (archivedProjectsBy !== entry) return;
+        archivedProjectsBy = { state: 'ready', projects: rows || [] };
+        repaint(true);
+      }, function (err) {
+        if (archivedProjectsBy !== entry) return;
+        console.error('[workspace] archived projects did not load:', err);
+        archivedProjectsBy = { state: 'failed', projects: [] };
+        repaint(true);
+      });
+    return entry;
+  }
+
+  /* A project's own activity (0052), asked for when its page is drawn rather
+     than with the whole workspace — the studio-wide feed is capped to its
+     most recent rows and a project's own history can reach further back than
+     that. Kept by project id until a write, which may have added to it. */
+  var projectActivityBy = {};
+  var PROJECT_ACTIVITY_LOADING = Object.freeze({ state: 'loading', activity: Object.freeze([]) });
+
+  function loadProjectActivity(id) {
+    var entry = { state: 'loading', activity: [] };
+    projectActivityBy[id] = entry;
+    Promise.resolve()
+      .then(function () { return window.workspaceData.projectActivity(id); })
+      .then(function (rows) {
+        if (projectActivityBy[id] !== entry) return;
+        projectActivityBy[id] = { state: 'ready', activity: rows || [] };
+        repaint(true);
+      }, function (err) {
+        if (projectActivityBy[id] !== entry) return;
+        console.error('[workspace] a project\'s activity did not load:', err);
+        projectActivityBy[id] = { state: 'failed', activity: [] };
+        repaint(true);
+      });
+    return entry;
+  }
+
+  /* Past meetings, events, invitees and project activity a page asked for
+     that did not load: a load that works tries them again, as everything
+     else is tried again by itself. Answers whether any were let go. */
   function clearFailedAsks() {
     var cleared = false;
-    [pastMeetingsBy, eventsAskedFor, inviteesAskedFor].forEach(function (asks) {
+    [pastMeetingsBy, eventsAskedFor, inviteesAskedFor, projectActivityBy].forEach(function (asks) {
       Object.keys(asks).forEach(function (id) {
         if (asks[id].state === 'failed') { delete asks[id]; cleared = true; }
       });
     });
+    if (archivedProjectsBy && archivedProjectsBy.state === 'failed') { archivedProjectsBy = null; cleared = true; }
     return cleared;
   }
 
@@ -863,6 +917,31 @@
       return inviteesAskedFor[key] || loadInvitees(key);
     },
 
+    /* A project's own activity (project-panels.js), as { state: 'loading' |
+       'ready' | 'failed', activity }. The first ask for a project, once the
+       workspace has loaded, starts the load; its page is drawn again once it
+       lands. */
+    projectActivity: function (id) {
+      if (!state.loaded || !window.workspaceData || typeof window.workspaceData.projectActivity !== 'function') return PROJECT_ACTIVITY_LOADING;
+      return projectActivityBy[id] || loadProjectActivity(id);
+    },
+    /* Ask again for a project's activity that did not load. */
+    retryProjectActivity: function (id) {
+      if (projectActivityBy[id] && projectActivityBy[id].state === 'failed') delete projectActivityBy[id];
+    },
+
+    /* Archived projects (projects-ui.js's Archived view), as { state:
+       'loading' | 'ready' | 'failed', projects }. The first ask starts the
+       load; the page is drawn again once it lands. */
+    archivedProjects: function () {
+      if (!state.loaded || !window.workspaceData || typeof window.workspaceData.archivedProjects !== 'function') return ARCHIVED_PROJECTS_LOADING;
+      return archivedProjectsBy || loadArchivedProjects();
+    },
+    /* Ask again for the archived list once it has failed. */
+    retryArchivedProjects: function () {
+      if (archivedProjectsBy && archivedProjectsBy.state === 'failed') archivedProjectsBy = null;
+    },
+
     /* Views call this after a write so the screen and the database agree. A
        refusal is said in a toast — unless the view says it itself, where it
        happened, and asks for none with { toast: false }: a dialog's error
@@ -873,12 +952,16 @@
         pastMeetingsBy = {};
         eventsAskedFor = {};
         inviteesAskedFor = {};
+        projectActivityBy = {};
+        archivedProjectsBy = null;
         await load();
         return out;
       } catch (err) {
         pastMeetingsBy = {};
         eventsAskedFor = {};
         inviteesAskedFor = {};
+        projectActivityBy = {};
+        archivedProjectsBy = null;
         if (typeof toast === 'function' && !(options && options.toast === false)) toast(err.message);
         /* A write that failed may still have changed something — a row saved
            before a later step was refused — so the page is brought back to

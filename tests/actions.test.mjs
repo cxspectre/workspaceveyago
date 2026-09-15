@@ -294,6 +294,23 @@ test('ticking a task off asks which rows changed, and none is a refusal, said as
     'not supabase-js\'s "no rows returned"');
 });
 
+test('unticking a task reopens it at the status it is given, not always "to do"', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }));
+  await ws.actions.setTaskDone('task-1', false, 'in_progress');
+  await ws.actions.setTaskDone('task-2', false, 'blocked');
+  await ws.actions.setTaskDone('task-3', false, 'todo');
+  await ws.actions.setTaskDone('task-4', false);
+  await ws.actions.setTaskDone('task-5', false, 'done');
+  await ws.actions.setTaskDone('task-6', false, 'not-a-status');
+  assert.deepEqual(ws.written.map(w => w.change.status),
+    ['in_progress', 'blocked', 'todo', 'todo', 'todo', 'todo'],
+    'an unknown or missing status — and "done" itself, which is not something to reopen a task to — falls back to "to do"');
+  assert.deepEqual(ws.written.map(w => w.change.completed_at), Array(6).fill(null));
+  const ticked = workspace(async () => ({ data: null, error: null }));
+  await ticked.actions.setTaskDone('task-1', true, 'in_progress');
+  assert.equal(ticked.written[0].change.status, 'done', 'a hint meant for reopening is ignored while ticking');
+});
+
 test('removing a task asks which rows went, and none is a refusal, said as one', async () => {
   const removed = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: 'task-1' }] });
   await removed.actions.deleteTask('task-1');
@@ -497,6 +514,47 @@ test('archiving a project is for owners and admins, and keeps the project', asyn
   assert.equal(staff.written.length, 0);
 });
 
+test('restoring a project is for owners and admins too, and asks which row came back', async () => {
+  const manager = workspace(async () => ({}), { manager: true, rows: () => [{ id: 'p1', deleted_at: null }] });
+  await manager.actions.restoreProject('p1');
+  assert.deepEqual(manager.written, [{ table: 'client_projects', what: 'update', change: { deleted_at: null }, where: [['id', 'p1']] }]);
+
+  const staff = workspace(async () => ({}), { manager: false });
+  await assert.rejects(staff.actions.restoreProject('p1'), /owner or admin/);
+  assert.equal(staff.written.length, 0);
+
+  const gone = workspace(async () => ({}), { manager: true, rows: () => [] });
+  await assert.rejects(gone.actions.restoreProject('p1'),
+    err => /not archived any more, or only an owner or admin/.test(err.message) && err.refused === true);
+});
+
+test('a new project is owned by whoever adds it, by the owner it is given, or by no one when that is chosen — never confused with "not said"', async () => {
+  const ws = workspace(async () => ({}));
+  await ws.actions.createProject({ name: 'Northline site' });
+  await ws.actions.createProject({ name: 'Kept · Autumn release', ownerId: 'e-2' });
+  await ws.actions.createProject({ name: 'A side project', ownerId: null });
+  assert.equal(ws.written[0].change.owner_id, 'emp-1', 'nothing said: whoever adds it');
+  assert.equal(ws.written[1].change.owner_id, 'e-2');
+  assert.equal(ws.written[2].change.owner_id, null, '"No owner" picked in the dialog is no owner, not the creator again');
+});
+
+test('a new project sends its start date, and every field a fresh project can be given', async () => {
+  const ws = workspace(async () => ({}));
+  await ws.actions.createProject({
+    name: 'Northline site', companyId: 'co1', description: 'Relaunch',
+    startsOn: '2026-09-15', dueOn: '2026-12-01', status: 'in_progress', code: 'N', accent: 'client'
+  });
+  assert.deepEqual(ws.written[0].change, {
+    name: 'Northline site', company_id: 'co1', code: 'N', accent: 'client', status: 'in_progress',
+    description: 'Relaunch', starts_on: '2026-09-15', due_on: '2026-12-01', owner_id: 'emp-1'
+  });
+  const bare = workspace(async () => ({}));
+  await bare.actions.createProject({ name: 'Minimal' });
+  assert.equal(bare.written[0].change.starts_on, null);
+  assert.equal(bare.written[0].change.status, 'discovery');
+  await assert.rejects(bare.actions.createProject({ name: '  ' }), { message: 'A project needs a name.' });
+});
+
 test('a project\'s start date is one of the columns an edit may change', async () => {
   const ws = workspace(async () => ({}));
   await ws.actions.updateProject('p1', { starts_on: '2026-09-15' });
@@ -592,12 +650,25 @@ test('a file someone may not remove stays, and they are told whose it is to remo
   await assert.rejects(ws.actions.removeProjectFile({ id: 'f1', name: 'brief.pdf', path: 'p1/u1/brief.pdf' }), /uploaded it/);
 });
 
-test('a file opens through a link that expires in a minute', async () => {
+test('a file opens through a link that expires in a minute, downloading under its own name when one is given', async () => {
   const stub = storageStub();
   const ws = workspace(async () => ({}), { storage: stub.storage });
-  const url = await ws.actions.projectFileLink('p1/u1/brief.pdf');
-  assert.match(url, /^https:\/\//);
-  assert.deepEqual(stub.calls, [{ bucket: 'project-files', what: 'sign', path: 'p1/u1/brief.pdf', seconds: 60 }]);
+  const bare = await ws.actions.projectFileLink('p1/u1/brief.pdf');
+  assert.match(bare, /^https:\/\//);
+  assert.deepEqual(stub.calls, [{ bucket: 'project-files', what: 'sign', path: 'p1/u1/brief.pdf', seconds: 60, options: undefined }],
+    'nothing to name the download by: no options, not a link the browser reads as one');
+
+  const named = await ws.actions.projectFileLink('p1/u1/brief.pdf', 'Brief (v2).pdf');
+  assert.match(named, /^https:\/\//);
+  assert.deepEqual({ ...stub.calls[1].options }, { download: 'Brief (v2).pdf' },
+    'the file’s own name, not the storage path it happens to be filed under');
+});
+
+test('a link the storage API refuses, or one that is not really a link, opens nothing', async () => {
+  const refused = workspace(async () => ({}), { storage: () => ({ createSignedUrl: async () => ({ data: null, error: { message: 'Object not found' } }) }) });
+  await assert.rejects(refused.actions.projectFileLink('p1/u1/gone.pdf'), { message: 'Could not open the file: Object not found' });
+  const bogus = workspace(async () => ({}), { storage: () => ({ createSignedUrl: async () => ({ data: { signedUrl: 'javascript:alert(1)' }, error: null }) }) });
+  await assert.rejects(bogus.actions.projectFileLink('p1/u1/x.pdf'), { message: 'Could not open the file.' });
 });
 
 test('a budget is set with insert, changed with update and cleared with delete — never upserted', async () => {
@@ -698,8 +769,8 @@ function storageStub(error = null) {
         calls.push({ bucket, what: 'remove', paths: [...paths] });
         return { data: [], error };
       },
-      createSignedUrl: async (path, seconds) => {
-        calls.push({ bucket, what: 'sign', path, seconds });
+      createSignedUrl: async (path, seconds, options) => {
+        calls.push({ bucket, what: 'sign', path, seconds, options });
         return { data: error ? null : { signedUrl: `https://storage.example/sign/${path}` }, error };
       }
     })

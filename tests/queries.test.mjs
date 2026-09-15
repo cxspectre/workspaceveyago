@@ -335,6 +335,66 @@ test('a note whose author\'s row is gone is a former team member\'s, never the s
   assert.doesNotMatch(notes.map(n => n.who).join(' '), /Veyago/);
 });
 
+/* ── Projects ─────────────────────────────────────────────────────────── */
+
+test('projects order by sort_order, then by name and id so a reload never reshuffles them', async () => {
+  const { data, queries } = loadTables(table => (table !== 'client_project_progress' ? [] : [
+    { id: 'p1', name: 'Northline site' }, { id: 'p2', name: 'Kept · Autumn release' }
+  ]));
+  await data.projects();
+  assert.deepEqual(queries[0].calls.filter(([method]) => method === 'order'),
+    [['order', 'sort_order'], ['order', 'name'], ['order', 'id']],
+    'sort_order is the same 0 for every project, so name then id is what actually settles the order');
+});
+
+test('archived projects are read past the view, which leaves them out, ordered newest-archived first', async () => {
+  const plain = value => JSON.parse(JSON.stringify(value));
+  const { data, queries } = loadTables(table => (table !== 'client_projects' ? [] : [
+    { id: 'p1', name: 'Old brief', code: null, accent: 'default', status: 'cancelled', description: null,
+      company_id: null, owner_id: null, due_on: null, deleted_at: '2026-08-01T09:00:00Z', company: null }
+  ]));
+  const [p] = await data.archivedProjects();
+  assert.equal(p.id, 'p1');
+  assert.equal(p.name, 'Old brief');
+  assert.equal(p.archivedAt, '2026-08-01T09:00:00Z');
+  assert.deepEqual(plain(queries[0].calls.filter(([method]) => method === 'not')), [['not', 'deleted_at', 'is', null]]);
+  assert.deepEqual(plain(queries[0].calls.filter(([method]) => method === 'order')),
+    [['order', 'deleted_at', { ascending: false }], ['order', 'id']]);
+});
+
+test('archived projects are named by their company, or "Internal product" with none', async () => {
+  const { data } = loadTables(table => (table !== 'client_projects' ? [] : [
+    { id: 'p1', name: 'Client work', code: null, accent: 'client', status: 'on_hold', description: null,
+      company_id: 'co1', owner_id: null, due_on: null, deleted_at: '2026-08-01T09:00:00Z', company: { name: 'Northline' } },
+    { id: 'p2', name: 'Side project', code: null, accent: 'default', status: 'discovery', description: null,
+      company_id: null, owner_id: null, due_on: null, deleted_at: '2026-08-02T09:00:00Z', company: null }
+  ]));
+  const [client, internal] = await data.archivedProjects();
+  assert.equal(client.client, 'Northline');
+  assert.equal(internal.client, 'Internal product');
+});
+
+test('a project\'s own activity is asked for by its id, past the studio-wide feed\'s window, and shaped the same way', async () => {
+  const plain = value => JSON.parse(JSON.stringify(value));
+  const PROJECT = 'a1000000-0000-4000-8000-000000000001';
+  const { data, queries } = loadTables(table => (table !== 'workspace_activity' ? [] : [{
+    id: 'a1', verb: 'created', entity_type: 'task', entity_id: 't1', summary: 'New task · Draft copy',
+    created_at: '2026-09-14T09:00:00Z', actor: { full_name: 'Sam Rivera' }
+  }]));
+  const [entry] = await data.projectActivity(PROJECT);
+  assert.equal(entry.who, 'Sam Rivera');
+  assert.equal(entry.text, 'New task · Draft copy');
+  assert.deepEqual(plain(queries[0].calls.filter(([method]) => method === 'eq')), [['eq', 'project_id', PROJECT]]);
+  assert.deepEqual(plain(queries[0].calls.find(([method]) => method === 'order')), ['order', 'created_at', { ascending: false }]);
+});
+
+test('a project\'s activity asks for nothing without a real id', async () => {
+  const { data, queries } = loadTables(() => []);
+  assert.deepEqual([...(await data.projectActivity('drop table projects;'))], []);
+  assert.deepEqual([...(await data.projectActivity(''))], []);
+  assert.equal(queries.length, 0);
+});
+
 test('a task arrives with its details, who made it, and when it was made and finished', async () => {
   const { data, queries } = loadTables(table => (table !== 'tasks' ? [] : [{
     id: 'task-1', project_id: 'p1', title: 'Wireframes', details: 'Home and checkout', status: 'done', priority: 'high',
