@@ -54,6 +54,11 @@ test('the models load before the views that use them', () => {
   assert.ok(at('dialog-forms.js') < at('crm-forms.js'), 'the CRM dialogs take their shared helpers as they load');
   assert.ok(at('dialog-forms.js') < at('finance-ui.js'), 'Finance\'s dialogs use the shared helpers');
   assert.ok(at('app.js') < at('crm-forms.js'), 'crm-forms.js replaces the Add contact form app.js defines');
+  assert.ok(at('projects-model.js') < at('project-forms.js'), 'the New project dialog checks what it saves with the model');
+  assert.ok(at('crm-model.js') < at('project-forms.js'), 'the New project dialog asks about a look-alike company the way the CRM does');
+  assert.ok(at('dialog-forms.js') < at('project-forms.js'), 'the New project dialog takes its shared helpers as it loads');
+  assert.ok(at('app.js') < at('project-forms.js'), 'project-forms.js replaces the New project form app.js defines');
+  assert.ok(at('project-panels.js') < at('project-forms.js'), 'both draw a project page\'s own bits, loaded together');
   assert.ok(at('tasks-model.js') < at('tasks-ui.js'), 'tasks-ui.js reads the model as it loads');
   assert.ok(at('dialog-forms.js') < at('tasks-ui.js'), 'the task dialogs take their shared helpers as tasks-ui.js loads');
   assert.ok(at('dialog-forms.js') < at('notes-ui.js'), 'the note dialogs take their shared helpers as notes-ui.js loads');
