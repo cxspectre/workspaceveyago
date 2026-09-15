@@ -359,6 +359,7 @@ const crmUi = (function () {
       + `<div class="record-layout"><div class="record-main">${notes ? notesPanel('companies', c.id) : overview}</div><aside class="record-aside">`
       + properties([
         ['Stage', c.stageLabel ? esc(c.stageLabel) : NONE],
+        ...(record.clientNumber != null ? [['Client No.', esc(String(record.clientNumber))]] : []),
         ['Kind', c.kindLabel ? esc(c.kindLabel) : NONE],
         ['Value', esc(valueText(c))],
         ['Owner', esc(owner.words)],

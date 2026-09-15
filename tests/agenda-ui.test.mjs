@@ -41,8 +41,8 @@ function target(attribute, value) {
 }
 
 /* refuseRemove: the database removes nothing. */
-function load({ list = [], projectEvents = [], route = ['agenda'], mode = 'week', loaded = true, me = 'e-me', manager = false, contacts = [], projects = [], weeks = null, failed = [], ask = null, refuseRemove = false,
-  team = [], companies = [], parts = ['events', 'team'], invitees = null, storage = null, phone = false } = {}) {
+function load({ list = [], projectEvents = [], route = ['agenda'], mode = 'week', loaded = true, me = 'e-me', manager = false, contacts = [], projects = [], weeks = null, failed = [], failedWeeks = null, ask = null, refuseRemove = false,
+  team = [], companies = [], parts = ['events', 'team'], invitees = null, storage = null, phone = false, legacyStore = false } = {}) {
   const invitesAsked = [];
   const heading = { attributes: {}, focused: 0, setAttribute(name, value) { this.attributes[name] = value; }, focus() { this.focused += 1; } };
   /* The page's own heading, and the events a page asked the store for by id. */
@@ -114,6 +114,11 @@ function load({ list = [], projectEvents = [], route = ['agenda'], mode = 'week'
       askInvitees: id => { invitesAsked.push(id); return invitees ? invitees(id) : { state: 'missing', attendees: [] }; },
       showWeek: week => shown.push(week.key),
       weekLoaded: key => (weeks ? weeks.includes(key) : true),
+      /* As store.js's own weekFailed: a test naming failedWeeks gets exactly
+         those keys reported failed; one that only names `failed` (the old
+         whole-agenda list) is treated as every week failing, matching what
+         agenda-ui.js's own fallback would have said before this existed. */
+      weekFailed: key => (failedWeeks ? failedWeeks.includes(key) : failed.includes('the agenda')),
       /* As store.js's after() does: once the write is in, the workspace is
          loaded again, bringing the weeks and the project meetings back; a
          refusal is said in a toast unless the caller says it itself. */
@@ -144,6 +149,9 @@ function load({ list = [], projectEvents = [], route = ['agenda'], mode = 'week'
     },
     agendaView: () => 'the page workspace.js drew'
   });
+  /* A store from before weekFailed existed: agenda-ui.js falls back to the
+     old whole-agenda check (state.failed) rather than throwing. */
+  if (legacyStore) delete context.workspaceStore.weekFailed;
   context.window = context;
   /* This browser's storage, when the test gives one. */
   if (storage === 'blocked') {
@@ -234,6 +242,19 @@ test('a week whose events did not load says so, rather than "Loading…" for goo
   assert.match(load({ loaded: false, failed: ['the agenda'] }).view(), /The agenda did not load/);
 });
 
+test('a week says it did not load only for its own failure, never for a week that never asked or one still loading', () => {
+  const own = load({ weeks: [], failedWeeks: ['2026-09-14'] }).view();
+  assert.match(own, /The agenda did not load/, 'this week\'s own failure');
+  const elsewhere = load({ weeks: [], failedWeeks: ['2026-10-05'] }).view();
+  assert.match(elsewhere, /Loading the week…/, 'a different week\'s failure is not this one\'s');
+  assert.doesNotMatch(elsewhere, /The agenda did not load/);
+});
+
+test('a store from before weekFailed existed still says a week did not load, from the old whole-agenda list', () => {
+  assert.match(load({ weeks: [], failed: ['the agenda'], legacyStore: true }).view(), /The agenda did not load/);
+  assert.match(load({ weeks: [], legacyStore: true }).view(), /Loading the week…/);
+});
+
 test('an event page opened before the agenda has loaded says it is loading, and says when the agenda did not load', () => {
   const waiting = load({ loaded: false, route: ['agenda', 'k'] }).view();
   assert.match(waiting, /This event cannot be shown yet/);
@@ -249,6 +270,12 @@ test('a card says its calendar in words as well as colour, the day view shows it
   assert.match(week, /class="calendar-day-button" data-agenda-day="2026-09-16" aria-label="Wednesday, September 16, 2026" aria-current="date"><span>/,
     'a button that opens the day is not a toggle: no pressed state, and "picked" only for a day someone picked');
   assert.doesNotMatch(week, /aria-pressed="(true|false)"><span>/);
+  /* #agenda/today (openToday) picks today's day without leaving the week — the
+     one way, short of workspace.js switching the view back, to see a picked
+     day drawn in the week itself in this file's own tests. */
+  const opened = load({ list, route: ['agenda', 'today'] }).view();
+  assert.match(opened, /class="calendar-day-button" data-agenda-day="2026-09-16" aria-label="Wednesday, September 16, 2026, picked" aria-current="date"><span>/,
+    'the day picked says so, in words');
   const tentative = load({ list: [event('maybe', at(16, 13), at(16, 14), { title: 'Maybe lunch', status: 'tentative' })], mode: 'schedule' }).view();
   assert.match(tentative, /<strong>Maybe lunch<\/strong><small class="tentative-note">Tentative<\/small>/, 'a tentative event says so in words');
   assert.match(tentative, /<div class="schedule-date today" aria-current="date">/, 'the schedule marks today');
@@ -260,6 +287,22 @@ test('on a phone the agenda opens on the schedule, which fits it; Week is a tap 
   assert.equal(load({ phone: true }).mode(), 'schedule');
   assert.equal(load().mode(), 'week', 'a wider screen opens on the week');
   assert.equal(load({ phone: true, mode: 'day' }).mode(), 'day');
+});
+
+test('a view picked with the view buttons is remembered in this browser, and opens the agenda on it next time — even where the phone default would say otherwise', () => {
+  const storage = memoryStorage();
+  const viewButton = value => {
+    const node = { dataset: { view: 'agendaMode', value } };
+    node.closest = selector => (selector === '[data-view]' ? node : null);
+    return node;
+  };
+  const h = load({ storage });
+  h.click(viewButton('day'));
+  assert.equal(storage.getItem('veyago.agenda.mode'), 'day', 'the choice is kept in this browser');
+  assert.equal(load({ storage, phone: true }).mode(), 'day', 'remembered, even where a phone would otherwise open on the schedule');
+  assert.equal(load({ storage: memoryStorage(), phone: true }).mode(), 'schedule', 'nothing remembered here: the phone default still applies');
+  h.click(viewButton('bogus'));
+  assert.equal(storage.getItem('veyago.agenda.mode'), 'day', 'a view that does not exist is not remembered');
 });
 
 test('an event not in the weeks loaded is fetched by its id: its page says so while it loads, draws it once it lands, and says when there is none', () => {
@@ -463,7 +506,13 @@ test('what a hidden calendar still decides: the weekend drawn for an event in it
   assert.doesNotMatch(load({ list: [odd], storage }).view(), /Odd one/, 'drawn as Internal, it is hidden with Internal');
   const two = [event('a', at(17, 9), at(17, 10), { kind: 'personal' }), event('b', at(17, 11), at(17, 12), { kind: 'personal' })];
   assert.match(load({ list: two, storage }).view(), /<div class="empty-calendar">2 events in hidden calendars<\/div>/);
-  assert.doesNotMatch(load({ loaded: false, storage }).view(), /agenda-kinds/, 'no calendars to pick above an agenda that did not load');
+  assert.doesNotMatch(load({ loaded: false, storage }).view(), /agenda-kinds/, 'no calendars to pick above an agenda still loading');
+});
+
+test('no calendars to pick above a week that failed, once the workspace has loaded — not just one still loading', () => {
+  const failed = load({ weeks: [], failedWeeks: ['2026-09-14'] }).view();
+  assert.match(failed, /The agenda did not load/);
+  assert.doesNotMatch(failed, /agenda-kinds/, 'a genuine failure hides it too, not only "Loading…"');
 });
 
 test('what anyone typed into an event stays text, on the week, the schedule and its page', () => {
@@ -483,6 +532,12 @@ test('when the events did not load the agenda says so, and a week with nothing o
   const empty = load().view();
   assert.match(empty, /<p class="quiet-text week-empty">Nothing on this week: room to focus\.<\/p>/);
   assert.doesNotMatch(empty, /class="empty-calendar"/, 'not a filler line in every column');
+  const hiddenOnly = load({
+    list: [event('gym', at(15, 8), at(15, 9), { title: 'Gym', kind: 'personal' })],
+    storage: memoryStorage({ 'veyago.agenda.hiddenKinds': JSON.stringify(['personal']) })
+  }).view();
+  assert.doesNotMatch(hiddenOnly, /week-empty/, 'something is on the week, only hidden — not "room to focus"');
+  assert.match(hiddenOnly, /empty-calendar/);
   const busy = load({ list: [event('standup', at(14, 10), at(14, 10, 30))] }).view();
   assert.doesNotMatch(busy, /week-empty|class="empty-calendar"/, 'a day with nothing on it is simply empty');
   const h = load({ mode: 'schedule' });

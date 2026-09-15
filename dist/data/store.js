@@ -68,6 +68,23 @@
      (agendaModel.loadRange), so one that began the week before is there too. */
   var shownWeek = null;
   var loadedWeeks = {};
+  /* The week keys whose events failed on their last try, and are not being
+     asked for again right now — so a week that failed once is not shown as
+     failing forever, a week that never asked is not shown as failing at all,
+     and a week asked for again shows loading, not the last try's failure,
+     while that ask is on its way. Cleared the moment a new request covers a
+     key (markWeeksAsking, called before the fetch in loadOnce and loadParts —
+     the same windowKey the fetch itself asks weeksToLoad() for, one request
+     covering it and failing or succeeding for all of them at once), and again
+     on that request's own success (markWeeks) in case a stale key from a
+     different, still-failing request rode along. */
+  var failedWeeks = {};
+  function markWeeksAsking(weeksKey) {
+    weeksKey.split('|').forEach(function (key) { delete failedWeeks[key]; });
+  }
+  function markWeeksFailed(weeksKey) {
+    weeksKey.split('|').forEach(function (key) { failedWeeks[key] = true; });
+  }
   function weeksToLoad() {
     var now = new Date();
     var today = agendaModel.weekOf(now);
@@ -93,7 +110,10 @@
 
   function markWeeks(loaded) {
     loadedWeeks = {};
-    loaded.weeks.forEach(function (key) { loadedWeeks[key] = true; });
+    /* markWeeksAsking already cleared these keys before this fetch began, so
+       this delete never has anything left to do — kept as a second line of
+       defence, in case a future caller of markWeeks skips that step. */
+    loaded.weeks.forEach(function (key) { loadedWeeks[key] = true; delete failedWeeks[key]; });
   }
 
   /* options.sign: what counts as a change, when not the whole answer.
@@ -272,12 +292,16 @@
     if (!everLoaded && !state.notice) repaint(false);
 
     var key = windowKey();
+    /* Asked for again now, so its last failure — if it had one — is not the
+       last word on it while this is on its way. */
+    markWeeksAsking(key);
     var startedAt = lastStart = Math.max(Date.now(), lastStart + 1);
     var outcomes = await Promise.all(PARTS.map(function (p) { return fetchPart(p, window.workspaceData); }));
 
     var applied = applyOutcomes(outcomes, quiet, startedAt);
     var changed = applied.changed;
     var failures = applied.failures;
+    if (failures.some(function (o) { return o.part.key === 'events'; })) markWeeksFailed(key);
     if (changed || !quiet) regroupNotes();
 
     var coreMissing = CORE.filter(function (key) { return !arrivedAt[key]; });
@@ -361,9 +385,14 @@
     var parts = PARTS.filter(function (p) { return only.indexOf(p.key) !== -1; });
     var keys = parts.map(function (p) { return p.key; });
     var key = windowKey();
+    /* Only when events are among the parts asked for here — otherwise these
+       weeks are not being asked about at all, and a real failure of theirs
+       must not read as cleared. */
+    if (keys.indexOf('events') !== -1) markWeeksAsking(key);
     var startedAt = lastStart = Math.max(Date.now(), lastStart + 1);
     var outcomes = await Promise.all(parts.map(function (p) { return fetchPart(p, window.workspaceData); }));
     var applied = applyOutcomes(outcomes, quiet, startedAt);
+    if (applied.failures.some(function (o) { return o.part.key === 'events'; })) markWeeksFailed(key);
     lastFailures = lastFailures
       .filter(function (o) { return keys.indexOf(o.part.key) === -1; })
       .concat(applied.failures);
@@ -819,6 +848,9 @@
     },
     /* Whether a week's events are in: until then the agenda says it is loading. */
     weekLoaded: function (key) { return Boolean(loadedWeeks[key]); },
+    /* Whether that week's own events failed on their last try — not some
+       other week's, and not stuck true once it has since loaded. */
+    weekFailed: function (key) { return Boolean(failedWeeks[key]); },
 
     /* A company's or a person's past meetings (crm-ui.js), as { state:
        'loading' | 'ready' | 'failed', meetings, more }. The first ask for a

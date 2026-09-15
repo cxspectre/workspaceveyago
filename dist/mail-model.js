@@ -182,26 +182,94 @@ const mailModel = (function () {
     return Object.freeze({ messageId: target.id, to: Object.freeze(to), cc: Object.freeze(cc) });
   }
 
-  /* One address as people paste it, with quotes, a mailto: and stray angle
-     brackets taken off. */
-  const bareAddress = token => String(token || '').trim()
-    .replace(/^mailto:/i, '')
-    .replace(/^["'<\s]+|["'>\s]+$/g, '')
+  /* One or several trailing parenthetical comments taken off ("a@x (Do not
+     reply) (Automated)"), balanced parens inside one counted rather than
+     matched by a regex — a regex retried across a long run of them, hunting
+     for one that never closes, backtracks in the square of the input's
+     length and can freeze the tab on a large paste; counting characters from
+     the end never backtracks at all. A leading comment is not handled (falls
+     back to invalid, same as before this existed — never a mangled or
+     fabricated address). A comment holding a comma, a semicolon or a new
+     line is already torn from what follows by the time this runs, so only
+     its first word survives whole; also left. */
+  function withoutComments(value) {
+    for (;;) {
+      var trimmed = value.replace(/\s+$/, '');
+      if (!trimmed.endsWith(')')) return trimmed;
+      var depth = 0, start = -1;
+      for (var i = trimmed.length - 1; i >= 0; i--) {
+        if (trimmed[i] === ')') depth++;
+        else if (trimmed[i] === '(') {
+          depth--;
+          if (depth === 0) { start = i; break; }
+        }
+      }
+      if (start < 0) return trimmed; // no opening match: not a comment, leave it
+      value = trimmed.slice(0, start);
+    }
+  }
+
+  /* One address as people paste it, with quotes, a mailto: (and any ?subject=
+     it carries, whatever ran between the colon and the address — only there,
+     so a literal ? in an address's own local part is left alone), a trailing
+     parenthetical comment, and stray angle brackets taken off. */
+  const bareAddress = token => withoutComments(String(token || '').trim()
+    .replace(/^mailto:\s*([^?\s]*)(?:\?.*)?$/i, '$1')
+    .replace(/^["'<\s]+|["'>\s]+$/g, ''))
     .trim();
 
-  /* What someone typed or pasted into an address field. A named address comes
-     out whole first, because its name may hold a comma ("Lima, Ana <ana@…>"):
-     before a <address>, semicolons and new lines always separate recipients,
-     and a comma does only where an address sits before it. The rest splits on
+  /* The piece touching a <address> is that address's own name — cut off,
+     never a second recipient — whatever else came before it, comma- or
+     semicolon-separated, and however many words it holds ("Lima, Ana <ana@…>"
+     keeps only ana@…). It is read as a name even when it looks like an
+     address in its own right, as some senders set their display name to
+     their own old or public one ("j.doe@old.example <j.doe@new.example>" —
+     the piece before it is dropped, not a second recipient) — UNLESS it
+     holds more than one @, which no name would: that is several addresses
+     pasted with a space and no comma between them ("a@x b@y <c@z>"; kept
+     whole here, split on whitespace by the flatMap below). Returns how many
+     of the pieces before the bracket to keep as separate addresses. */
+  function nameCutoff(pieces) {
+    const last = pieces.length - 1;
+    const lastAddress = pieces.map(piece => piece.includes('@')).lastIndexOf(true);
+    const nextToBracket = pieces[last] || '';
+    if (lastAddress === last && (nextToBracket.match(/@/g) || []).length <= 1) return lastAddress;
+    return lastAddress + 1;
+  }
+
+  /* A bracket can hold more than one address, comma- or semicolon-separated,
+     as some clients export them — a stray leading or trailing separator
+     leaves no piece of its own to fail this — but only when every piece left
+     is itself a whole address; a comma inside a quoted local part
+     ('<"Lima, Ana"@x>') must not be read as such a separator and fabricate
+     one out of a fragment. */
+  function bracketed(inside) {
+    const pieces = inside.split(/[,;]+/).map(piece => piece.trim()).filter(Boolean);
+    return pieces.length && pieces.every(piece => piece.includes('@')) ? pieces : [inside];
+  }
+
+  /* What someone typed or pasted into an address field. Before a <address>,
+     semicolons and new lines always separate recipients, and a comma does
+     only where an address sits before it (nameCutoff). The rest splits on
      commas, semicolons and new lines — and on spaces, when several addresses
      share one piece. */
   function parseAddresses(text) {
     const tokens = [];
-    const rest = String(text || '').replace(/([^<>]*)<([^<>]*)>/g, (_, before, inside) => {
+    const str = String(text || '');
+    /* The regex below can only ever match where there is a literal < — with
+       none in the whole string it is guaranteed to replace nothing, and
+       skipping it here avoids a real freeze on a long paste with no bracket
+       at all (a signature block, a quoted thread): failing to find one, a
+       regex built from two open-ended runs of "not < or >" backtracks in the
+       square of the remaining length once it reaches the end without one.
+       Pre-existing (not from this change), and only this common shape is
+       covered — a long run of text with no < AFTER a real <address> pair
+       backtracks the same way and is not, since fixing that would mean
+       replacing the regex itself, a larger change than today's fix called for. */
+    const rest = str.indexOf('<') === -1 ? str : str.replace(/([^<>]*)<([^<>]*)>/g, (_, before, inside) => {
       const segments = before.split(/[;\n]/);
       const pieces = segments.pop().split(',');
-      const lastAddress = pieces.map(piece => piece.includes('@')).lastIndexOf(true);
-      tokens.push(...segments, ...pieces.slice(0, lastAddress + 1), inside);
+      tokens.push(...segments, ...pieces.slice(0, nameCutoff(pieces)), ...bracketed(inside));
       return '\n';
     });
     tokens.push(...rest.split(/[,;\n]+/));

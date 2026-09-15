@@ -437,6 +437,17 @@ test('a company arrives with its owner', async () => {
   assert.equal(co.row.owner_id, 'e-sam');
 });
 
+test('a client carries its number; a company not yet one has none', async () => {
+  const { data, queries } = loadTables(table => (table !== 'crm_companies' ? [] : [
+    { id: 'co1', name: 'Northline', domain: null, kind: 'client', stage: 'client', value: 1, currency: 'EUR', owner_id: null, notes: null, client_number: 42 },
+    { id: 'co2', name: 'Harbor & Co', domain: null, kind: 'client', stage: 'lead', value: 0, currency: 'USD', owner_id: null, notes: null, client_number: null }
+  ]));
+  const [client, lead] = await data.companies();
+  assert.ok(queries[0].calls.find(([method]) => method === 'select')[1].split(/,\s*/).includes('client_number'));
+  assert.equal(client.clientNumber, 42);
+  assert.equal(lead.clientNumber, null);
+});
+
 test('an amount is written in its currency, and a code Intl cannot format goes beside it rather than throwing', () => {
   const { data } = load(() => ({ data: null, error: null }));
   assert.equal(data.money(1200, 'eur'), '€1,200');

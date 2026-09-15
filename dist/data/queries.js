@@ -540,12 +540,14 @@
       });
     },
 
-    /* Every company, a page at a time (everyRow), as contacts are. */
+    /* Every company, a page at a time (everyRow), as contacts are. A client
+       number (0053) is given once, when a company first reaches the client
+       stage — a lead has none yet. */
     async companies() {
       var rows = await everyRow(function (from, to) {
         return sb()
           .from('crm_companies')
-          .select('id, name, domain, kind, stage, value, currency, owner_id, notes')
+          .select('id, name, domain, kind, stage, value, currency, owner_id, notes, client_number')
           .is('deleted_at', null)
           .order('name')
           .order('id')
@@ -554,7 +556,7 @@
       return rows.map(function (r) {
         return {
           id: r.id, name: r.name, domain: r.domain || '',
-          stage: label(r.stage), kind: label(r.kind),
+          stage: label(r.stage), kind: label(r.kind), clientNumber: r.client_number == null ? null : r.client_number,
           value: money(r.value, r.currency) || '—', notes: r.notes || '', row: r
         };
       });

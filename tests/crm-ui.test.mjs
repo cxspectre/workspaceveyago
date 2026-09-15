@@ -116,8 +116,12 @@ const money = (amount, currency) => finance.money(amount, currency);
 let made = 0;
 function company(stage, value, currency = 'USD', over = {}) {
   made += 1;
-  const row = { id: `company-${made}`, name: `Company ${made}`, domain: null, kind: 'prospect', stage, value, currency, owner_id: null, notes: null, ...over };
-  return { id: row.id, name: row.name, domain: row.domain || '', stage: stage[0].toUpperCase() + stage.slice(1), kind: 'Prospect', value: `${value} ${currency}`, notes: row.notes || '', row };
+  const { clientNumber = null, ...rowOver } = over;
+  const row = { id: `company-${made}`, name: `Company ${made}`, domain: null, kind: 'prospect', stage, value, currency, owner_id: null, notes: null, client_number: clientNumber, ...rowOver };
+  return {
+    id: row.id, name: row.name, domain: row.domain || '', stage: stage[0].toUpperCase() + stage.slice(1), kind: 'Prospect',
+    value: `${value} ${currency}`, notes: row.notes || '', clientNumber: row.client_number, row
+  };
 }
 
 /* A contact as queries.contacts() hands it over, at `at` — a company() — or at
@@ -601,6 +605,15 @@ test('a company\'s page lists its people, projects and tickets by id — never a
   assert.match(html, /<span>Owner<\/span><div>Sam Rivera<\/div>/);
   assert.match(html, /€12,000\.00/);
   assert.match(html, /Retainer since 2024/);
+});
+
+test('a client\'s number is on its page; a company not yet one has no such row', () => {
+  const northline = company('client', 12000, 'EUR', { name: 'Northline', clientNumber: 42 });
+  const prospect = company('prospect', 0, 'USD', { name: 'Early Talks' });
+  const numbered = load({ route: ['crm', 'companies', northline.id], companies: [northline] }).view();
+  assert.match(numbered, /<span>Client No\.<\/span><div>42<\/div>/);
+  const unnumbered = load({ route: ['crm', 'companies', prospect.id], companies: [prospect] }).view();
+  assert.doesNotMatch(unnumbered, /Client No\./);
 });
 
 test('an invoice sent to two of a company\'s people is listed once', () => {

@@ -331,6 +331,99 @@ test('names with commas in them, quotes, mailto: and stray brackets still give t
     ['ana@northline.example', 'ops@northline.example']);
 });
 
+test('a display name that is itself an address is a name, not a second recipient — a genuinely separate address before a name still counts, whichever separator sets them apart', () => {
+  /* Some senders set their display name to their old or public address; the
+     one that receives mail is the one inside the angle brackets. */
+  const renamed = model.parseAddresses('j.doe@old.example <j.doe@new.example>');
+  assert.deepEqual([...renamed.valid], ['j.doe@new.example']);
+  assert.deepEqual([...renamed.invalid], []);
+  /* Comma-joined names, and a genuinely separate address before one, still count. */
+  const mixed = model.parseAddresses('ops@northline.example, Doe, John <john@northline.example>');
+  assert.deepEqual([...mixed.valid], ['ops@northline.example', 'john@northline.example']);
+  assert.deepEqual([...mixed.invalid], []);
+  /* The one piece touching the bracket is always read as its name, even when
+     it looks like its own address and even when a comma or a semicolon (not
+     only a plain name) set it apart from an earlier, separate address —
+     comma and semicolon give the same answer. A product decision, not a
+     guess: syntax alone cannot tell "two recipients, one whose name happens
+     to be an address" from "three recipients, none of them named" apart. */
+  const withComma = model.parseAddresses('ops@northline.example, j.doe@old.example <j.doe@new.example>');
+  assert.deepEqual([...withComma.valid], ['ops@northline.example', 'j.doe@new.example']);
+  assert.deepEqual([...withComma.invalid], []);
+  const withSemicolon = model.parseAddresses('ops@northline.example; j.doe@old.example <j.doe@new.example>');
+  assert.deepEqual([...withSemicolon.valid], ['ops@northline.example', 'j.doe@new.example']);
+  assert.deepEqual([...withSemicolon.invalid], [], 'a comma and a semicolon here agree, on invalid too');
+  const cruz = model.parseAddresses('ana@northline.example, ben@northline.example <cruz@northline.example>');
+  assert.deepEqual([...cruz.valid], ['ana@northline.example', 'cruz@northline.example'], 'the piece touching the bracket, ben@…, is read as its name');
+  assert.deepEqual([...cruz.invalid], []);
+});
+
+test('several addresses pasted with a space, not a comma, ahead of a named one are still every one of them', () => {
+  const spaced = model.parseAddresses('ana@northline.example ben@northline.example <cruz@northline.example>');
+  assert.deepEqual([...spaced.valid], ['ana@northline.example', 'ben@northline.example', 'cruz@northline.example']);
+  assert.deepEqual([...spaced.invalid], []);
+  const three = model.parseAddresses('ana@northline.example ben@northline.example cruz@northline.example <dee@northline.example>');
+  assert.deepEqual([...three.valid], ['ana@northline.example', 'ben@northline.example', 'cruz@northline.example', 'dee@northline.example']);
+  const noBracket = model.parseAddresses('ana@northline.example ben@northline.example cruz@northline.example');
+  assert.deepEqual([...noBracket.valid], ['ana@northline.example', 'ben@northline.example', 'cruz@northline.example'], 'the same, with no bracket at all');
+});
+
+test('an address followed by a parenthetical comment gives the address; a leading one, or one alone, is not read as an address at all', () => {
+  assert.deepEqual([...model.parseAddresses('no-reply@northline.example (Do not reply)').valid], ['no-reply@northline.example']);
+  assert.deepEqual([...model.parseAddresses('no-reply@northline.example (Do not reply)').invalid], []);
+  /* More than one trailing comment, and one nested inside another. */
+  assert.deepEqual([...model.parseAddresses('no-reply@northline.example (Do not reply) (Automated)').valid], ['no-reply@northline.example']);
+  assert.deepEqual([...model.parseAddresses('no-reply@northline.example (a (nested) note)').valid], ['no-reply@northline.example']);
+  /* A stray, unrelated paren earlier in the address (isAddress's own looseness,
+     not touched here) does not confuse where the trailing comment starts. */
+  assert.deepEqual([...model.parseAddresses('a(b)@northline.example (Do not reply)').valid], ['a(b)@northline.example']);
+  /* Not handled: a comment before the address, rather than after it; nor one
+     holding a comma or a semicolon of its own — parseAddresses has already
+     split the text on those by the time a comment is looked for, so only the
+     comment's first word survives, whole, as its own leftover token. */
+  assert.deepEqual([...model.parseAddresses('(Do not reply) no-reply@northline.example').valid], []);
+  assert.deepEqual([...model.parseAddresses('(Do not reply) no-reply@northline.example').invalid], ['(Do not reply) no-reply@northline.example']);
+  const commaInComment = model.parseAddresses('ops@northline.example (Ops, Team)');
+  assert.deepEqual([...commaInComment.valid], []);
+  assert.deepEqual([...commaInComment.invalid], ['ops@northline.example (Ops', 'Team)']);
+  /* A comment with nothing else is noise, not an address to reject either. */
+  const alone = model.parseAddresses('(Do not reply)');
+  assert.deepEqual([...alone.valid], []);
+  assert.deepEqual([...alone.invalid], []);
+});
+
+test('a bracket holding two or three addresses, comma- or semicolon-separated, gives every one — but a comma inside a quoted local part is not read as one, and a stray leading or trailing separator is not a blank address', () => {
+  assert.deepEqual([...model.parseAddresses('<ana@northline.example, ben@northline.example>').valid],
+    ['ana@northline.example', 'ben@northline.example']);
+  assert.deepEqual([...model.parseAddresses('<ana@northline.example; ben@northline.example>').valid],
+    ['ana@northline.example', 'ben@northline.example']);
+  assert.deepEqual([...model.parseAddresses('<ana@northline.example, ben@northline.example, cruz@northline.example>').valid],
+    ['ana@northline.example', 'ben@northline.example', 'cruz@northline.example']);
+  assert.deepEqual([...model.parseAddresses('<ana@northline.example,>').valid], ['ana@northline.example'], 'a stray trailing comma is not a second, blank address');
+  assert.deepEqual([...model.parseAddresses('<,ana@northline.example>').valid], ['ana@northline.example'], 'nor a stray leading one');
+  const quoted = model.parseAddresses('<"Lima, Ana"@northline.example>');
+  assert.deepEqual([...quoted.valid], [], 'a comma inside quotes is not a second address — nothing is fabricated from the fragment');
+  assert.deepEqual([...quoted.invalid], ['Lima, Ana"@northline.example'], 'kept as one leftover token, its own leading quote stripped as any address\'s would be');
+  /* A semicolon inside quotes is left whole the same way; isAddress's own
+     regex — unchanged here — is loose enough to accept the result anyway
+     (";" and '"' are not excluded from a local part), a separate, pre-existing
+     limitation this fix does not reach. */
+  assert.deepEqual([...model.parseAddresses('<"a;b"@northline.example>').valid], ['a;b"@northline.example']);
+});
+
+test('mailto\'s ?subject= is taken off, whatever ran between the colon and the address; a literal ? in an address\'s own local part, which mailto: never introduced, is left alone', () => {
+  assert.deepEqual([...model.parseAddresses('mailto:ops@northline.example?subject=Hello%20there').valid], ['ops@northline.example']);
+  assert.deepEqual([...model.parseAddresses('mailto:ops@northline.example').valid], ['ops@northline.example']);
+  /* Rendered as plain text on a web page, or typed by hand: a space (or a
+     tab) after the colon still gives the address. */
+  assert.deepEqual([...model.parseAddresses('mailto: ops@northline.example').valid], ['ops@northline.example']);
+  assert.deepEqual([...model.parseAddresses('mailto:\tops@northline.example?subject=Hi').valid], ['ops@northline.example']);
+  const weird = model.parseAddresses('weird?name@northline.example');
+  assert.deepEqual([...weird.valid], ['weird?name@northline.example']);
+  assert.deepEqual([...weird.invalid], []);
+  assert.deepEqual([...model.parseAddresses('huh?').invalid], ['huh?'], 'kept whole, not mangled to "huh"');
+});
+
 test('a subject already answered in another language keeps its prefix', () => {
   assert.equal(model.subjectFor('reply', 'AW: Angebot'), 'AW: Angebot');
   assert.equal(model.subjectFor('replyAll', 'SV: Offert'), 'SV: Offert');
@@ -442,4 +535,15 @@ test('a mailbox says what went wrong in a sentence the column fits, and keeps th
   assert.equal(model.mailboxNote({ lastError: null }), null);
   assert.equal(model.mailboxNote({ lastError: 'Graph → 503: Service Unavailable' }), 'Graph → 503: Service Unavailable');
   assert.equal(model.mailboxNote({ lastError: 'x'.repeat(400) }).length, 160);
+});
+
+test('a long paste with no address in it does not freeze the composer', () => {
+  /* Signature blocks and quoted threads can run to thousands of characters.
+     Parsing must stay roughly linear in the input's length, not square it —
+     the field would otherwise lock up the tab on a paste this ordinary. */
+  const long = 'Kind regards,\n'.repeat(4000);
+  const start = Date.now();
+  const parsed = model.parseAddresses(long);
+  assert.ok(Date.now() - start < 200, 'a 56,000-character paste with no address parses in well under 200ms');
+  assert.deepEqual([...parsed.valid], []);
 });

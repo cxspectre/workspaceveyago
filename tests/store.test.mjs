@@ -471,6 +471,111 @@ test('a week\'s retry that loads starts the delays again from the first', async 
   assert.equal(s.pending(15000).length, 1, 'the first delay, not the second');
 });
 
+/* ── Which week's own failure it was ─────────────────────────────────── */
+
+test('weekFailed names the week whose own load failed, not a week never asked for', async () => {
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  const todayKey = s.read(TODAY_WEEK).key, laterKey = s.read(LATER_WEEK).key;
+  assert.equal(s.store.weekFailed(todayKey), false, 'nothing has failed yet');
+  assert.equal(s.store.weekFailed(laterKey), false, 'a week never asked for is not failed either');
+  s.answer(answers({ eventsOverlapping: async () => { throw new Error('Could not load the agenda: Failed to fetch'); } }));
+  await s.store.showWeek(s.read(LATER_WEEK));
+  assert.equal(s.store.weekFailed(laterKey), true, 'the week that failed');
+  assert.equal(s.store.weekFailed(todayKey), true, 'today\'s week was asked for in the same failing request');
+  assert.equal(s.store.weekFailed('2099-01-01'), false, 'a week nobody asked for stays untouched');
+});
+
+test('a week that failed is not stuck failed: once it loads, weekFailed says so no longer', async () => {
+  const noAgenda = async () => { throw new Error('Could not load the agenda: Failed to fetch'); };
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  const laterKey = s.read(LATER_WEEK).key;
+  s.answer(answers({ eventsOverlapping: noAgenda }));
+  await s.store.showWeek(s.read(LATER_WEEK));
+  assert.equal(s.store.weekFailed(laterKey), true);
+  s.answer(answers({ eventsOverlapping: async () => [] }));
+  s.fire(15000);
+  await tick();
+  assert.equal(s.store.weekFailed(laterKey), false, 'the stale failure is cleared once that week loads');
+  assert.equal(s.store.weekLoaded(laterKey), true);
+});
+
+test('a background refresh that fails leaves a week already showing its events alone: still loaded, and now also failed', async () => {
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  const todayKey = s.read(TODAY_WEEK).key;
+  const renders = s.read('renders'), idle = s.read('idleRepaints');
+  s.answer(answers({ eventsOverlapping: async () => { throw new Error('Could not load the agenda: Failed to fetch'); } }));
+  await s.store.load({ quiet: true });
+  assert.equal(s.store.weekLoaded(todayKey), true, 'a background failure does not undo a week already shown');
+  assert.equal(s.store.weekFailed(todayKey), true, 'but its own last try is recorded as failed');
+  assert.equal(s.read('renders'), renders, 'a quiet refresh that failed changes nothing on screen: the week still shows its events');
+  assert.equal(s.read('idleRepaints'), idle);
+});
+
+test('asking again for a week clears its last failure before the answer is even in: loading, not a stale "did not load"', async () => {
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  const laterKey = s.read(LATER_WEEK).key;
+  s.answer(answers({ eventsOverlapping: async () => { throw new Error('Could not load the agenda: Failed to fetch'); } }));
+  await s.store.showWeek(s.read(LATER_WEEK));
+  assert.equal(s.store.weekFailed(laterKey), true, 'failed on its first try');
+  await s.store.showWeek(s.read(TODAY_WEEK));
+  assert.equal(s.store.weekFailed(laterKey), true, 'left on screen, still its last known state');
+  const gate = deferred();
+  s.answer(answers({ eventsOverlapping: async () => { await gate.promise; return []; } }));
+  const asking = s.store.showWeek(s.read(LATER_WEEK));
+  assert.equal(s.store.weekFailed(laterKey), false, 'asked for again: not failed while this try is still on its way');
+  assert.equal(s.store.weekLoaded(laterKey), false, 'and not yet loaded either — the agenda says loading, not failed');
+  gate.resolve();
+  await asking;
+  assert.equal(s.store.weekLoaded(laterKey), true);
+});
+
+test('a whole load, not only showWeek, clears a week\'s stale failure the moment it asks again', async () => {
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  const laterKey = s.read(LATER_WEEK).key;
+  s.answer(answers({ eventsOverlapping: async () => { throw new Error('Could not load the agenda: Failed to fetch'); } }));
+  await s.store.showWeek(s.read(LATER_WEEK));
+  assert.equal(s.store.weekFailed(laterKey), true);
+  const gate = deferred();
+  s.answer(answers({ eventsOverlapping: async () => { await gate.promise; return []; }, tickets: async () => { await gate.promise; return [ticket()]; } }));
+  const whole = s.store.load({ quiet: true });
+  assert.equal(s.store.weekFailed(laterKey), false, 'the later week is still shown, so the whole load asks about it too');
+  gate.resolve();
+  await whole;
+  assert.equal(s.store.weekLoaded(laterKey), true);
+});
+
+test('a load for other parts does not clear a week\'s real failure — it never asked about it', async () => {
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  const laterKey = s.read(LATER_WEEK).key;
+  s.answer(answers({ eventsOverlapping: async () => { throw new Error('Could not load the agenda: Failed to fetch'); } }));
+  await s.store.showWeek(s.read(LATER_WEEK));
+  assert.equal(s.store.weekFailed(laterKey), true);
+  s.answer(answers({ eventsOverlapping: async () => { throw new Error('Could not load the agenda: Failed to fetch'); }, tickets: async () => [ticket()] }));
+  await s.store.load({ quiet: true, only: ['tickets'] });
+  assert.equal(s.store.weekFailed(laterKey), true, 'a load that never asked about the agenda leaves its failure as it was');
+});
+
+test('a quiet retry that answers exactly as before still clears the failure it is standing in for', async () => {
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  const todayKey = s.read(TODAY_WEEK).key;
+  s.answer(answers({ eventsOverlapping: async () => { throw new Error('Could not load the agenda: Failed to fetch'); } }));
+  await s.store.load({ quiet: true, only: ['events'] });
+  assert.equal(s.store.weekFailed(todayKey), true);
+  /* Back to the very answer the first, successful load already applied: the
+     signature is unchanged, so this quiet retry takes the "keep" path
+     (markWeeks again), never "apply". */
+  s.answer(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load({ quiet: true, only: ['events'] });
+  assert.equal(s.store.weekFailed(todayKey), false, 'an unchanged-answer retry is still a load that worked');
+});
+
 test('a note on a project meeting outside the weeks loaded is shown on its page', async () => {
   const review = { id: 'pe1', title: 'Design review', row: { id: 'pe1' } };
   const s = start(answers({

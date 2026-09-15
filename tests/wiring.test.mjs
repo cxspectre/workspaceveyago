@@ -38,7 +38,7 @@ const OFFSITE = event('offsite', at(14, 10), at(15, 16), { title: 'Studio offsit
 const STANDUP = event('standup', at(15, 9), at(15, 9, 30), { title: 'Standup' });
 const LATER = event('later', at(22, 11), at(22, 12), { title: 'Next week\'s review' });
 
-function load({ events = [OFFSITE, STANDUP, LATER], has = ['events'], weeks = [THIS_WEEK], failed = [], page = 'overview', days = [] } = {}) {
+function load({ events = [OFFSITE, STANDUP, LATER], has = ['events'], weeks = [THIS_WEEK], failed = [], failedWeeks = null, legacyStore = false, page = 'overview', days = [] } = {}) {
   const modals = [];
   const dayCalls = [];
   const context = vm.createContext({
@@ -56,9 +56,18 @@ function load({ events = [OFFSITE, STANDUP, LATER], has = ['events'], weeks = [T
     shapedInvoices: () => [],
     mailModel: { ALL: 'all', unreadCount: () => 0 },
     projectsModel: { isActive: () => true },
-    workspaceStore: { has: part => has.includes(part), weekLoaded: key => weeks.includes(key), state: { overview: null, failed } },
+    workspaceStore: {
+      has: part => has.includes(part), weekLoaded: key => weeks.includes(key), state: { overview: null, failed },
+      /* A test naming failedWeeks gets exactly those weeks failed; one that
+         only names failed (the whole-agenda list) is every week, matching
+         the fallback app.js used before store.js kept this. */
+      weekFailed: key => (failedWeeks ? failedWeeks.includes(key) : failed.includes('the agenda'))
+    },
     agendaUi: { dayOptions: options => { dayCalls.push({ ...options }); return days; } }
   });
+  /* A store from before weekFailed existed: app.js falls back to the old
+     whole-agenda check (state.failed) rather than throwing. */
+  if (legacyStore) delete context.workspaceStore.weekFailed;
   context.window = context;
   vm.runInContext(`const RealDate = Date; var __now = ${NOW};
     Date = class extends RealDate { constructor(...a) { super(...(a.length ? a : [__now])); } static now() { return __now; } };`, context);
@@ -130,6 +139,19 @@ test('while today\'s week is not in, the Overview says it is loading, or that it
     assert.doesNotMatch(panel, /class="agenda-item"/);
   }
   assert.match(load({ weeks: [], failed: ['the agenda'] }).context.agendaPanel(), /The agenda did not load\. It is tried again by itself\./);
+});
+
+test('the Overview panel says "did not load" for today\'s own failure, not a failure that was another week\'s', () => {
+  const own = load({ weeks: [], failedWeeks: [THIS_WEEK] }).context.agendaPanel();
+  assert.match(own, /The agenda did not load\. It is tried again by itself\./);
+  const elsewhere = load({ weeks: [], failedWeeks: ['2026-10-05'] }).context.agendaPanel();
+  assert.match(elsewhere, /Today’s agenda is loading…/, 'a different week\'s failure does not say today did not load');
+  assert.doesNotMatch(elsewhere, /did not load/);
+});
+
+test('a store from before weekFailed existed still says today did not load, from the old whole-agenda list', () => {
+  assert.match(load({ weeks: [], failed: ['the agenda'], legacyStore: true }).context.agendaPanel(), /The agenda did not load\. It is tried again by itself\./);
+  assert.match(load({ weeks: [], legacyStore: true }).context.agendaPanel(), /Today’s agenda is loading…/);
 });
 
 /* ── The create forms ─────────────────────────────────────────────────── */
