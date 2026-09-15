@@ -312,7 +312,7 @@ const tasksUi = (function () {
     if (!Object.keys(changes).length) return stored;
     markBusy(id, true);
     try {
-      const saved = await workspaceStore.after(workspaceActions.updateTask(current.task.id, changes));
+      const saved = await workspaceStore.after(workspaceActions.updateTask(current.task.id, changes), { only: ['projects', 'overview'] });
       toast(`${current.task.title}: ${labelIn(T.STATUSES, changes.status)}.`);
       return (saved && saved.status) || changes.status;
     } catch (err) {
