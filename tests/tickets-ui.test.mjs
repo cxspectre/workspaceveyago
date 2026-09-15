@@ -235,6 +235,24 @@ test('the details show what is stored: every status and priority, and Unassigned
   assert.match(html, /data-record-kind="tickets" data-record-id="7" data-field="status"/);
 });
 
+test('a resolved ticket says whether it met its response target — not only one still waiting', () => {
+  const missed = load({
+    route: ['tickets', '9'],
+    list: [ticket(9, {}, { resolve_due_at: '2026-09-12T00:00:00Z', resolved_at: '2026-09-14T00:00:00Z' })]
+  }).view();
+  assert.match(missed, /Resolved.*?Missed/s, 'a resolution two days after its target says Missed, not silence');
+  const met = load({
+    route: ['tickets', '10'],
+    list: [ticket(10, {}, { resolve_due_at: '2026-09-16T00:00:00Z', resolved_at: '2026-09-14T00:00:00Z' })]
+  }).view();
+  assert.match(met, /Resolved.*?Met/s);
+  const waiting = load({
+    route: ['tickets', '11'],
+    list: [ticket(11, {}, { resolve_due_at: '2026-09-16T00:00:00Z', resolved_at: null })]
+  }).view();
+  assert.match(waiting, /Not yet.*?Due/s, 'still open and inside its target: Due, not silence');
+});
+
 test('an owner who has left stays the owner shown, rather than becoming the first name', () => {
   const html = load({ route: ['tickets', '8'], list: [ticket(8, { assigneeId: 'e-gone', assigneeName: 'Jo Park' }, { assignee_id: 'e-gone' })] }).view();
   assert.match(html, /value="e-gone" selected>Jo Park/);

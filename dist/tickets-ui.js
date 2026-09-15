@@ -196,7 +196,7 @@
       ['Product', esc(t.product)],
       ['Came in', esc([SOURCES[r.source] || '', when(r.created_at)].filter(Boolean).join(' · ') || '—') + (age ? ` <small>(${esc(age)} old)</small>` : '')],
       ['First reply', esc(r.first_response_at ? when(r.first_response_at) : 'Not sent yet') + targetLine(r.first_response_due_at, r.first_response_at)],
-      ['Resolved', r.resolved_at ? esc(when(r.resolved_at)) + ' <small>(' + esc(T.durationLabel(r.created_at, r.resolved_at) || '—') + ')</small>' : esc('Not yet') + targetLine(r.resolve_due_at, r.resolved_at)],
+      ['Resolved', (r.resolved_at ? esc(when(r.resolved_at)) + ' <small>(' + esc(T.durationLabel(r.created_at, r.resolved_at) || '—') + ')</small>' : esc('Not yet')) + targetLine(r.resolve_due_at, r.resolved_at)],
       ...(mergedInto ? [['Merged into', `<a class="record-link" href="#tickets/${esc(mergedInto.id)}">#VYG-${esc(mergedInto.id)}</a>`]] : [])
     ];
   }
