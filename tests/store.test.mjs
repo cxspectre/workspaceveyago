@@ -59,6 +59,7 @@ function answers(over = {}) {
     activity: async () => [],
     mailboxes: async () => [],
     mailThreads: async () => ({ threads: [], truncated: [] }),
+    mailUnreadCounts: async () => ({}),
     mailMessages: async () => [{ body: 'hello', bodyHtml: '' }],
     ticketMessages: async () => [],
     ticketAttachments: async () => [],
@@ -1340,6 +1341,146 @@ test('a conversation fetched while a new message arrived is fetched again, not k
   await tick();
   assert.equal(fetches, 2, 'asked again for the thread as it is now');
   assert.equal(s.store.threadBody('th1').length, 3, 'two messages were never kept for a thread of three');
+});
+
+test('the true unread count lands in state, from a database that has it', async () => {
+  const s = start(answers({ mailUnreadCounts: async () => ({ mb1: 3, mb2: 0 }) }));
+  await s.store.load();
+  assert.deepEqual({ ...s.store.state.mailUnreadCounts }, { mb1: 3, mb2: 0 });
+});
+
+test('a database from before 0062 leaves the true unread count null, and mail still loads', async () => {
+  const s = start(answers({
+    mailUnreadCounts: async () => { throw new Error('Could not load the unread mail count: function does not exist'); }
+  }));
+  await s.store.load();
+  assert.equal(s.store.state.mailUnreadCounts, null,
+    'unknown, not zero — mail-model.js\'s own floor guess is used only for null');
+  assert.equal(s.store.has('mail'), true, 'the mail part still "arrives": threads and mailboxes answered fine');
+});
+
+test('a background refresh with an unchanged true count does not repaint, and one that changed does', async () => {
+  let counts = { mb1: 1 };
+  const s = start(answers({ mailUnreadCounts: async () => counts }));
+  await s.store.load();
+  await s.store.load({ quiet: true });
+  assert.equal(s.context.idleRepaints, 0, 'unchanged: no repaint from a background tick');
+  counts = { mb1: 2 };
+  await s.store.load({ quiet: true });
+  assert.equal(s.context.idleRepaints, 1, 'the count moved, even though no thread or mailbox itself did');
+  assert.deepEqual({ ...s.store.state.mailUnreadCounts }, { mb1: 2 });
+});
+
+/* ── "Load more": older mail, appended rather than replacing what shows ──
+   mailThreads()'s own 200-per-folder window is what the workspace opens on;
+   asking further back is a page someone chose, kept apart from `mails`
+   itself so a background refresh's own swap(mails, …) (applyMail) can never
+   silently lose it — that refresh always answers the newest window again,
+   never the older pages "Load more" already reached. */
+
+test('"Load more" asks for the page after the oldest thread already shown, and appends rather than replaces', async () => {
+  const oldest = '2026-09-10T09:00:00Z';
+  const s = start(answers({
+    mailThreads: async () => ({ threads: [thread(2)], truncated: [] })
+  }));
+  await s.store.load();
+  let asked = null;
+  s.answer({ ...answers(), mailThreads: async (folders, ids, before) => { asked = { folders, ids, before }; return { threads: [{ ...thread(2), id: 'older1', row: { id: 'older1', last_message_at: oldest, message_count: 1 } }], truncated: [] }; } });
+  const entry = s.store.loadMoreMail('all', 'inbox');
+  assert.equal(entry.state, 'loading');
+  await tick();
+  assert.deepEqual([...asked.folders], ['inbox']);
+  assert.deepEqual(asked.before, '2026-09-14T09:00:00Z', 'the oldest thread already on screen (thread()\'s own last_message_at)');
+  const after = s.store.moreMail('all', 'inbox');
+  assert.equal(after.state, 'ready');
+  assert.deepEqual([...after.threads.map(t => t.id)], ['older1']);
+});
+
+test('a second "Load more" continues past what the first page already reached', async () => {
+  const s = start(answers({ mailThreads: async () => ({ threads: [thread(2)], truncated: [] }) }));
+  await s.store.load();
+  const asked = [];
+  s.answer({
+    ...answers(),
+    mailThreads: async (folders, ids, before) => {
+      asked.push(before);
+      const id = 'page' + asked.length;
+      return { threads: [{ ...thread(2), id, row: { id, last_message_at: `2026-09-${String(10 - asked.length).padStart(2, '0')}T09:00:00Z`, message_count: 1 } }], truncated: [] };
+    }
+  });
+  s.store.loadMoreMail('all', 'inbox');
+  await tick();
+  s.store.loadMoreMail('all', 'inbox');
+  await tick();
+  assert.deepEqual(asked, ['2026-09-14T09:00:00Z', '2026-09-09T09:00:00Z'], 'the second page asks before the first page\'s own oldest, not the original window\'s');
+  assert.deepEqual([...s.store.moreMail('all', 'inbox').threads.map(t => t.id)], ['page1', 'page2']);
+});
+
+test('"Load more" says there is nothing further back once a page comes back short of the cap', async () => {
+  const s = start(answers({ mailThreads: async () => ({ threads: [thread(2)], truncated: [] }) }));
+  await s.store.load();
+  s.answer({ ...answers(), mailThreads: async () => ({ threads: [{ ...thread(2), id: 'older1' }], truncated: [] }) });
+  s.store.loadMoreMail('all', 'inbox');
+  await tick();
+  assert.equal(s.store.moreMail('all', 'inbox').more, false);
+});
+
+test('"Load more" that fails says so, and a fresh mail load clears it rather than leaving a stale cursor', async () => {
+  const s = start(answers({ mailThreads: async () => ({ threads: [thread(2)], truncated: [] }) }));
+  await s.store.load();
+  s.answer({ ...answers(), mailThreads: async () => { throw new Error('offline'); } });
+  s.store.loadMoreMail('all', 'inbox');
+  await tick();
+  assert.equal(s.store.moreMail('all', 'inbox').state, 'failed');
+  s.answer(answers());
+  await s.store.load({ quiet: true });
+  const cleared = s.store.moreMail('all', 'inbox');
+  assert.equal(cleared.state, 'idle',
+    'a fresh mail load may shift the loaded window\'s own boundary, so the old cursor is not trusted further');
+  assert.equal(cleared.more, true);
+  assert.deepEqual([...cleared.threads], []);
+});
+
+/* ── A word search across every mailbox, not the loaded window ──────────── */
+
+test('a mail search is asked for once per exact query, and kept while nothing changed', async () => {
+  let asked = 0;
+  const s = start(answers({ searchMail: async q => { asked++; return [{ threadId: 't1', subject: q }]; } }));
+  await s.store.load();
+  assert.equal(s.store.searchMail('kickoff').state, 'loading');
+  await tick();
+  assert.equal(s.store.searchMail('kickoff').state, 'ready');
+  assert.equal(s.store.searchMail('kickoff').results[0].subject, 'kickoff');
+  assert.equal(asked, 1, 'the same query again is answered from the cache');
+  s.store.searchMail('kickoff');
+  assert.equal(asked, 1);
+});
+
+test('a blank search is never asked for: it answers ready and empty at once', async () => {
+  let asked = 0;
+  const s = start(answers({ searchMail: async () => { asked++; return []; } }));
+  await s.store.load();
+  const blank = s.store.searchMail('   ');
+  assert.equal(blank.state, 'ready');
+  assert.deepEqual([...blank.results], []);
+  assert.equal(asked, 0);
+});
+
+test('a failed mail search can be retried, and a write forgets every cached search', async () => {
+  let fail = true;
+  const s = start(answers({ searchMail: async () => { if (fail) throw new Error('offline'); return [{ threadId: 't1' }]; } }));
+  await s.store.load();
+  s.store.searchMail('kickoff');
+  await tick();
+  assert.equal(s.store.searchMail('kickoff').state, 'failed');
+  fail = false;
+  s.store.retrySearchMail('kickoff');
+  assert.equal(s.store.searchMail('kickoff').state, 'loading');
+  await tick();
+  assert.equal(s.store.searchMail('kickoff').state, 'ready');
+
+  await s.store.after(Promise.resolve());
+  assert.equal(s.store.searchMail('kickoff').state, 'loading', 'a write may have changed what matches — asked afresh, not kept stale');
 });
 
 /* ── A ticket's conversation and attachments (audit #12) ─────────────────

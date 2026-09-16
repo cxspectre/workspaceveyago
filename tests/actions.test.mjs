@@ -952,6 +952,59 @@ test('reconnecting needs a mailbox to reconnect', async () => {
   assert.equal(ws.invoked.length, 0);
 });
 
+/* ── Connecting or disconnecting a mailbox (0062) ─────────────────────────
+   connectMailbox mirrors connectCalendar's own shape exactly (0057) — the
+   same microsoft-connect call, the other provider; disconnectMailbox is a
+   plain table write, the same shape markThreadRead/starThread are NOT (those
+   go through an Edge Function for Outlook's sake) — 0055 already widened
+   integration_connections' own UPDATE policy to let a plain member of staff
+   disconnect their own personal mailbox, or a manager the studio's, the same
+   line reconnecting already draws; the workspace only ever sets `status`,
+   which 0038's own trigger is what actually enforces. */
+
+test('connecting a mailbox asks microsoft-connect for that provider, and hands back Microsoft\'s page', async () => {
+  const ws = workspace(async () => ({ data: { connectionId: 'c1', consentUrl: CONSENT }, error: null }));
+  const url = await ws.actions.connectMailbox('cassian@veyago.cloud');
+  assert.equal(url, CONSENT);
+  assert.deepEqual(ws.invoked, [{ name: 'microsoft-connect', body: { provider: 'microsoft_mail', accountLabel: 'cassian@veyago.cloud' } }],
+    'no employeeId: the same shape connectCalendar already uses for a plain reconnect');
+});
+
+test('connecting a brand new studio mailbox says whose it is, explicitly, mirroring connectCalendar', async () => {
+  const ws = workspace(async () => ({ data: { connectionId: 'c1', consentUrl: CONSENT }, error: null }));
+  await ws.actions.connectMailbox('hello@veyago.cloud', null);
+  assert.deepEqual(ws.invoked[0].body, { provider: 'microsoft_mail', accountLabel: 'hello@veyago.cloud', employeeId: null });
+});
+
+test('connecting a mailbox refuses a page that is not Microsoft\'s, and needs an address', async () => {
+  const bad = workspace(async () => ({ data: { consentUrl: 'javascript:alert(1)' }, error: null }));
+  await assert.rejects(bad.actions.connectMailbox('hello@veyago.cloud'), /Microsoft/);
+  const empty = workspace(async () => ({ data: { consentUrl: CONSENT }, error: null }));
+  await assert.rejects(empty.actions.connectMailbox(''), /mailbox/i);
+  assert.equal(empty.invoked.length, 0);
+});
+
+test('disconnecting sets a mailbox\'s status directly — no Edge Function round trip, the way marking a thread read needs one', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: 'c1' }] });
+  const row = await ws.actions.disconnectMailbox('c1');
+  assert.equal(row.id, 'c1');
+  assert.deepEqual(ws.written.map(w => [w.table, w.what, w.change, w.where]),
+    [['integration_connections', 'update', { status: 'disconnected' }, [['id', 'c1']]]]);
+  assert.equal(ws.invoked.length, 0);
+});
+
+test('disconnecting a mailbox this session may not act on (RLS refuses the write) says so, rather than a silent success', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }), { rows: () => [] });
+  await assert.rejects(ws.actions.disconnectMailbox('c1'),
+    { message: /^That mailbox could not be disconnected: it may already be, or this is not yours to change\./ });
+});
+
+test('disconnecting needs a mailbox to disconnect', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }));
+  await assert.rejects(ws.actions.disconnectMailbox(''), /mailbox/i);
+  assert.equal(ws.written.length, 0);
+});
+
 /* ── Projects ─────────────────────────────────────────────────────────── */
 
 test('editing a project writes only the columns a project form may change', async () => {

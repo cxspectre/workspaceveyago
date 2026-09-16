@@ -302,6 +302,52 @@ test('Cc and Bcc addresses reach the request the same way To does', async () => 
   assert.deepEqual([...c.sent[0].cc], ['ben@northline.example']);
 });
 
+test('open() also accepts a starting Bcc list, the same way To and Cc already do', async () => {
+  const c = loadComposer();
+  c.open({ mode: 'new', connectionId: STUDIO, to: ['ana@northline.example'], bcc: ['audit@northline.example'], subject: 'Kick-off' });
+  c.fields.editorEl.innerHTML = '<p>Hi</p>';
+  c.fields.editorEl.innerText = 'Hi';
+  c.click('send');
+  await settle();
+  assert.deepEqual([...c.sent[0].bcc], ['audit@northline.example']);
+});
+
+/* ── snapshot(): the draft as plain data, for mail.js to persist across a
+   sign-out and restore on the next sign-in (audit: "Signing out forgets an
+   unsent draft") ─────────────────────────────────────────────────────────── */
+
+test('snapshot() reads to/cc/bcc, subject and the words as plain text — committing a chip not yet turned into one first', () => {
+  const c = loadComposer();
+  c.open({ mode: 'new', connectionId: STUDIO, to: ['ana@northline.example'], subject: 'Kick-off' });
+  c.fields.chipInputs.cc.value = 'ben@northline.example';
+  c.fields.chipInputs.bcc.value = 'audit@northline.example';
+  c.fields.subjectEl.value = 'Kick-off, revised';
+  c.fields.editorEl.innerText = 'See you Monday';
+  const snap = c.composer.snapshot();
+  assert.equal(snap.mode, 'new');
+  assert.equal(snap.connectionId, STUDIO);
+  assert.deepEqual([...snap.to], ['ana@northline.example']);
+  assert.deepEqual([...snap.cc], ['ben@northline.example'], 'committed by snapshot() itself, the same way send() already commits every field before reading it');
+  assert.deepEqual([...snap.bcc], ['audit@northline.example']);
+  assert.equal(snap.subject, 'Kick-off, revised');
+  assert.equal(snap.bodyText, 'See you Monday');
+  assert.equal(c.fields.chipInputs.cc.value, '', 'committing clears the field, the same as pressing Enter would');
+});
+
+test('snapshot() answers null with nothing open', () => {
+  const c = loadComposer();
+  assert.equal(c.composer.snapshot(), null);
+});
+
+test('snapshot() carries a reply\'s own thread and message, so restoring it answers the right conversation', () => {
+  const c = loadComposer();
+  c.open({ mode: 'reply', connectionId: STUDIO, threadId: THREAD, messageId: 'm1', to: ['ana@northline.example'], subject: 'Re: Kick-off' });
+  const snap = c.composer.snapshot();
+  assert.equal(snap.mode, 'reply');
+  assert.equal(snap.threadId, THREAD);
+  assert.equal(snap.messageId, 'm1');
+});
+
 /* ── Sending, and its failure paths ──────────────────────────────────── */
 
 test('a message with nothing in it refuses to send, in send-mail\'s own words', async () => {

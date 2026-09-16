@@ -115,11 +115,71 @@ const mailModel = (function () {
   /* An unread badge counts only what loaded. Past the cap, an older unread
      thread is not being counted at all — `atLeast` says the number is a
      floor, not the true count. A true one needs the database to count what
-     was never fetched, which is outside what this file can do. */
-  function unreadCountInfo(threads, mailbox, truncated) {
+     was never fetched (trueCounts, below): mail_unread_counts() (0062).
+     trueCounts: {connectionId: count}, once it has landed — a real count()
+     past whatever mailThreads() loaded beats the floor guess outright, so it
+     is used first, and All mailboxes sums every mailbox counted rather than
+     only the ones the loaded list still happens to hold unread mail from.
+     null/undefined (not yet asked, still loading, or a database from before
+     0062) falls back to the guess unreadCount() has always made. */
+  function unreadCountInfo(threads, mailbox, truncated, trueCounts) {
+    if (trueCounts) {
+      return Object.freeze({
+        count: mailbox === ALL ? trueUnreadTotal(trueCounts) : (Number(trueCounts[mailbox]) || 0),
+        atLeast: false
+      });
+    }
     return Object.freeze({
       count: unreadCount(threads, mailbox),
       atLeast: isTruncated(truncated, mailbox, ['inbox'])
+    });
+  }
+
+  /* The grand total across every mailbox mail_unread_counts() named — each
+     value coerced through Number() since a bigint column can come back as a
+     string, however the client happens to serialise one. null while there is
+     nothing to sum yet: unknown is not the same as zero (app.js's nav badge
+     and the bell fall back to unreadCount()'s own loaded-list guess for
+     exactly that reason, only once this reads null). */
+  function trueUnreadTotal(trueCounts) {
+    if (!trueCounts) return null;
+    return Object.values(trueCounts).reduce((sum, n) => sum + (Number(n) || 0), 0);
+  }
+
+  /* mails plus a "Load more" page's own older threads (store.js
+     loadMoreMail), each once: the same thread can arrive in both once a
+     background refresh's fresh 200-per-folder window reaches back far
+     enough to retouch what "Load more" already fetched on its own. mails'
+     own copy is kept — its order, newest first, is what "Load more"
+     continues past — so a stale one an older page happened to answer with
+     is never shown over it. */
+  function mergeOlder(threads, older) {
+    const seen = new Set();
+    return Object.freeze([...(threads || []), ...(older || [])].filter(t => {
+      if (!t || seen.has(t.id)) return false;
+      seen.add(t.id);
+      return true;
+    }));
+  }
+
+  /* A thread search_mail (0055) found that mailThreads()'s own 200-per-
+     folder window never loaded — built from what the search hit already
+     answered: enough for the reading pane to open it and ask for its
+     messages by id (workspaceStore.loadThread/threadBody, which need only
+     the id, never the row). What only the loaded row would know — the true
+     sender, read and starred state, its folder, a linked ticket or contact —
+     is not guessed at: `fromSearch` tells the reader to withhold the two
+     controls (star, mark unread) that would otherwise toggle a state this
+     does not actually have. */
+  function threadFromSearchHit(hit) {
+    return Object.freeze({
+      id: hit.threadId, sender: 'Unknown sender', initial: '?', email: '',
+      subject: hit.subject, preview: hit.preview, time: hit.time,
+      unread: false, starred: false, count: undefined,
+      mailboxId: hit.mailboxId, folder: null,
+      ticketId: null, contactId: null,
+      body: undefined, bodyHtml: undefined, thread: undefined,
+      row: hit.row, fromSearch: true
     });
   }
 
@@ -409,7 +469,7 @@ const mailModel = (function () {
 
   return Object.freeze({
     ALL, FOLDERS, mailboxesFor, mailboxNote, parseMailRoute, mailRoute, folderForThread, visibleThreads, unreadCount,
-    isTruncated, unreadCountInfo, recipientLine,
+    isTruncated, unreadCountInfo, trueUnreadTotal, mergeOlder, threadFromSearchHit, recipientLine,
     LIMITS, PURIFY_CONFIG, isAddress, subjectFor, answerFor, parseAddresses, storageName, attachmentProblem,
     signatureFor, sendProblem, addressBook
   });

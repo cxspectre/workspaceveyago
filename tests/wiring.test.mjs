@@ -24,7 +24,7 @@ function take(prefix) {
   assert.equal(found.length, 1, `app.js has one line starting ${prefix}`);
   return found[0];
 }
-const WIRING = ['const todayEvents=', 'function overviewCounts(){', 'function agendaPanel(){', 'function attentionItems(){', 'function createForm(kind){']
+const WIRING = ['const todayEvents=', 'const mailUnreadTotal=', 'function overviewCounts(){', 'function agendaPanel(){', 'function attentionItems(){', 'function createForm(kind){']
   .map(take).join('\n');
 
 /* An event as queries.js hands it to the store, the row under `row`. */

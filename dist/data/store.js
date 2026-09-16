@@ -53,6 +53,10 @@
        connection filter at all), so `mail` still "arrives"; this is the only
        place that failure survives to be shown. */
     mailboxes: [], mailboxesFailed: false, mailTruncated: [], calendars: [],
+    /* The true unread count per mailbox (mail_unread_counts(), 0062) — null
+       until it has answered once, or on a database from before it: unknown,
+       not zero, so mail-model.js's own floor guess is what shows until then. */
+    mailUnreadCounts: null,
     /* The Company page's own parts: connections (companyModel.connectionRows),
        the studio's public profile (companyModel.studioProfile) and which bell
        items this person has already dismissed. */
@@ -206,16 +210,23 @@
          not a change worth a repaint, but kept for the next one. Whether the
          mailbox list itself is currently failing is not, on its own, either —
          mailboxesFailed is kept the same way — but IS part of the signature,
-         so recovering from a failure (even onto the same empty list) repaints. */
+         so recovering from a failure (even onto the same empty list) repaints.
+         unreadCounts is too: a thread outside the loaded window going from
+         unread to read moves the true count with nothing else here to show it. */
       sign: function (value) {
         return {
           threads: value.threads,
           truncated: value.truncated,
           mailboxesFailed: value.mailboxesFailed,
-          mailboxes: value.mailboxes.map(function (b) { return Object.assign({}, b, { last_synced_at: null }); })
+          mailboxes: value.mailboxes.map(function (b) { return Object.assign({}, b, { last_synced_at: null }); }),
+          unreadCounts: value.unreadCounts
         };
       },
-      keep: function (value) { state.mailboxes = value.mailboxes; state.mailboxesFailed = Boolean(value.mailboxesFailed); }
+      keep: function (value) {
+        state.mailboxes = value.mailboxes;
+        state.mailboxesFailed = Boolean(value.mailboxesFailed);
+        state.mailUnreadCounts = value.unreadCounts || null;
+      }
     }),
     part('overview', 'the overview figures',
       function (d) { return d.overview(); },
@@ -706,23 +717,40 @@
      mailbox connected": the caller gets mailboxesFailed alongside the empty
      list, rather than the error being swallowed into indistinguishable rows. */
   function loadMail(d) {
-    return d.mailboxes()
-      .then(
+    return Promise.all([
+      d.mailboxes().then(
         function (boxes) { return { boxes: boxes, failed: false }; },
         function (err) {
           console.error('[workspace] could not load the mailboxes:', err);
           return { boxes: [], failed: true };
         }
+      ),
+      /* A COUNT-based answer (mail_unread_counts(), 0062): the true unread
+         total for every mailbox this person can read, not only the 200 most
+         recent inbox threads mailThreads() keeps. Missing on a database from
+         before 0062, or failing for any other reason, degrades to null —
+         mail-model.js's own floor-based guess (unreadCountInfo) is what the
+         badges already showed before this existed, and stays the fallback
+         rather than a failure here taking the rest of mail down with it. */
+      d.mailUnreadCounts().then(
+        function (counts) { return counts; },
+        function (err) {
+          console.error('[workspace] the true unread count did not load:', err);
+          return null;
+        }
       )
-      .then(function (mailboxes) {
-        var ids = mailboxes.boxes.map(function (b) { return b.id; });
-        return d.mailThreads(['inbox', 'sent', 'starred'], ids).then(function (result) {
-          return {
-            mailboxes: mailboxes.boxes, mailboxesFailed: mailboxes.failed,
-            threads: result.threads, truncated: result.truncated
-          };
-        });
+    ]).then(function (loaded) {
+      var mailboxes = loaded[0];
+      var unreadCounts = loaded[1];
+      var ids = mailboxes.boxes.map(function (b) { return b.id; });
+      return d.mailThreads(['inbox', 'sent', 'starred'], ids).then(function (result) {
+        return {
+          mailboxes: mailboxes.boxes, mailboxesFailed: mailboxes.failed,
+          threads: result.threads, truncated: result.truncated,
+          unreadCounts: unreadCounts
+        };
       });
+    });
   }
 
   /* Thread bodies, fetched when a thread is opened rather than with the list,
@@ -761,6 +789,14 @@
     state.mailboxes = result.mailboxes;
     state.mailboxesFailed = Boolean(result.mailboxesFailed);
     state.mailTruncated = result.truncated;
+    state.mailUnreadCounts = result.unreadCounts || null;
+    /* "Load more"'s own cursor (below) is the oldest thread `mails` held the
+       moment it was last asked for; a fresh mail load can move that window
+       forward (new mail arrived) or, more rarely, back, so a page reached
+       through it is not trusted across one — asked for again, from `mails`
+       as it now stands, rather than risking a silently skipped or repeated
+       stretch of mail. */
+    moreMailBy = {};
   }
 
   /* Which version of a thread is loaded: a new message changes both. */
@@ -793,6 +829,93 @@
         failedThreads[threadId] = true;
         if (typeof render === 'function') render();
       });
+  }
+
+  /* ── "Load more": older mail, one page beyond what mailThreads() keeps ──
+     Kept apart from `mails` itself (never pushed into it) rather than folded
+     into the ordinary mail part: a background refresh's own swap(mails, …)
+     (applyMail, above) always answers with the newest 200-per-folder window
+     again, which would silently throw an appended older page away the next
+     time mail refreshes — kept here instead, mail.js's own list draws both
+     together (mailModel.mergeOlder), and applyMail clears this cache outright
+     the moment mail genuinely reloads, since the window a further page would
+     continue past may have moved. */
+  var moreMailBy = {};
+  var moreMailKey = function (mailbox, folder) { return String(mailbox) + '|' + String(folder); };
+  var MORE_MAIL_IDLE = Object.freeze({ state: 'idle', more: true, threads: Object.freeze([]) });
+
+  /* The oldest last_message_at among a list of threads matching this mailbox
+     and folder — Starred spans every folder a thread could actually be filed
+     under, exactly as mailModel.visibleThreads() itself reads "starred". */
+  function oldestInScope(list, mailbox, folder) {
+    return list.reduce(function (min, t) {
+      var matches = (folder === 'starred' ? Boolean(t.starred) : t.folder === folder)
+        && (mailbox === 'all' || t.mailboxId === mailbox);
+      var at = matches && t.row ? t.row.last_message_at : null;
+      return at && (!min || at < min) ? at : min;
+    }, null);
+  }
+
+  function loadMoreMail(mailbox, folder) {
+    var key = moreMailKey(mailbox, folder);
+    var existing = moreMailBy[key] || MORE_MAIL_IDLE;
+    if (existing.state === 'loading') return existing;
+    /* Continues past whatever "Load more" has already reached for this key,
+       falling back to the ordinary loaded window the first time it is asked. */
+    var before = oldestInScope(existing.threads, mailbox, folder) || oldestInScope(mails, mailbox, folder);
+    if (!before) {
+      moreMailBy[key] = { state: 'ready', more: false, threads: existing.threads };
+      repaint(true);
+      return moreMailBy[key];
+    }
+    var entry = { state: 'loading', more: existing.more, threads: existing.threads };
+    moreMailBy[key] = entry;
+    var ids = mailbox === 'all' ? state.mailboxes.map(function (b) { return b.id; }) : [mailbox];
+    window.workspaceData.mailThreads([folder], ids, before)
+      .then(function (result) {
+        if (moreMailBy[key] !== entry) return;
+        moreMailBy[key] = {
+          state: 'ready',
+          /* Any one (mailbox, folder) pair hitting queries.js's own PER_FOLDER
+             cap means there is more still further back than this page reached. */
+          more: result.truncated.length > 0,
+          threads: existing.threads.concat(result.threads)
+        };
+        repaint(true);
+      }, function (err) {
+        if (moreMailBy[key] !== entry) return;
+        console.error('[workspace] older mail did not load:', err);
+        moreMailBy[key] = { state: 'failed', more: existing.more, threads: existing.threads };
+        repaint(true);
+      });
+    return entry;
+  }
+
+  /* ── A word search across every message this person could read ──────────
+     Kept by the exact query typed (search_mail, 0055) — the same word
+     searched twice while nothing else has happened should not ask again —
+     and forgotten on a write (after(), below), the same as every other
+     page's own "asked for" cache: a send, a star or a read may change what
+     matches or what a hit's own row now says. */
+  var mailSearchBy = {};
+  var MAIL_SEARCH_LOADING = Object.freeze({ state: 'loading', results: Object.freeze([]) });
+  var MAIL_SEARCH_EMPTY = Object.freeze({ state: 'ready', results: Object.freeze([]) });
+
+  function loadMailSearch(query) {
+    var entry = { state: 'loading', results: [] };
+    mailSearchBy[query] = entry;
+    window.workspaceData.searchMail(query)
+      .then(function (results) {
+        if (mailSearchBy[query] !== entry) return;
+        mailSearchBy[query] = { state: 'ready', results: results || [] };
+        repaint(true);
+      }, function (err) {
+        if (mailSearchBy[query] !== entry) return;
+        console.error('[workspace] mail search did not load:', err);
+        mailSearchBy[query] = { state: 'failed', results: [] };
+        repaint(true);
+      });
+    return entry;
   }
 
   /* A client's past meetings, asked for when their page is drawn rather than
@@ -1271,6 +1394,7 @@
         archivedProjectsBy = null;
         transactionsBy = {};
         employeePrivateAskedFor = {};
+        mailSearchBy = {};
         await load(reload);
         return out;
       } catch (err) {
@@ -1282,6 +1406,7 @@
         archivedProjectsBy = null;
         transactionsBy = {};
         employeePrivateAskedFor = {};
+        mailSearchBy = {};
         if (typeof toast === 'function' && !(options && options.toast === false)) toast(err.message);
         /* A write that failed may still have changed something — a row saved
            before a later step was refused — so the page is brought back to
@@ -1338,6 +1463,32 @@
     retryThread: function (threadId) {
       delete failedThreads[threadId];
       loadThread(threadId);
+    },
+
+    /* "Load more" for one folder of one mailbox (mail.js), as { state:
+       'idle' | 'loading' | 'ready' | 'failed', more, threads } — never
+       started merely by asking (unlike pastMeetings/transactions above):
+       a page rendered over and over must not turn into a stream of older-
+       mail requests nobody clicked for. loadMoreMail is the one thing that
+       starts it. */
+    moreMail: function (mailbox, folder) { return moreMailBy[moreMailKey(mailbox, folder)] || MORE_MAIL_IDLE; },
+    loadMoreMail: loadMoreMail,
+
+    /* A word search across every mailbox this person can read (mail.js),
+       as { state: 'loading' | 'ready' | 'failed', results }. A blank query
+       is answered at once, with nothing asked for: search_mail itself
+       answers nothing for one, and skipping the round trip is one less
+       place a slow network shows on every keystroke that clears the box. */
+    searchMail: function (query) {
+      var q = String(query || '').trim();
+      if (!q) return MAIL_SEARCH_EMPTY;
+      if (!state.loaded || !window.workspaceData || typeof window.workspaceData.searchMail !== 'function') return MAIL_SEARCH_LOADING;
+      return mailSearchBy[q] || loadMailSearch(q);
+    },
+    /* Ask again for a search that did not load. */
+    retrySearchMail: function (query) {
+      var q = String(query || '').trim();
+      if (mailSearchBy[q] && mailSearchBy[q].state === 'failed') delete mailSearchBy[q];
     },
 
     /* Projects are known by id (projects-model.js), never by position. */

@@ -602,6 +602,30 @@ const mailComposer = (function () {
       || typing;
   }
 
+  /* The draft as plain data — to/cc/bcc, subject, and its words as plain
+     text — for whatever needs to outlive this page: today, carrying an
+     unfinished draft across a sign-out and back in again for the same
+     person (mail.js). null with nothing open. Formatting (bold, lists,
+     colour, an inline image) is not carried — restoring it goes back through
+     open()'s own bodyText, exactly as a saved signature or a plain-text
+     paste already turn into paragraphs — a smaller loss than the words
+     themselves going missing, which is what this exists to stop. Every
+     field is committed first, the same way send() commits every field
+     before reading it, so a chip not yet turned into one (still sitting in
+     the field, half-typed) is not silently dropped. */
+  function draftSnapshot() {
+    if (!draft || !el) return null;
+    ['to', 'cc', 'bcc'].forEach(commitInput);
+    const subject = find('[data-c="subject"]');
+    return {
+      mode: draft.mode, connectionId: draft.connectionId,
+      threadId: draft.threadId, messageId: draft.messageId,
+      to: [...draft.to], cc: [...draft.cc], bcc: [...draft.bcc],
+      subject: subject ? subject.value : draft.subject,
+      bodyText: editor().innerText || ''
+    };
+  }
+
   /* ── Events, bound once per draft ──────────────────────────────────── */
 
   function onClick(e) {
@@ -775,8 +799,12 @@ const mailComposer = (function () {
 
   /* ── What mail.js calls ────────────────────────────────────────────── */
 
-  /* init: { mode, connectionId, threadId, messageId, to, cc, subject, about, bodyText }
-     with: { boxes, book, canReconnect, onSent(result, sent), onClose() }
+  /* init: { mode, connectionId, threadId, messageId, to, cc, bcc, subject,
+     about, bodyText } with: { boxes, book, canReconnect, onSent(result,
+     sent), onClose() }. bcc seeds the draft the same way to/cc already do —
+     used when mail.js restores a draft snapshot() (below) saved across a
+     sign-out; nothing else has ever passed one in, since a fresh new/reply/
+     forward always starts with an empty Bcc a person adds themselves.
      Refused while a message is being sent: that send finishes into its own draft. */
   function open(init, withContext) {
     if (sending) return false;
@@ -789,6 +817,7 @@ const mailComposer = (function () {
       : '<p><br></p>';
     const to = Object.freeze([...(init.to || [])]);
     const cc = Object.freeze([...(init.cc || [])]);
+    const bcc = Object.freeze([...(init.bcc || [])]);
     const subject = String(init.subject || '');
     const connectionId = init.connectionId || null;
     draft = Object.freeze({
@@ -797,7 +826,7 @@ const mailComposer = (function () {
       connectionId,
       threadId: init.threadId || null,
       messageId: init.messageId || null,
-      to, cc, bcc: Object.freeze([]),
+      to, cc, bcc,
       subject,
       about: String(init.about || ''),
       bodyHtml: `${paragraphs}<p><br></p><div class="composer-signature" data-signature></div>`,
@@ -888,6 +917,7 @@ const mailComposer = (function () {
 
   return Object.freeze({
     open, close, beforeRender, afterRender, focus, hasContent, openSignatures,
+    snapshot: draftSnapshot,
     isOpen: () => Boolean(draft),
     isSending: () => sending,
     mode: () => (draft ? draft.mode : null),

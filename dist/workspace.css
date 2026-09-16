@@ -77,8 +77,17 @@
 .mailbox-name small.mailbox-warning, .mail-folder-foot small.mailbox-warning { color: #b45309; }
 .mailbox-connection + .mailbox-connection { margin-top: 12px; }
 .mailbox-connection small { display: block; }
-.mail-folder-foot .mailbox-reconnect { margin-top: 7px; padding: 5px 11px; font-size: .75rem; }
-.mail-folder-foot .mailbox-reconnect:disabled { opacity: .55; cursor: progress; }
+.mailbox-connection-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 7px; }
+.mail-folder-foot .mailbox-reconnect, .mail-folder-foot .mailbox-disconnect { padding: 5px 11px; font-size: .75rem; }
+.mail-folder-foot .mailbox-reconnect:disabled, .mail-folder-foot .mailbox-disconnect:disabled { opacity: .55; cursor: progress; }
+.mailbox-disconnect { color: #96693a; border-color: #e7d6c2; background: #fdf8f2; }
+.mailbox-disconnect:hover { background: #faf0e2; }
+.mail-folder-foot .mailbox-connect { margin-top: 10px; width: 100%; }
+
+/* ── Mark all as read, and loading an older page of mail ─────────────── */
+.mail-list-heading .mail-mark-all-read { flex-shrink: 0; white-space: nowrap; }
+.mail-load-more { display: block; width: calc(100% - 32px); margin: 14px 16px; text-align: center; justify-content: center; }
+.mail-load-more:disabled { opacity: .6; cursor: progress; }
 
 /* ── Compose, in the reading pane ─────────────────────────────────────── */
 .reader-compose .reader-content { padding-top: 16px; }
@@ -194,8 +203,8 @@ button.mail-message-head:hover { background: #f7faff; }
   .mailbox-select { display: block; margin-right: 6px; }
   .mail-folder-list { display: flex; flex-wrap: wrap; gap: 6px; }
   /* The foot is hidden here to save room — but not when it is the only place
-     a manager can reconnect a mailbox. */
-  .mail-folder-foot:has(.mailbox-reconnect) { display: block; }
+     a manager can reconnect, or connect, a mailbox. */
+  .mail-folder-foot:has(.mailbox-reconnect, .mailbox-connect) { display: block; }
 }
 @media (max-width: 760px) { .mail-workspace { grid-template-columns: 1fr; } }
 

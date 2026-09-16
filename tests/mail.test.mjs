@@ -174,6 +174,33 @@ test('unread counts are inbox-only and follow the mailbox', () => {
   assert.equal(model.unreadCount([thread({ folder: 'sent', unread: true })], 'all'), 0);
 });
 
+test('mergeOlder appends "load more" threads once, keeping mails\' own order and its own copy first', () => {
+  const older = [thread({ id: 't5', subject: 'Old one' }), thread({ id: 't1', subject: 'Stale copy of t1' })];
+  const merged = model.mergeOlder(threads, older);
+  assert.deepEqual([...merged.map(t => t.id)], ['t1', 't2', 't3', 't4', 't5'],
+    'a thread already in mails is kept once, at its own place, not repeated from the older page');
+  assert.equal(merged[0].subject, 'Launch plan', 'mails\' own copy is kept — not the older page\'s stale one');
+});
+
+test('mergeOlder tolerates missing lists', () => {
+  assert.deepEqual([...model.mergeOlder(null, null)], []);
+  assert.deepEqual([...model.mergeOlder(threads, undefined).map(t => t.id)], threads.map(t => t.id));
+});
+
+test('a search hit for a thread outside the loaded window builds just enough of one to open', () => {
+  const hit = { threadId: 'search-only', mailboxId: STUDIO, subject: 'Old renewal', preview: 'See attached', time: 'Sep 1', row: { sent_at: '2026-09-01T09:00:00Z' } };
+  const built = model.threadFromSearchHit(hit);
+  assert.equal(built.id, 'search-only');
+  assert.equal(built.mailboxId, STUDIO);
+  assert.equal(built.subject, 'Old renewal');
+  assert.equal(built.preview, 'See attached');
+  assert.equal(built.sender, 'Unknown sender', 'search_mail\'s own row does not carry a sender — never guessed at');
+  assert.equal(built.unread, false, 'not known either way — never presented as read when it might not be');
+  assert.equal(built.starred, false);
+  assert.equal(built.folder, null, 'folderForThread falls back to wherever the person already is');
+  assert.equal(built.fromSearch, true, 'so the reader can withhold star/unread, which need a state this does not have');
+});
+
 test('recipient lines read like a mail client, and stay short', () => {
   assert.equal(model.recipientLine(['a@x.com']), 'a@x.com');
   assert.equal(model.recipientLine(['a@x.com', 'b@y.com']), 'a@x.com, b@y.com');
@@ -554,6 +581,24 @@ test('an unread count says when it is a floor rather than the true number', () =
   assert.equal(model.unreadCountInfo(threads, model.ALL, []).count, 2, 'matches unreadCount itself');
 });
 
+test('with a true, database-counted answer, unreadCountInfo uses it instead of the floor guess', () => {
+  const trueCounts = { [STUDIO]: 5, [PERSONAL]: 0 };
+  const studio = model.unreadCountInfo(threads, STUDIO, [`${STUDIO}|inbox`], trueCounts);
+  assert.equal(studio.count, 5, 'the real count, not the loaded-list guess (1) nor its floor');
+  assert.equal(studio.atLeast, false, 'a real count is never a floor');
+  const all = model.unreadCountInfo(threads, model.ALL, [], trueCounts);
+  assert.equal(all.count, 5, 'All mailboxes sums the true counts');
+  const untouched = model.unreadCountInfo(threads, STUDIO, [`${STUDIO}|inbox`], null);
+  assert.equal(untouched.count, 1, 'with none yet, the old floor-based guess still answers');
+  assert.equal(untouched.atLeast, true);
+});
+
+test('trueUnreadTotal sums a database count answer, and says "not yet known" until there is one', () => {
+  assert.equal(model.trueUnreadTotal({ a: 3, b: '2' }), 5, 'a value however it arrived (a bigint reads as a string) still adds up');
+  assert.equal(model.trueUnreadTotal({}), 0, 'answered, and the answer is zero — not "not yet known"');
+  assert.equal(model.trueUnreadTotal(null), null, 'not yet loaded, or a database from before 0062: unknown, not zero');
+});
+
 test('a mailbox says what went wrong in a sentence the column fits, and keeps the whole of it', () => {
   const [box] = model.mailboxesFor([connection({
     last_error: 'Some mail filed away in Outlook may still show in this inbox until the daily check. inbox: Graph has not confirmed whether 1 message(s) left the inbox (Graph → 503: busy)'
@@ -645,13 +690,23 @@ let mActiveElement = null;
 function loadMail(options = {}) {
   const {
     boxes = [connection({})], threads = [], route = ['mail'], loaded = true,
-    mailboxesFailed = false, mailTruncated = [], notice = null,
+    mailboxesFailed = false, mailTruncated = [], notice = null, mailUnreadCounts = null,
     bodies = () => null, failedThreadIds = [], retriedThreadIds = [],
     markThreadReadResult = async () => ({}), starThreadResult = async () => ({}),
     reconnectMailboxResult = async () => 'https://login.microsoftonline.com/x',
+    connectMailboxResult = async () => 'https://login.microsoftonline.com/x',
+    disconnectMailboxResult = async () => ({}),
     manager = false, me = ME, meEmail = null,
-    tickets = [], contacts = []
+    tickets = [], contacts = [], team = [],
+    /* null: no store.searchMail/moreMail at all — an older store the way the
+       pre-0062 mail part answered, so nothing about them is asked for.
+       Otherwise a function of (mailbox, folder) / (query) answering the
+       { state, ... } shape those store methods themselves return. */
+    searchMailAnswer = null, moreMailAnswer = null
   } = options;
+  const searchMailCalls = [];
+  const retrySearchMailCalls = [];
+  const loadMoreMailCalls = [];
 
   const toasts = [];
   const navigated = [];
@@ -660,9 +715,19 @@ function loadMail(options = {}) {
   const listeners = {};
   const on = (type, fn) => { (listeners[type] = listeners[type] || []).push(fn); };
   const timers = [];
+  /* A plain in-memory stand-in for window.localStorage — real enough for
+     the draft-across-a-sign-out persistence to read and write, seeded from
+     options.storedItems the way a browser that already had something saved
+     would be. */
+  const storageMap = new Map(Object.entries(options.storedItems || {}));
+  const localStorageStub = {
+    getItem: k => (storageMap.has(k) ? storageMap.get(k) : null),
+    setItem: (k, v) => { storageMap.set(k, String(v)); },
+    removeItem: k => { storageMap.delete(k); }
+  };
 
   const state = { page: 'mail', routeParts: [...route], mailFolder: 'Inbox', selectedMail: 0, renders: 0 };
-  const queries = { mail: '' };
+  const queries = { mail: options.query || '' };
   const mailsArr = threads.map(t => ({ ...t }));
 
   let mainHtml = '';
@@ -802,21 +867,36 @@ function loadMail(options = {}) {
     get mailFolder() { return state.mailFolder; }, set mailFolder(v) { state.mailFolder = v; },
     get selectedMail() { return state.selectedMail; }, set selectedMail(v) { state.selectedMail = v; },
     queries,
-    tickets, contacts,
+    tickets, contacts, team,
     mails: mailsArr,
     workspaceSession: { employee: me ? { id: me, email: meEmail } : null, isManager: () => manager },
     workspaceStore: {
-      state: { loaded, mailboxes: boxes, mailboxesFailed, mailTruncated, notice },
+      state: { loaded, mailboxes: boxes, mailboxesFailed, mailTruncated, notice, mailUnreadCounts },
       has: key => (options.hasParts ? options.hasParts.includes(key) : true),
       threadBody: id => bodies(id),
       threadFailed: id => failedThreadIds.includes(id),
       retryThread: id => retriedThreadIds.push(id),
-      reload: () => Promise.resolve()
+      reload: () => Promise.resolve(),
+      /* null (the default): as a store from before these methods existed —
+         mail.js reads `typeof workspaceStore.searchMail !== 'function'` and
+         falls back exactly as it does for an older store, so no test needs
+         to know about search or "Load more" unless it is actually about
+         them. */
+      ...(searchMailAnswer ? {
+        searchMail: query => { searchMailCalls.push(query); return searchMailAnswer(query); },
+        retrySearchMail: query => retrySearchMailCalls.push(query)
+      } : {}),
+      ...(moreMailAnswer ? {
+        moreMail: (mailbox, folder) => moreMailAnswer(mailbox, folder),
+        loadMoreMail: (mailbox, folder) => loadMoreMailCalls.push({ mailbox, folder })
+      } : {})
     },
     workspaceActions: {
       markThreadRead: (id, read) => markThreadReadResult(id, read),
       starThread: (id, starred) => starThreadResult(id, starred),
-      reconnectMailbox: address => reconnectMailboxResult(address)
+      reconnectMailbox: address => reconnectMailboxResult(address),
+      connectMailbox: (address, whose) => connectMailboxResult(address, whose),
+      disconnectMailbox: id => disconnectMailboxResult(id)
     },
     mailComposer: {
       open(init) { openedWith.push(init); return options.refuseComposerOpen ? false : true; },
@@ -828,10 +908,15 @@ function loadMail(options = {}) {
       isOpen: () => Boolean(options.composerOpen),
       isSending: () => Boolean(options.composerSending),
       mode: () => options.composerMode || null,
-      threadId: () => options.composerThreadId || null
+      threadId: () => options.composerThreadId || null,
+      snapshot: () => (options.composerSnapshot !== undefined ? options.composerSnapshot : null)
     },
     document: documentStub,
-    window: { open: () => null, addEventListener: on, DOMPurify: null, mailHtml: null, location: { hash: '' } },
+    window: {
+      open: () => null, addEventListener: on, DOMPurify: null, mailHtml: null, location: { hash: '' },
+      workspaceGate: options.gateLeaving ? { leaving: true } : null,
+      localStorage: options.noLocalStorage ? null : localStorageStub
+    },
     setTimeout: (fn, ms) => { timers.push({ fn, ms, cleared: false }); return timers.length; },
     clearTimeout: id => { if (timers[id - 1]) timers[id - 1].cleared = true; },
     get render() { return render; }, set render(v) { render = v; },
@@ -866,7 +951,11 @@ function loadMail(options = {}) {
       if (!prevented && node && typeof node.href === 'string' && node.href.startsWith('#')) navigate(node.href.slice(1));
     },
     change: node => (listeners.change || []).forEach(fn => fn({ target: node })),
-    keydown: node => (listeners.keydown || []).forEach(fn => fn({ target: node, key: 'Escape', preventDefault() {} })),
+    keydown: (node, key = 'Escape') => {
+      let prevented = false;
+      (listeners.keydown || []).forEach(fn => fn({ target: node, key, preventDefault() { prevented = true; } }));
+      return prevented;
+    },
     input: node => (listeners.input || []).forEach(fn => fn({ target: node, stopImmediatePropagation() {} })),
     setActive: el => { mActiveElement = el; },
     active: () => mActiveElement,
@@ -874,6 +963,20 @@ function loadMail(options = {}) {
     fire: ms => { timers.filter(t => !t.cleared && t.ms === ms).forEach(t => { t.cleared = true; t.fn(); }); },
     renders: () => state.renders,
     route: () => state.routeParts,
+    searchMailCalls, retrySearchMailCalls, loadMoreMailCalls,
+    /* Fires the same beforeunload the gate's own reload does (data/gate.js
+       leave()), and returns the event so a test can check whether the
+       browser's own "leave site?" prompt was asked for. */
+    signOut() {
+      const event = { prevented: false, preventDefault() { this.prevented = true; }, returnValue: undefined };
+      (listeners.beforeunload || []).forEach(fn => fn(event));
+      return event;
+    },
+    signIn: () => (listeners['workspace:loaded'] || []).forEach(fn => fn({ type: 'workspace:loaded' })),
+    storedDraft: () => {
+      const raw = storageMap.get('veyago.mail.draft');
+      return raw ? JSON.parse(raw) : null;
+    },
     toasts, navigated, openedWith, composerClosed,
     compose: (...args) => vm.runInContext(`compose(${args.map(a => JSON.stringify(a)).join(',')})`, context)
   };
@@ -907,6 +1010,7 @@ function storeAnswers(over = {}) {
     tickets: async () => [], projects: async () => [], allProjectTasks: async () => [],
     contacts: async () => [], team: async () => [], events: async () => [], invoices: async () => [],
     activity: async () => [], mailboxes: async () => [], mailThreads: async () => ({ threads: [], truncated: [] }),
+    mailUnreadCounts: async () => ({}),
     mailMessages: async () => [{ body: 'hello', bodyHtml: '' }], overview: async () => ({}),
     revenueSeries: async () => [], revenueMix: async () => [], companies: async () => [],
     upcomingProjectEvents: async () => [], projectMembers: async () => [], projectContacts: async () => [],
@@ -1023,6 +1127,17 @@ test('an unread badge past the per-folder cap says "or more" for a screen reader
   assert.doesNotMatch(whole, /1\+/);
 });
 
+test('once mail_unread_counts() has answered, every badge shows the real count instead of the loaded-list floor', () => {
+  const html = loadMail({
+    threads: [mthread({ unread: true })],
+    mailUnreadCounts: { [STUDIO]: 9 },
+    mailTruncated: [`${STUDIO}|inbox`]   // would otherwise say "1+" — the true count is never a floor
+  }).view();
+  assert.match(html, /<small class="mail-count">9<span class="sr-only"> unread<\/span><\/small>/);
+  assert.doesNotMatch(html, /9\+/);
+  assert.doesNotMatch(html, />1</, 'the stale loaded-list count of 1 is not shown anywhere once the true one has landed');
+});
+
 /* ── A failed mark-as-read (finding 5) ───────────────────────────────────── */
 
 const settle = () => new Promise(resolve => setTimeout(resolve, 0));
@@ -1057,6 +1172,196 @@ test('retrying a failed mark-as-read clears the note and tries again', async () 
   await settle();
   assert.equal(attempts, 2);
   assert.doesNotMatch(page.view(), /Could not mark this conversation as read\./);
+});
+
+/* ── "Load more": older mail than mailThreads() loaded (finding 2) ──────── */
+
+test('a "Load more" button appears while there may be older mail, and asks the store for the folder shown', () => {
+  const page = loadMail({
+    threads: [mthread({ id: T1 })],
+    moreMailAnswer: () => ({ state: 'ready', more: true, threads: [] })
+  });
+  const html = page.view();
+  assert.match(html, /Load older mail/);
+  const button = page.byId('mail-load-more');
+  page.click(button);
+  assert.deepEqual(page.loadMoreMailCalls, [{ mailbox: 'all', folder: 'inbox' }]);
+});
+
+test('no "Load more" once a page came back short of the cap, or while a search is on screen', () => {
+  const done = loadMail({ threads: [mthread()], moreMailAnswer: () => ({ state: 'ready', more: false, threads: [] }) });
+  assert.doesNotMatch(done.view(), /Load older mail/);
+
+  const searching = loadMail({
+    threads: [mthread()], query: 'x',
+    moreMailAnswer: () => ({ state: 'ready', more: true, threads: [] }),
+    searchMailAnswer: () => ({ state: 'ready', results: [] })
+  });
+  assert.doesNotMatch(searching.view(), /Load older mail/, 'a search already answers from the whole mailbox in one go');
+});
+
+test('an older page "Load more" already fetched is appended to the list, not shown instead of it', () => {
+  const OLDER = mthread({ id: 'd0000000-0000-4000-8000-000000000077', subject: 'Older one' });
+  const page = loadMail({
+    threads: [mthread({ id: T1, subject: 'Newer one' })],
+    moreMailAnswer: () => ({ state: 'ready', more: false, threads: [OLDER] })
+  });
+  const html = page.view();
+  assert.match(html, /Newer one/);
+  assert.match(html, /Older one/);
+  assert.match(html, /2 conversations/);
+});
+
+test('a failed "Load more" says so, and its own label doubles as the retry', () => {
+  const page = loadMail({ threads: [mthread()], moreMailAnswer: () => ({ state: 'failed', more: true, threads: [] }) });
+  assert.match(page.view(), /Older mail did not load — try again/);
+});
+
+/* ── Next/previous and mark all as read (finding 3) ──────────────────────── */
+
+test('j/ArrowDown opens the next conversation on screen, k/ArrowUp the previous one', () => {
+  const page = loadMail({
+    threads: [mthread({ id: T1, subject: 'First' }), mthread({ id: T2, subject: 'Second' })],
+    route: ['mail', 'all', 'inbox', T1]
+  });
+  page.view();
+  page.keydown(mtarget(), 'j');
+  assert.deepEqual(page.navigated, [`mail/all/inbox/${T2}`]);
+  page.view();
+  page.keydown(mtarget(), 'k');
+  assert.deepEqual(page.navigated.slice(-1), [`mail/all/inbox/${T1}`]);
+});
+
+test('with nothing open, j opens the first conversation shown; k stays there rather than going before it', () => {
+  const page = loadMail({ threads: [mthread({ id: T1 }), mthread({ id: T2 })] });
+  page.view();
+  page.keydown(mtarget(), 'j');
+  assert.deepEqual(page.navigated, [`mail/all/inbox/${T1}`]);
+});
+
+test('j/k does nothing at the ends of the list, or with nothing in it', () => {
+  const page = loadMail({ threads: [mthread({ id: T1 })], route: ['mail', 'all', 'inbox', T1] });
+  page.view();
+  page.keydown(mtarget(), 'j');
+  assert.deepEqual(page.navigated, [], 'already the last (and only) conversation');
+
+  const empty_ = loadMail({ threads: [] });
+  empty_.view();
+  empty_.keydown(mtarget(), 'j');
+  assert.deepEqual(empty_.navigated, []);
+});
+
+test('j/k does nothing while a draft is open, so a stray letter cannot carry someone away from it', () => {
+  const page = loadMail({
+    threads: [mthread({ id: T1 }), mthread({ id: T2 })], route: ['mail', 'all', 'inbox', T1],
+    composerOpen: true, composerThreadId: T1
+  });
+  page.view();
+  page.keydown(mtarget(), 'j');
+  assert.deepEqual(page.navigated, [], 'nothing moved — a draft answering this very conversation is open');
+});
+
+test('"Mark all as read" shows only while something on screen is unread, and marks each one', async () => {
+  const marked = [];
+  const page = loadMail({
+    threads: [mthread({ id: T1, unread: true }), mthread({ id: T2, unread: true, subject: 'Other' })],
+    markThreadReadResult: async id => { marked.push(id); return {}; }
+  });
+  const html = page.view();
+  assert.match(html, /Mark all as read/);
+  page.click(page.byId('mail-mark-all-read'));
+  await settle();
+  assert.deepEqual([...marked].sort(), [T1, T2].sort());
+});
+
+test('no "Mark all as read" once nothing on screen is unread', () => {
+  const page = loadMail({ threads: [mthread({ unread: false })] });
+  assert.doesNotMatch(page.view(), /Mark all as read/);
+});
+
+/* ── Connecting or disconnecting a mailbox (finding 5) ───────────────────── */
+
+test('"Connect a mailbox" shows for a manager only — the same rule microsoft-connect itself enforces for a brand new connection', () => {
+  const manager = loadMail({ manager: true }).view();
+  assert.match(manager, /Connect a mailbox/);
+  const staff = loadMail({ manager: false }).view();
+  assert.doesNotMatch(staff, /Connect a mailbox/);
+});
+
+test('Disconnect sits beside Reconnect for every mailbox this session may act on', () => {
+  const html = loadMail({
+    manager: true,
+    boxes: [
+      connection({ status: 'needs_reauth', is_live: false }),
+      connection({ id: PERSONAL, account_label: 'cassian@veyago.cloud', employee_id: ME, status: 'needs_reauth', is_live: false })
+    ]
+  }).view();
+  assert.match(html, /aria-label="Disconnect hello@veyago\.cloud"/);
+  assert.match(html, /aria-label="Disconnect cassian@veyago\.cloud"/);
+});
+
+test('a mailbox this session may not act on shows its connection, but neither Reconnect nor Disconnect', () => {
+  const box = connection({});
+  const html = loadMail({ manager: false, boxes: [box], route: ['mail', box.id, 'inbox'] }).view();
+  assert.match(html, /hello@veyago\.cloud/, 'the connection itself is still shown');
+  assert.doesNotMatch(html, /data-mail-disconnect/);
+  assert.doesNotMatch(html, /data-mail-reconnect/);
+});
+
+/* ── A draft carried across a sign-out (finding 4) ───────────────────────── */
+
+test('signing out saves an open draft, keyed to who is signed in, and does not hold up the reload with a prompt', () => {
+  const SNAP = { mode: 'new', connectionId: STUDIO, threadId: null, messageId: null, to: ['ana@x.example'], cc: [], bcc: [], subject: 'Kick-off', bodyText: 'See you Monday' };
+  const page = loadMail({ gateLeaving: true, composerHasContent: true, me: ME, composerSnapshot: SNAP });
+  const event = page.signOut();
+  assert.equal(event.prevented, false, 'the gate is already reloading — nothing here should hold that up with a confirmation');
+  assert.deepEqual(page.storedDraft(), { employeeId: ME, draft: SNAP });
+});
+
+test('signing out with nothing worth saving leaves nothing behind', () => {
+  const page = loadMail({ gateLeaving: true, composerHasContent: false });
+  page.signOut();
+  assert.equal(page.storedDraft(), null);
+});
+
+test('signing back in as the same person restores the draft, opening the composer with it', () => {
+  const SNAP = { mode: 'new', connectionId: STUDIO, threadId: null, messageId: null, to: ['ana@x.example'], cc: [], bcc: [], subject: 'Kick-off', bodyText: 'See you Monday' };
+  const page = loadMail({ me: ME, storedItems: { 'veyago.mail.draft': JSON.stringify({ employeeId: ME, draft: SNAP }) } });
+  page.signIn();
+  assert.equal(page.openedWith.length, 1);
+  assert.equal(page.openedWith[0].connectionId, STUDIO);
+  assert.equal(page.openedWith[0].subject, 'Kick-off');
+  assert.equal(page.storedDraft(), null, 'consumed — read once, not restored again on the next load');
+  assert.deepEqual(page.toasts, ['Picked up an unfinished message from before you signed out.']);
+});
+
+test('a different person signing in never sees a stranger\'s saved draft, and it is not left waiting for its owner either', () => {
+  const page = loadMail({
+    me: 'a0000000-0000-4000-8000-000000000099',
+    storedItems: { 'veyago.mail.draft': JSON.stringify({ employeeId: ME, draft: { mode: 'new', connectionId: STUDIO, to: [], cc: [], bcc: [], subject: '', bodyText: 'private' } }) }
+  });
+  page.signIn();
+  assert.equal(page.openedWith.length, 0);
+  assert.equal(page.storedDraft(), null, 'consumed rather than left on a shared computer indefinitely, waiting for a sign-in that may never come');
+});
+
+test('a saved draft with no mailbox to send it from is not restored, and says so rather than failing silently', () => {
+  const page = loadMail({
+    me: ME, boxes: [],
+    storedItems: { 'veyago.mail.draft': JSON.stringify({ employeeId: ME, draft: { mode: 'new', connectionId: STUDIO, to: [], cc: [], bcc: [], subject: '', bodyText: 'x' } }) }
+  });
+  page.signIn();
+  assert.equal(page.openedWith.length, 0);
+  assert.match(page.toasts[0], /could not be restored/);
+});
+
+test('nothing is restored while a draft is already open', () => {
+  const page = loadMail({
+    me: ME, composerOpen: true,
+    storedItems: { 'veyago.mail.draft': JSON.stringify({ employeeId: ME, draft: { mode: 'new', connectionId: STUDIO, to: [], cc: [], bcc: [], subject: '', bodyText: 'x' } }) }
+  });
+  page.signIn();
+  assert.equal(page.openedWith.length, 0);
 });
 
 /* ── Focus kept through a redraw (finding 9) ─────────────────────────────
@@ -1220,8 +1525,11 @@ test('a mailto: link with no address at all opens nothing', () => {
    searches; mail's own listener, added in front of it on the capture phase,
    is what is tested here — not that shared handler itself. */
 
-test('typing in mail\'s own search does not redraw until the typing pauses, and does not touch the other query keys', () => {
-  const page = loadMail({ threads: [mthread({ subject: 'Launch plan' }), mthread({ id: T2, subject: 'Something else' })] });
+test('typing in mail\'s own search does not redraw until the typing pauses, then asks the database rather than narrowing the loaded list', () => {
+  const page = loadMail({
+    threads: [mthread({ subject: 'Launch plan' }), mthread({ id: T2, subject: 'Something else' })],
+    searchMailAnswer: () => ({ state: 'ready', results: [] })
+  });
   const before = page.renders();
   const input = mtarget({ matches: ['[data-query="mail"]'] });
   input.value = 'launch';
@@ -1231,9 +1539,54 @@ test('typing in mail\'s own search does not redraw until the typing pauses, and 
   assert.equal(page.renders(), before, 'no redraw yet');
   page.fire(200);
   assert.equal(page.renders(), before + 1, 'exactly one, once the debounce elapses');
+  assert.deepEqual(page.searchMailCalls, ['launch'], 'search_mail spans the whole mailbox, not just what mailThreads() loaded');
   const html = page.view();
-  assert.match(html, /Launch plan/);
-  assert.doesNotMatch(html, /Something else/);
+  assert.match(html, /Search results/, 'search replaces the plain folder list rather than narrowing it — the loaded window could not have found an older match anyway');
+});
+
+/* ── A word search across the whole mailbox, not just the loaded page
+   (finding 1) ────────────────────────────────────────────────────────── */
+
+test('a search still loading, or that failed, says so — never a silently empty list', () => {
+  const loading = loadMail({ query: 'kickoff', searchMailAnswer: () => ({ state: 'loading', results: [] }) });
+  assert.match(loading.view(), /Searching…/);
+
+  const failed = loadMail({ query: 'kickoff', searchMailAnswer: () => ({ state: 'failed', results: [] }) });
+  const html = failed.view();
+  assert.match(html, /The search did not run\./);
+  assert.match(html, /data-mail-search-retry/);
+});
+
+test('a search hit for a thread the loaded list already has shows its real sender, and opens it', () => {
+  const HIT = { threadId: T1, mailboxId: STUDIO, subject: 'Kickoff notes', preview: 'See attached', time: 'Sep 1' };
+  const page = loadMail({
+    query: 'kickoff',
+    threads: [mthread({ id: T1, sender: 'Ana Lima', unread: true })],
+    searchMailAnswer: () => ({ state: 'ready', results: [HIT] })
+  });
+  const html = page.view();
+  assert.match(html, /Ana Lima/, 'the known thread\'s own sender, not "Unknown sender"');
+  const hit = page.byId(`mail-thread-${T1}`);
+  assert.ok(hit);
+  page.click(hit);
+  assert.deepEqual(page.navigated, [`mail/all/inbox/${T1}`]);
+});
+
+test('a search hit for a thread outside the loaded window still opens, without guessing its read or starred state', () => {
+  const OUTSIDE = 'd0000000-0000-4000-8000-000000000099';
+  const HIT = { threadId: OUTSIDE, mailboxId: STUDIO, subject: 'Old renewal', preview: 'See attached', time: 'Sep 1' };
+  const page = loadMail({
+    query: 'renewal',
+    threads: [],
+    route: ['mail', 'all', 'inbox', OUTSIDE],
+    searchMailAnswer: () => ({ state: 'ready', results: [HIT] }),
+    bodies: () => [{ id: 'm1', body: 'hi', outbound: false, sender: 'Old Client', initial: 'O', date: 'Today', time: '09:00', to: [], cc: [] }]
+  });
+  const html = page.view();
+  assert.match(html, /Old renewal/, 'the reader opens it — subject and mailbox from the hit itself');
+  assert.doesNotMatch(html, /data-mail-star=/, 'starring is withheld: the true starred state is not something a search hit carries');
+  assert.doesNotMatch(html, /data-mail-unread=/, 'so is mark-as-unread, for the same reason');
+  assert.match(html, /data-mail-answer="reply"/, 'replying only needs the id, which this does have');
 });
 
 test('a failed mailbox list says so, rather than reading as no mailboxes connected', async () => {
