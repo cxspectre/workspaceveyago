@@ -234,6 +234,36 @@ test('a search failure is said in words', async () => {
     { message: 'Could not search mail: permission denied for function search_mail' });
 });
 
+/* ── Agenda search (0064) ─────────────────────────────────────────────── */
+
+test('searchEvents reaches the database for a past meeting or a far-off event, and skips a blank query entirely', async () => {
+  const q = load((name, args) => (name === 'search_events'
+    ? {
+      data: [{
+        id: 'e9', title: 'Northline retro', detail: null, location: 'Lisbon',
+        starts_at: '2026-06-01T14:00:00Z', ends_at: '2026-06-01T14:30:00Z', all_day: false, kind: 'client'
+      }],
+      error: null
+    }
+    : { data: null, error: { message: 'unexpected rpc ' + name } }));
+
+  assert.deepEqual([...(await q.data.searchEvents('   '))], [], 'blank (or whitespace-only) is not a search');
+  assert.equal(q.calls.length, 0, 'nothing was asked for it');
+
+  const [hit] = await q.data.searchEvents('retro');
+  assert.deepEqual(q.calls[0], { name: 'search_events', args: { p_query: 'retro', p_limit: 20 } });
+  assert.equal(hit.id, 'e9');
+  assert.equal(hit.title, 'Northline retro');
+  assert.equal(hit.detail, 'Lisbon', 'falls back to the location the same way every other agenda event does');
+  assert.match(hit.when, / · \d\d:\d\d$/, 'shaped by agendaEvent, the same as any other event this file returns');
+});
+
+test('a search failure is said in words', async () => {
+  const q = load(() => ({ data: null, error: { message: 'permission denied for function search_events' } }));
+  await assert.rejects(q.data.searchEvents('retro'),
+    { message: 'Could not search events: permission denied for function search_events' });
+});
+
 /* ── Tickets ──────────────────────────────────────────────────────────── */
 
 /* The list embeds only enough of each message to know whether the

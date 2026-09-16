@@ -920,6 +920,21 @@
       });
     },
 
+    /* A past meeting, or a plain event weeks outside the weeks loaded, found
+       by a word in its title, detail or location — a word search_events
+       (0064) finds, the same way search_mail (0055) already finds one in
+       mail. A blank query is not asked at all, the same guard searchMail
+       uses. Shaped by agendaEvent, same as every other event this file
+       returns, so shell-model.js's search can treat it exactly like one from
+       the weeks loaded or from upcomingProjectEvents. */
+    async searchEvents(q) {
+      var query = String(q || '').trim();
+      if (!query) return [];
+      var res = await sb().rpc('search_events', { p_query: query, p_limit: 20 });
+      if (res.error) throw new Error('Could not search events: ' + res.error.message);
+      return (res.data || []).map(agendaEvent);
+    },
+
     /* Every calendar connection the agenda may show or act on: the studio's
        and this person's own (0044's rule, the same integration_status view
        mailboxes() reads, filtered to the other provider). What the agenda

@@ -53,10 +53,14 @@ const shellModel = (function () {
       [co.name, co.domain].join(' '), 'crm/companies/' + co.id)));
     (s.team || []).forEach(m => items.push(entry('Person', m.name, m.role,
       [m.name, m.role].join(' '), 'company/people/' + m.id)));
-    /* An event, found with the day it is on: the weeks loaded and the project
-       meetings coming up, which reach beyond them — each once. */
+    /* An event, found with the day it is on: the weeks loaded, the project
+       meetings that reach beyond them, and — once a query has actually gone
+       to the database (queries.js searchEvents, 0064) — a past meeting or a
+       plain event weeks away in either direction, which neither of those two
+       ever holds, being both just windows in time. Each counted once: the
+       database can easily re-find something already loaded. */
     const seenEvents = new Set();
-    [...(s.events || []), ...(s.projectEvents || [])].forEach(e => {
+    [...(s.events || []), ...(s.projectEvents || []), ...(s.searchedEvents || [])].forEach(e => {
       const key = text(e && e.id).toLowerCase();
       if (!key || seenEvents.has(key)) return;
       seenEvents.add(key);

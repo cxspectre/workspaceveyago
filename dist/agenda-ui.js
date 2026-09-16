@@ -750,7 +750,13 @@
       workspaceActions.syncCalendar(id)
         .then(result => {
           const n = result && typeof result.events === 'number' ? result.events : null;
-          toast(n === null ? 'Synced.' : `Synced: ${n} event${n === 1 ? '' : 's'}.`);
+          const synced = n === null ? 'Synced.' : `Synced: ${n} event${n === 1 ? '' : 's'}.`;
+          /* An event Outlook no longer has, that the sync used to leave on the
+             agenda forever, is now cancelled here too (0064) — said, not just
+             done silently, so a sync that quietly cleared a dozen stale
+             meetings is not mistaken for one that did nothing. */
+          const removed = result && typeof result.cancelled === 'number' ? result.cancelled : 0;
+          toast(removed > 0 ? `${synced} ${removed} no longer in Outlook.` : synced);
           /* calendars for its fresh last-synced time, events for anything new —
              not the whole workspace: the audit's own "every save reloads the
              whole workspace" applies here too. */
