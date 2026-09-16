@@ -189,12 +189,78 @@ test('search is handed the project meetings coming up, beside the weeks loaded',
   });
   /* As on a page, where window is the global the scripts share. */
   context.window = context;
-  vm.runInContext(take('function searchSources(){'), context);
+  vm.runInContext(['let searchedEvents=', 'function searchSources(){'].map(take).join('\n'), context);
   const handed = vm.runInContext('searchSources()', context);
   assert.deepEqual([...handed.projectEvents].map(e => e.id), ['pm9']);
   assert.deepEqual([...handed.events].map(e => e.id), ['standup']);
+  assert.deepEqual([...handed.searchedEvents], [], 'nothing asked for yet');
   delete context.workspaceStore;
   assert.deepEqual([...vm.runInContext('searchSources()', context).projectEvents], [], 'before the store is on the page, none');
+});
+
+/* app.js's own searchEventsForBox(): the database half of global search
+   (0064's search_events), asked only once typing settles and only for a
+   query still current when the answer lands. */
+function loadSearchEvents({ searchEvents = null } = {}) {
+  const timers = [];
+  const asked = [];
+  const context = vm.createContext({
+    setTimeout: (fn, ms) => { timers.push({ fn, ms, cleared: false, fired: false }); return timers.length - 1; },
+    clearTimeout: id => { if (timers[id]) timers[id].cleared = true; },
+    showResults: () => {},
+    workspaceData: searchEvents ? { searchEvents: q => { asked.push(q); return searchEvents(q); } } : undefined
+  });
+  context.window = context;
+  vm.runInContext(['let searchedEvents=', 'const GLOBAL_SEARCH_DEBOUNCE_MS=', 'function searchEventsForBox(q){'].map(take).join('\n'), context);
+  return {
+    call: q => vm.runInContext(`searchEventsForBox(${JSON.stringify(q)})`, context),
+    fire: () => timers.filter(t => !t.cleared && !t.fired).forEach(t => { t.fired = true; t.fn(); }),
+    searchedEvents: () => vm.runInContext('searchedEvents', context),
+    asked
+  };
+}
+
+test('a query asks the database only once typing settles, and a slow answer superseded by a newer query is dropped', async () => {
+  let resolveFirst;
+  const h = loadSearchEvents({
+    searchEvents: q => (q === 'first' ? new Promise(resolve => { resolveFirst = resolve; }) : Promise.resolve([{ id: 'e1' }]))
+  });
+  h.call('first');
+  h.fire();
+  h.call('second');
+  h.fire();
+  await Promise.resolve(); await Promise.resolve();
+  assert.deepEqual(h.asked, ['first', 'second']);
+  assert.deepEqual([...h.searchedEvents()].map(e => e.id), ['e1'], '"second" already answered');
+  resolveFirst([{ id: 'stale' }]);
+  await Promise.resolve(); await Promise.resolve();
+  assert.deepEqual([...h.searchedEvents()].map(e => e.id), ['e1'], 'the late, superseded answer for "first" never overwrites "second"\'s');
+});
+
+test('typing again before the debounce elapses never asks the database for what was typed first', () => {
+  const h = loadSearchEvents({ searchEvents: () => Promise.resolve([]) });
+  h.call('fir');
+  h.call('first');
+  h.fire();
+  assert.deepEqual(h.asked, ['first'], 'the debounce timer for "fir" was cleared before it ever fired');
+});
+
+test('a blank query asks nothing, and clears whatever the last query found — without waiting for a debounce that will never fire', async () => {
+  const h = loadSearchEvents({ searchEvents: () => Promise.resolve([{ id: 'e1' }]) });
+  h.call('retro');
+  h.fire();
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(h.searchedEvents().length, 1);
+  h.call('');
+  assert.deepEqual([...h.searchedEvents()], []);
+  assert.deepEqual(h.asked, ['retro']);
+});
+
+test('no workspaceData.searchEvents (a store from before 0064) asks nothing and throws nothing', () => {
+  const h = loadSearchEvents();
+  assert.doesNotThrow(() => h.call('retro'));
+  assert.doesNotThrow(() => h.fire());
+  assert.deepEqual(h.asked, []);
 });
 
 /* ── A project page ───────────────────────────────────────────────────── */

@@ -999,6 +999,16 @@ test('Sync now asks for that connection, then refreshes the calendars and events
   assert.match(h.toasts.at(-1), /Synced: 2 events/);
 });
 
+test('Sync now says how many no longer in Outlook were removed here too (0064), and says nothing extra when none were', async () => {
+  const h = load({
+    calendars: [{ id: 'conn-1', label: 'hello@veyago.cloud', employeeId: null, live: true }],
+    syncCalendar: async () => ({ ok: true, events: 12, skipped: 0, cancelled: 3 })
+  });
+  h.click(target('data-agenda-calendar-sync', 'conn-1'));
+  await settle();
+  assert.match(h.toasts.at(-1), /Synced: 12 events\.\s*3 no longer in Outlook\./);
+});
+
 test('Sync now says why a sync could not be started, in the function\'s own words', async () => {
   const h = load({
     calendars: [{ id: 'conn-1', label: 'hello@veyago.cloud', employeeId: null, live: true }],

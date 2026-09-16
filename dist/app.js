@@ -290,10 +290,20 @@ window.addEventListener('hashchange',()=>navigate(location.hash.slice(1)));
    well as records — best matches first, twelve at a time, and usable with the
    arrow keys (shell-model.js). */
 const search=document.querySelector('#search'),results=document.querySelector('#search-results');
-function searchSources(){return {navs:overviewModel.visibleNavs(navs,isManagerNow()),tickets,projects,contacts,companies:(window.workspaceStore&&workspaceStore.state.companies)||[],team,events,projectEvents:(window.workspaceStore&&workspaceStore.state.projectEvents)||[],invoices:shapedInvoices(),invoiceMatches:financeModel.matchesQuery,mails,notes:recordNotes,mailRoute:m=>mailModel.mailRoute({mailbox:mailModel.ALL,folder:mailModel.folderForThread(m,'inbox'),threadId:m.id})};}
+function searchSources(){return {navs:overviewModel.visibleNavs(navs,isManagerNow()),tickets,projects,contacts,companies:(window.workspaceStore&&workspaceStore.state.companies)||[],team,events,projectEvents:(window.workspaceStore&&workspaceStore.state.projectEvents)||[],invoices:shapedInvoices(),invoiceMatches:financeModel.matchesQuery,mails,notes:recordNotes,mailRoute:m=>mailModel.mailRoute({mailbox:mailModel.ALL,folder:mailModel.folderForThread(m,'inbox'),threadId:m.id}),searchedEvents};}
 function showResults(){const q=search.value.trim();results.hidden=!q;if(!q)return;const found=shellModel.search(shellModel.searchItems(searchSources()),q);results.innerHTML=found.results.map(x=>`<button type="button" data-nav="${esc(x.route)}">${esc(x.label)}<small>${esc(x.type)}${x.detail?' · '+esc(x.detail):''}</small></button>`).join('')+(found.more?`<p class="search-more">${overviewModel.plural(found.more,'more match','more matches')} — keep typing to narrow it down.</p>`:'')||'<div class="empty-state">No matching records.</div>';}
 function moveInResults(e){const buttons=[...results.querySelectorAll('button[data-nav]')];if(!buttons.length||results.hidden)return;e.preventDefault();const next=shellModel.nextFocus(buttons.indexOf(document.activeElement),e.key,buttons.length);if(next===-1)search.focus();else buttons[next].focus();}
-search.addEventListener('input',showResults);
+/* A past meeting, or an event weeks away with no project, is not in any array
+   already loaded — search_events (0064) asks the database instead, once
+   typing settles. globalSearchSeq answers a slow request arriving after a
+   newer query already has: dropped, since the box must show what it is
+   currently asked, never an older answer landing late. Cleared, not left as
+   it was, the moment the query changes at all — the loaded-only results are
+   still correct on their own; a previous query's events are not. */
+let searchedEvents=[],globalSearchDebounce=null,globalSearchSeq=0;
+const GLOBAL_SEARCH_DEBOUNCE_MS=200;
+function searchEventsForBox(q){clearTimeout(globalSearchDebounce);const seq=++globalSearchSeq;if(searchedEvents.length){searchedEvents=[];showResults();}if(!q||typeof window.workspaceData==='undefined'||typeof workspaceData.searchEvents!=='function')return;globalSearchDebounce=setTimeout(()=>{workspaceData.searchEvents(q).then(rows=>{if(seq!==globalSearchSeq)return;searchedEvents=rows||[];showResults();}).catch(()=>{});},GLOBAL_SEARCH_DEBOUNCE_MS);}
+search.addEventListener('input',()=>{showResults();searchEventsForBox(search.value.trim());});
 search.addEventListener('keydown',e=>{if(e.key==='ArrowDown'||e.key==='ArrowUp')moveInResults(e);});
 results.addEventListener('keydown',e=>{if(['ArrowDown','ArrowUp','Home','End'].includes(e.key))moveInResults(e);if(e.key==='Escape'){e.preventDefault();e.stopPropagation();results.hidden=true;search.focus();}});
 /* Picking a result puts focus back in the box before the page changes: a new

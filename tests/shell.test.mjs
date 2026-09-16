@@ -57,6 +57,18 @@ test('an event is found with the day it is on, and a project meeting beyond the 
     'one with no day given keeps its time');
 });
 
+test('a database search for a past meeting or a far-off event (searchEvents, 0064) is found too, and not doubled up with what is already loaded', () => {
+  const withSearch = { ...sources, searchedEvents: [
+    { id: 'past1', title: 'Old kickoff', detail: 'Zoom', time: '10:00', when: 'Mon 12 Jan · 10:00' },
+    /* The database can easily re-find something already loaded (sources.events
+       has 'e1' under the same title) — it must not show up twice. */
+    { id: 'e1', title: 'Northline kickoff', detail: 'Zoom', time: '10:00', when: 'Thu 17 Sep · 10:00' }
+  ] };
+  const events = model.search(model.searchItems(withSearch), 'kickoff').results.filter(r => r.type === 'Event');
+  assert.equal(events.length, 2, 'the loaded one and the one only the database knew about — not three');
+  assert.deepEqual([...events.map(r => r.route)], ['agenda/e1', 'agenda/past1']);
+});
+
 test('a company opens its own page, whoever works there', () => {
   assert.ok(found('northline').includes('Company:crm/companies/co1'));
   assert.deepEqual([...found('quiet')], ['Company:crm/companies/co2']);
