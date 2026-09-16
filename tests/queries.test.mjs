@@ -234,6 +234,66 @@ test('a search failure is said in words', async () => {
     { message: 'Could not search mail: permission denied for function search_mail' });
 });
 
+/* ── A contact's or a company's linked mail (mail_threads.contact_id/
+   company_id, read straight off the table rather than mailThreads()'s own
+   per-folder working window) ─────────────────────────────────────────── */
+
+test('a contact\'s linked mail is asked by their id, newest first, with one more asked for than shown', async () => {
+  /* A vm-sandboxed array/object has the same shape as a plain literal here but
+     is not reference-equal to it, which deepEqual (deepStrictEqual) tells
+     apart even though nothing about the two actually differs. */
+  const plain = value => JSON.parse(JSON.stringify(value));
+  const C1 = 'c1000000-0000-4000-8000-000000000001';
+  const rows = [
+    { id: 't1', subject: 'Kickoff', folder: 'inbox', is_read: false, is_starred: true,
+      last_message_at: '2026-09-10T09:00:00Z', other_party_name: 'Ana Lima', other_party_email: 'ana@northline.example',
+      contact_id: C1, company_id: null },
+    { id: 't2', subject: null, folder: 'archive', is_read: true, is_starred: false,
+      last_message_at: '2026-08-01T09:00:00Z', other_party_name: null, other_party_email: 'ana@northline.example',
+      contact_id: C1, company_id: null }
+  ];
+  const { data, queries } = loadTables(table => (table === 'mail_threads' ? rows : []));
+  const { threads, more } = await data.mailThreadsFor({ contactId: C1 });
+  assert.deepEqual(queries[0].calls.find(([method]) => method === 'or'), ['or', `contact_id.eq.${C1}`]);
+  assert.deepEqual(plain(queries[0].calls.filter(([method]) => method === 'order').map(c => c.slice(1))),
+    [['last_message_at', { ascending: false, nullsFirst: false }], ['id', { ascending: false }]]);
+  assert.equal(more, false);
+  assert.deepEqual(threads.map(t => t.id), ['t1', 't2']);
+  assert.equal(threads[0].sender, 'Ana Lima');
+  assert.equal(threads[0].folder, 'inbox');
+  assert.equal(threads[0].starred, true);
+  assert.equal(threads[0].unread, true);
+  assert.equal(threads[1].subject, '(no subject)', 'no subject on record');
+  assert.equal(threads[1].sender, 'ana@northline.example', 'no name known, the address stands in');
+});
+
+test('a company\'s linked mail is asked by its own id, and with neither id nothing is', async () => {
+  const plain = value => JSON.parse(JSON.stringify(value));
+  const CO = 'b1000000-0000-4000-8000-000000000001';
+  const { data, queries } = loadTables(() => []);
+  await data.mailThreadsFor({ companyId: CO });
+  assert.deepEqual(queries[0].calls.find(([method]) => method === 'or'), ['or', `company_id.eq.${CO}`]);
+  const none = loadTables(() => { throw new Error('nothing should be asked with no id'); });
+  assert.deepEqual(plain(await none.data.mailThreadsFor({})), { threads: [], more: false });
+  assert.equal(none.queries.length, 0, 'no id that is a uuid, no request');
+});
+
+test('linked mail says there is more past its own limit (20 unless given), and a limit given is capped at 100', async () => {
+  const C1 = 'c1000000-0000-4000-8000-000000000001';
+  const rows = Array.from({ length: 21 }, (_, i) => ({
+    id: `t${i}`, subject: `Thread ${i}`, folder: 'inbox', is_read: true, is_starred: false,
+    last_message_at: '2026-09-10T09:00:00Z', other_party_name: 'Ana Lima', other_party_email: 'ana@northline.example',
+    contact_id: C1, company_id: null
+  }));
+  const { data, queries } = loadTables(table => (table === 'mail_threads' ? rows : []));
+  const { threads, more } = await data.mailThreadsFor({ contactId: C1 });
+  assert.equal(threads.length, 20);
+  assert.equal(more, true);
+  assert.deepEqual(queries[0].calls.find(([method]) => method === 'limit'), ['limit', 21], 'one more than shown, to know');
+  await data.mailThreadsFor({ contactId: C1, limit: 500 });
+  assert.deepEqual(queries[1].calls.find(([method]) => method === 'limit'), ['limit', 101], 'at most 100 shown, and one more asked for');
+});
+
 /* ── Tickets ──────────────────────────────────────────────────────────── */
 
 /* The list embeds only enough of each message to know whether the
@@ -271,6 +331,21 @@ test('the list asks for enough to know a ticket changed, never a message\'s word
   assert.equal(t.lastMessageAt, '2026-09-10T10:00:00Z');
   assert.equal(t.deliveryFailed, true, 'the latest outbound message never delivered');
   assert.equal(t.mergedIntoId, null);
+});
+
+test('a ticket carries its company\'s client number, when it is filed under one that has reached that stage', async () => {
+  const { data, queries } = loadTables(table => (table !== 'support_tickets' ? [] : [{
+    id: 'u144', number: 144, subject: 'Renewal', product: null, priority: 'normal', status: 'open',
+    created_at: '2026-09-10T09:00:00Z', contact: null, company: { name: 'Northline', client_number: 42 }, assignee: null, ticket_messages: []
+  }, {
+    id: 'u145', number: 145, subject: 'A lead\'s question', product: null, priority: 'normal', status: 'open',
+    created_at: '2026-09-10T09:00:00Z', contact: null, company: { name: 'Early Talks', client_number: null }, assignee: null, ticket_messages: []
+  }]));
+  const [numbered, unnumbered] = await data.tickets();
+  const select = queries[0].calls.find(([method]) => method === 'select')[1];
+  assert.ok(select.includes('client_number'), 'the query asks for it on the same embed');
+  assert.equal(numbered.row.company.client_number, 42);
+  assert.equal(unnumbered.row.company.client_number, null, 'a company not yet a client has none');
 });
 
 test('a fallback address stands in for the client and the reply-to address when there is no CRM contact', async () => {
@@ -762,6 +837,22 @@ test('an invoice arrives with when it last changed, its tax and its lines, oldes
   assert.ok(queries[0].calls.some(call => call[0] === 'order' && call[1] === 'sort_order'
     && call[2] && call[2].foreignTable === 'finance_invoice_lines' && call[2].ascending === true),
     'lines come back in the order the invoice lists them, not however finance_invoice_lines happens to be stored');
+});
+
+test('an invoice carries its company\'s client number, when finance_invoices.company_id (0051) leads to one', async () => {
+  const { data, queries } = loadTables(table => (table !== 'finance_invoices' ? [] : [{
+    id: 'inv-3', number: 'INV-1044', client: 'Northline', amount: 400, currency: 'USD', status: 'sent',
+    company_id: 'co1', company: { client_number: 7 }
+  }, {
+    id: 'inv-4', number: 'INV-1045', client: 'Nobody in particular', amount: 40, currency: 'USD', status: 'draft',
+    company_id: null, company: null
+  }]));
+  const [linked, unlinked] = await data.invoices();
+  const select = queries[0].calls.find(([method]) => method === 'select')[1];
+  assert.ok(select.includes('company_id'), 'the query asks for company_id');
+  assert.ok(select.includes('client_number'), 'and the company it leads to');
+  assert.equal(linked.row.company.client_number, 7);
+  assert.equal(unlinked.row.company, null, 'no company linked, nothing to quote');
 });
 
 test('every invoice loads, past the thousand rows the API hands back at once', async () => {

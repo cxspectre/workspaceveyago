@@ -587,6 +587,24 @@
         'The company was not saved: it has been removed from the CRM, or you may not change it.')[0];
     },
 
+    /* Soft delete: owners and admins only, and the database enforces the same
+       rule whichever way a company's deleted_at is changed (guard_soft_delete,
+       0012, wired to crm_companies by 0021) — this check just fails fast with
+       a sentence a person can read, the way archiveProject's own check does.
+       .is('deleted_at', null) makes a company already removed a refusal
+       rather than a silent no-op. Its people and its work stay exactly where
+       they are: a contact still names it (crm_contacts.company_id is left
+       alone), but the next load of `companies` leaves it out, so every page
+       reads them as having no company any more — the same as a company a
+       contact's own row never had. */
+    async deleteCompany(companyId) {
+      must(window.workspaceSession.isManager && window.workspaceSession.isManager(),
+        'Only an owner or admin can remove a company from the CRM.');
+      touched(await sb().from('crm_companies')
+        .update({ deleted_at: new Date().toISOString() }).eq('id', companyId).is('deleted_at', null).select('id'),
+        'remove the company', 'The company was not removed: it has been removed already, or only an owner or admin can remove one.');
+    },
+
     async createContact(fields) {
       must(fields && fields.fullName && fields.fullName.trim(), 'A contact needs a name.');
       var res = await sb().from('crm_contacts').insert({
@@ -647,6 +665,21 @@
       must(changes && Object.keys(changes).length, 'Nothing to save.');
       return touched(await sb().from('crm_contacts').update(changes).eq('id', contactId).is('deleted_at', null).select(), 'save the contact',
         'The contact was not saved: they have been removed from the CRM, or you may not change them.')[0];
+    },
+
+    /* Soft delete, the same rule and the same reasoning as deleteCompany
+       above: owners and admins only, enforced again by guard_soft_delete
+       whichever way this is called. A project they are on, a ticket filed
+       under them or mail matched to them all keep pointing at their row —
+       only the next load of `contacts` leaves them off every list, so the
+       rest of the workspace reads them the way it already reads any contact
+       it cannot find by id. */
+    async deleteContact(contactId) {
+      must(window.workspaceSession.isManager && window.workspaceSession.isManager(),
+        'Only an owner or admin can remove a contact from the CRM.');
+      touched(await sb().from('crm_contacts')
+        .update({ deleted_at: new Date().toISOString() }).eq('id', contactId).is('deleted_at', null).select('id'),
+        'remove the contact', 'The contact was not removed: it has been removed already, or only an owner or admin can remove one.');
     },
 
     /* Turn a /websites/ enquiry into a company + contact. Safe to call twice:

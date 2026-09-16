@@ -503,6 +503,77 @@ const crmUi = (function () {
       + (start ? pastPanel(key, { ...filter, limit: PAST_SHOWN, before: start.toISOString() }, shown, fileUnder) : '');
   }
 
+  /* ── A record's linked mail ─────────────────────────────────────────────
+     Mail links to the CRM by itself, so far (0025's own address match;
+     0059's domain fallback) — there is still no "link this thread" or "add
+     sender to the CRM" affordance, and old threads are never back-filled;
+     both are bigger, separate pieces, left undone here. What this adds is
+     narrower: mail_threads already carries contact_id/company_id, and
+     nothing on either page read it straight — a contact's own "Conversations"
+     panel only ever knew what was already loaded for the Mail view, which
+     keeps a working window of a few hundred a folder (queries.mailThreads),
+     not everything ever linked. queries.mailThreadsFor(filter) asks
+     mail_threads directly, by contact_id or company_id; this asks for it once
+     a page opens and keeps it by `key` ('contact:<id>' / 'company:<id>'), the
+     way a client's past meetings are kept, but locally — this is the only
+     place that asks, so there is nothing here for data/store.js to share. */
+  const linkedMailState = new Map();
+
+  function askLinkedMail(key, filter) {
+    const cached = linkedMailState.get(key);
+    if (cached) return cached;
+    const loading = { status: 'loading', threads: null, more: false };
+    linkedMailState.set(key, loading);
+    const done = () => { if (typeof repaintKeepingFocus === 'function') repaintKeepingFocus(); else if (typeof render === 'function') render(); };
+    Promise.resolve()
+      .then(() => window.workspaceData.mailThreadsFor(filter))
+      .then(result => { linkedMailState.set(key, { status: 'ready', threads: result.threads || [], more: Boolean(result.more) }); done(); },
+        err => {
+          console.error('[workspace] linked mail did not load:', err);
+          linkedMailState.set(key, { status: 'failed', threads: null, more: false });
+          done();
+        });
+    return loading;
+  }
+
+  const linkedMailSection = body => `<section class="panel content-panel related-panel"><h2 id="linked-mail" tabindex="-1">Linked mail</h2>${body}</section>`;
+  const mailThreadItems = threads => threads.map(t =>
+    [mailModel.mailRoute({ mailbox: mailModel.ALL, folder: mailModel.folderForThread(t, 'inbox'), threadId: t.id }), t.subject, t.time, 'mail']);
+
+  /* `exclude` leaves out a thread already listed elsewhere on the page — a
+     contact's own "Conversations & invoices" panel, built from whatever mail
+     is already loaded — so nothing linked shows twice. A company's page has
+     nothing else to exclude against, and passes none. */
+  function linkedMailPanel(key, filter, exclude) {
+    const asked = askLinkedMail(key, filter);
+    if (asked.status === 'loading') return linkedMailSection('<p class="quiet-text" role="status">Loading linked mail…</p>');
+    if (asked.status === 'failed') {
+      return linkedMailSection('<p class="quiet-text" role="status">Linked mail did not load. They are tried again by themselves.</p>'
+        + `<button type="button" class="btn" data-crm-mail-retry="${esc(key)}">Try again</button>`);
+    }
+    const shown = exclude && exclude.size ? asked.threads.filter(t => !exclude.has(String(t.id))) : asked.threads;
+    /* Empty two different ways: genuinely nothing linked, or everything found
+       is already listed above (a contact's own "Conversations" panel) — the
+       first is not true of the second, and saying it anyway would read as
+       this contact having no mail at all when they plainly do. */
+    const empty = asked.threads.length ? 'Already listed above.' : 'No linked mail yet.';
+    return linkedMailSection(shown.length ? meetingLinks(mailThreadItems(shown)) : `<p class="quiet-text">${esc(empty)}</p>`)
+      + (asked.more ? note('Older mail is not listed.') : '');
+  }
+
+  /* Linked mail that did not load, asked for again — the page redrawn without
+     the button, so the keyboard goes to the panel's own heading, the way a
+     client's past meetings already do this. */
+  document.addEventListener('click', e => {
+    const retry = e.target.closest && e.target.closest('[data-crm-mail-retry]');
+    if (!retry) return;
+    e.preventDefault();
+    linkedMailState.delete(retry.dataset.crmMailRetry);
+    if (typeof render === 'function') render();
+    const heading = document.getElementById('linked-mail');
+    if (heading && heading.focus) heading.focus();
+  });
+
   /* A company's page: its people, its projects and tickets, its meetings
      coming up and its past ones — filed under it, its projects or its people,
      by id — and the invoices sent to its people; its notes on a tab of their
@@ -517,6 +588,7 @@ const crmUi = (function () {
     const actions = (c.stageLabel ? pill(c.stageLabel) : '')
       + `<button class="btn" type="button" data-crm-new-contact="${id}">${icon('plus')}Add person</button>`
       + (isManagerNow() ? `<button class="btn" type="button" data-crm-merge-company="${id}">Merge…</button>` : '')
+      + (isManagerNow() ? `<button class="btn" type="button" data-crm-delete-company="${id}">Remove company</button>` : '')
       + `<button class="btn btn-primary" type="button" data-crm-edit-company="${id}">Edit company</button>`;
     /* Drawn only on the Overview tab: it asks for past meetings, which the notes tab does not show. */
     const overview = notes ? '' : `<section class="panel contact-summary">${avatar(c.name, null, 'contact-avatar')}<div><span class="eyebrow">${esc((c.kindLabel || 'Company').toUpperCase())}</span><h2>${esc(c.name)}</h2><p>${esc(c.domain || 'No domain on record')}</p></div></section>`
@@ -535,7 +607,8 @@ const crmUi = (function () {
       + (sent.shown
         ? linkedPanel('Invoices to its people', invoiceItems(sent.list || []))
           + note(sent.list ? 'Invoices are listed by the address they were sent to: one of its people\'s.' : 'Invoices did not load. They are tried again by themselves.')
-        : '');
+        : '')
+      + linkedMailPanel(`company:${c.id}`, { companyId: c.id });
     return detailHeader('crm/companies', 'All companies', c.name, [c.kindLabel, c.domain].filter(Boolean).join(' · ') || 'Company', actions)
       + subnav([[`crm/companies/${id}`, 'Overview', 'overview'], [`crm/companies/${id}/activity`, 'Activity & notes', 'activity']], notes ? 'activity' : 'overview')
       + `<div class="record-layout"><div class="record-main">${notes ? notesPanel('companies', c.id) : overview}</div><aside class="record-aside">`
@@ -595,10 +668,12 @@ const crmUi = (function () {
         ...invoiceItems(sent.list || [])
       ])
       + (mailLoaded ? '' : note('Conversations did not load. They are tried again by themselves.'))
-      + invoiceNote(person, sent);
+      + invoiceNote(person, sent)
+      + linkedMailPanel(`contact:${person.id}`, { contactId: person.id }, new Set(threads.map(m => String(m.id))));
     return detailHeader('crm/contacts', 'All contacts', person.name, person.companyName || 'No company',
       `<button class="btn" type="button" data-crm-edit-contact="${id}">Edit contact</button>`
       + (isManagerNow() ? `<button class="btn" type="button" data-crm-merge-contact="${id}">Merge…</button>` : '')
+      + (isManagerNow() ? `<button class="btn" type="button" data-crm-delete-contact="${id}">Remove contact</button>` : '')
       + (person.email ? `<button class="btn btn-primary" data-action="contact-email" data-id="${id}">${icon('mail')}Write email</button>` : ''))
       + subnav([[`crm/${id}`, 'Overview', 'overview'], [`crm/${id}/activity`, 'Activity & notes', 'activity']], notes ? 'activity' : 'overview')
       + `<div class="record-layout"><div class="record-main">${notes ? notesPanel('crm', person.id) : overview}</div><aside class="record-aside">`

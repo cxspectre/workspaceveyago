@@ -416,7 +416,12 @@
                   'first_response_at, resolved_at, first_response_due_at, resolve_due_at, ' +
                   'project_id, company_id, contact_id, assignee_id, merged_into_id, ' +
                   'requester_name, requester_email, ' +
-                  'contact:crm_contacts (full_name, email), company:crm_companies (name), ' +
+                  /* client_number (0053) rides along on the same embed the
+                     ticket already carries, so its page can quote it beside
+                     whichever company it is filed under — read straight off
+                     the row (tickets-ui.js's clientNumberOf), never through
+                     tickets-model.js, which knows nothing of it. */
+                  'contact:crm_contacts (full_name, email), company:crm_companies (name, client_number), ' +
                   'assignee:employees (full_name), ' +
                   /* Enough of each message to know whether the conversation
                      changed since it was last read — its id, direction and
@@ -690,6 +695,12 @@
           .from('finance_invoices')
           .select('id, number, client, client_email, amount, currency, status, issued_on, due_on, paid_on, notes, ' +
                   'updated_at, tax_rate, tax_amount, ' +
+                  /* company_id (0051, filled by a trigger from the client name
+                     or the invoice's project) and the client_number it leads
+                     to (0053) ride along on the row for finance-ui.js to read
+                     straight off .row.company — a company with no number yet,
+                     or no company at all, embeds as null and quotes nothing. */
+                  'company_id, company:crm_companies (client_number), ' +
                   'finance_invoice_lines (id, description, quantity, unit_amount, amount, sort_order)')
           .order('issued_on', { ascending: false, nullsFirst: false })
           .order('sort_order', { foreignTable: 'finance_invoice_lines', ascending: true })
@@ -880,6 +891,46 @@
           outbound: r.direction === 'outbound', row: r
         };
       });
+    },
+
+    /* A contact's or a company's linked conversations, straight off
+       mail_threads.contact_id/company_id (0025's own best-effort match on an
+       address; 0059 widens the company side to a sender's domain for inbound
+       mail no contact claims) — read here, not through mailThreads() above,
+       whose per-folder window (queries.js's own PER_FOLDER cap) only ever
+       holds a working set for the Mail view, so an older conversation, or one
+       filed away (0045), can be linked and still never show up there. This is
+       the only place that asks for it, so there is nothing here for
+       data/store.js to share — crm-ui.js keeps its own small cache, by key,
+       the way it already asks for a client's past meetings.
+       Newest first; one more asked for than `limit`, to say whether there are
+       more. Only a uuid goes into either filter; with neither, nothing is. */
+    async mailThreadsFor(filter) {
+      var f = filter || {};
+      var conditions = [];
+      if (uuids([f.contactId], 1).length) conditions.push('contact_id.eq.' + f.contactId);
+      if (uuids([f.companyId], 1).length) conditions.push('company_id.eq.' + f.companyId);
+      if (!conditions.length) return { threads: [], more: false };
+      var limit = Math.min(Math.max(Math.floor(Number(f.limit)) || 20, 1), 100);
+      var rows = unwrap(await sb()
+        .from('mail_threads')
+        .select('id, subject, folder, is_read, is_starred, last_message_at, other_party_name, other_party_email, contact_id, company_id')
+        .or(conditions.join(','))
+        .order('last_message_at', { ascending: false, nullsFirst: false })
+        .order('id', { ascending: false })
+        .limit(limit + 1), 'their mail');
+      return {
+        threads: rows.slice(0, limit).map(function (r) {
+          return {
+            id: r.id, subject: r.subject || '(no subject)',
+            sender: r.other_party_name || r.other_party_email || 'Unknown sender',
+            time: shortDate(r.last_message_at),
+            folder: r.folder, starred: r.is_starred, unread: !r.is_read,
+            contactId: r.contact_id, companyId: r.company_id, row: r
+          };
+        }),
+        more: rows.length > limit
+      };
     },
 
     /* What the mail switcher offers: the studio's mailboxes and this person's

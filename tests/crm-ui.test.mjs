@@ -58,11 +58,14 @@ function fakeClock() {
 function load({ route = ['crm'], query = '', contacts = [], companies = [], loaded = EVERYTHING,
   projects = [], projectContacts = [], tickets = [], invoices = [], mails = [], team = [], manager = true, overview = null,
   events = [], projectEvents = [], past = {}, notes = {}, viewer = null, drafts = null, workspaceLoaded = true,
-  refuse = null, clock = null, enquiries = null, enquiriesFail = false, promoteResult = 'new-contact-1', refusePromote = null } = {}) {
+  refuse = null, clock = null, enquiries = null, enquiriesFail = false, promoteResult = 'new-contact-1', refusePromote = null,
+  linkedMail = [], linkedMailMore = false, linkedMailFail = false } = {}) {
   /* What the page asked the store for past meetings, and asked again. */
   const pastAsked = [];
   const retried = [];
   const promoted = [];
+  /* What linkedMailPanel asked queries.mailThreadsFor for. */
+  const mailAsked = [];
   const navigated = [];
   const listeners = {};
   const toasts = [];
@@ -86,7 +89,13 @@ function load({ route = ['crm'], query = '', contacts = [], companies = [], load
     workspaceActivity: [],
     workspaceData: {
       initials: name => (String(name).trim()[0] || '?').toUpperCase(),
-      enquiries: () => (enquiriesFail ? Promise.reject(new Error('Could not load enquiries: timeout')) : Promise.resolve(enquiries || []))
+      enquiries: () => (enquiriesFail ? Promise.reject(new Error('Could not load enquiries: timeout')) : Promise.resolve(enquiries || [])),
+      mailThreadsFor: filter => {
+        mailAsked.push({ ...filter });
+        return linkedMailFail
+          ? Promise.reject(new Error('Could not load their mail: timeout'))
+          : Promise.resolve({ threads: linkedMail, more: linkedMailMore });
+      }
     },
     financeDay: () => TODAY,
     isManagerNow: () => manager,
@@ -166,7 +175,7 @@ function load({ route = ['crm'], query = '', contacts = [], companies = [], load
   };
   return {
     context, view: () => context.crmView(), pastAsked, retried, click, change, fire, dataTransfer,
-    focused, renders: () => renders, toasts, written, promoted, navigated
+    focused, renders: () => renders, toasts, written, promoted, navigated, mailAsked
   };
 }
 
@@ -1144,4 +1153,114 @@ test('whatever anyone typed into a company, a contact or a conversation stays te
     assert.doesNotMatch(html, MARKUP, route.join('/'));
     assert.ok(!isNotFound(html), route.join('/'));
   }
+});
+
+/* ── Removing a company or a contact from the CRM ────────────────────── */
+
+test('Remove company and Remove contact are offered to a manager, and hidden from staff', () => {
+  const northline = company('client', 100, 'USD', { id: U1, name: 'Northline' });
+  const ana = contact('Ana', 'ana@northline.example', northline, { id: U2 });
+  const lists = { companies: [northline], contacts: [ana] };
+  assert.match(load({ ...lists, route: ['crm', 'companies', U1] }).view(), new RegExp(`data-crm-delete-company="${U1}"`));
+  assert.doesNotMatch(load({ ...lists, route: ['crm', 'companies', U1], manager: false }).view(), /data-crm-delete-company/);
+  assert.match(load({ ...lists, route: ['crm', U2] }).view(), new RegExp(`data-crm-delete-contact="${U2}"`));
+  assert.doesNotMatch(load({ ...lists, route: ['crm', U2], manager: false }).view(), /data-crm-delete-contact/);
+});
+
+/* ── A record's linked mail (mail_threads.contact_id/company_id) ─────────
+   Beyond what a contact's own "Conversations" panel already shows from the
+   mail already loaded for the Mail view, this asks mail_threads directly, so
+   an older conversation, or one filed away, still shows on the page it is
+   linked to. */
+
+test('a company\'s page asks for its own linked mail, and lists it once it has loaded', async () => {
+  const northline = company('client', 100, 'USD', { id: U1, name: 'Northline' });
+  const h = load({
+    companies: [northline], route: ['crm', 'companies', U1],
+    linkedMail: [{ id: 'th1', subject: 'Kickoff', time: 'Sep 10', folder: 'inbox' }]
+  });
+  assert.match(section(h.view(), 'Linked mail'), /Loading linked mail…/);
+  await settle();
+  const page = h.view();
+  assert.match(page, /href="#mail\/all\/inbox\/th1"/);
+  assert.match(section(page, 'Linked mail'), /Kickoff/);
+  assert.deepEqual(h.mailAsked, [{ companyId: U1 }]);
+});
+
+test('a contact\'s page asks for its own linked mail by their id, leaving out one already shown in Conversations', async () => {
+  const olivia = contact('Olivia', 'olivia@northline.example');
+  const h = load({
+    contacts: [olivia], route: ['crm', olivia.id],
+    mails: [{ id: 'th1', subject: 'Already shown', contactId: olivia.id, email: '', time: '09:00', folder: 'inbox' }],
+    linkedMail: [
+      { id: 'th1', subject: 'Already shown', time: '09:00', folder: 'inbox' },
+      { id: 'th2', subject: 'Older, filed away', time: 'Aug 1', folder: 'archive' }
+    ]
+  });
+  h.view();
+  await settle();
+  const page = h.view();
+  assert.deepEqual(h.mailAsked, [{ contactId: olivia.id }]);
+  assert.equal((page.match(/Already shown/g) || []).length, 1, 'listed once, in Conversations, not repeated in Linked mail');
+  assert.match(section(page, 'Linked mail'), /Older, filed away/);
+  assert.match(page, /href="#mail\/all\/archive\/th2"/, 'opens in the folder it is actually filed under');
+});
+
+test('when everything found is already shown in Conversations, Linked mail says so — not that there is none', async () => {
+  const olivia = contact('Olivia', 'olivia@northline.example');
+  const h = load({
+    contacts: [olivia], route: ['crm', olivia.id],
+    mails: [{ id: 'th1', subject: 'Already shown', contactId: olivia.id, email: '', time: '09:00', folder: 'inbox' }],
+    linkedMail: [{ id: 'th1', subject: 'Already shown', time: '09:00', folder: 'inbox' }]
+  });
+  h.view();
+  await settle();
+  const page = h.view();
+  assert.match(section(page, 'Linked mail'), /Already listed above\./);
+  assert.doesNotMatch(section(page, 'Linked mail'), /No linked mail yet\./);
+});
+
+test('with nothing else linked, and with more than is shown, Linked mail says so', async () => {
+  const northline = company('client', 100, 'USD', { id: U1, name: 'Northline' });
+  const empty = load({ companies: [northline], route: ['crm', 'companies', U1], linkedMail: [] });
+  empty.view();
+  await settle();
+  assert.match(section(empty.view(), 'Linked mail'), /No linked mail yet\./);
+  const more = load({
+    companies: [northline], route: ['crm', 'companies', U1],
+    linkedMail: [{ id: 'th1', subject: 'One of many', time: 'Sep 1', folder: 'inbox' }], linkedMailMore: true
+  });
+  more.view();
+  await settle();
+  assert.match(more.view(), /Older mail is not listed\./);
+});
+
+test('linked mail that did not load can be asked for again, and the keyboard goes to its heading', async () => {
+  const northline = company('client', 100, 'USD', { id: U1, name: 'Northline' });
+  const h = load({ companies: [northline], route: ['crm', 'companies', U1], linkedMailFail: true });
+  h.view();
+  await settle();
+  assert.match(section(h.view(), 'Linked mail'), /Linked mail did not load\. They are tried again by themselves\./);
+  h.click({ 'data-crm-mail-retry': `company:${U1}` });
+  assert.deepEqual(h.focused, ['linked-mail'], 'the keyboard goes to the panel, the way a client\'s past meetings already do this');
+  /* The click clears the cache and calls render() — app.js's own render() redraws
+     the page itself, which is what actually asks again; this harness's render()
+     is only a counter, so the test redraws it the same way to see that. */
+  h.view();
+  await settle();
+  assert.match(section(h.view(), 'Linked mail'), /Linked mail did not load/, 'failing again says so again, rather than hanging on "Loading"');
+  assert.equal(h.mailAsked.length, 2, 'asked again, not just once');
+});
+
+test('what anyone typed into a linked thread\'s subject stays text', async () => {
+  const northline = company('client', 100, 'USD', { id: U1, name: 'Northline' });
+  const h = load({
+    companies: [northline], route: ['crm', 'companies', U1],
+    linkedMail: [{ id: 'th1', subject: TYPED, time: TYPED, folder: 'inbox' }]
+  });
+  h.view();
+  await settle();
+  const page = h.view();
+  assert.doesNotMatch(page, MARKUP);
+  assert.match(section(page, 'Linked mail'), /&lt;img src=x onerror=alert\(1\)&gt;/);
 });
