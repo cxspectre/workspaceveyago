@@ -71,6 +71,30 @@
     return projectsModel.CONTACT_ROLES.some(function (r) { return r.value === role; });
   }
 
+  /* Every status a task can be reopened to — everything but 'done' itself. */
+  var REOPEN_STATUSES = ['todo', 'in_progress', 'blocked'];
+
+  /* Text after a JSON parse, or null when it is not JSON: an RPC's `detail`
+     (create_contact_with_company, 0053) names the record it clashed with, but
+     only when the database sent one — an unrelated failure has none. */
+  function parsedDetail(text) {
+    if (!text) return null;
+    try {
+      var parsed = JSON.parse(text);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  /* A duplicate key on one of the CRM's own unique indexes, read as the
+     sentence a person typed something wrong would want — never the
+     database's "duplicate key value violates unique constraint …", which
+     names a constraint, not what was typed. */
+  function crmDuplicate(res, index) {
+    return Boolean(res.error) && new RegExp(index, 'i').test(res.error.message);
+  }
+
   /* Read or starred, through update-mail-state, which changes Outlook, the
      stored messages and the thread together. There is deliberately no fallback
      to writing the thread row: that never reached Outlook and was undone by the
@@ -161,9 +185,20 @@
     },
 
     async assignTicket(ticketId, employeeId) {
-      return one(await sb().from('support_tickets')
+      var row = one(await sb().from('support_tickets')
         .update({ assignee_id: employeeId || null }).eq('id', ticketId).select().single(),
         'reassign the ticket');
+      /* Told once, after the assignment itself has already saved — never
+         awaited into anything the caller does with the save, so a mail
+         failure here can never look like the reassignment failed. Only when
+         someone was actually given the ticket: notify-ticket (0056) decides
+         for itself whether they should hear about it (not themselves, not
+         inactive, an address on file) — this just starts the call. */
+      if (employeeId) {
+        sb().functions.invoke('notify-ticket', { body: { ticket_id: ticketId, event: 'assigned' } })
+          .catch(function (err) { console.warn('[workspace] could not tell the assignee:', err && err.message); });
+      }
+      return row;
     },
 
     async createTicket(fields) {
@@ -176,8 +211,114 @@
         product: fields.product || null,
         priority: fields.priority || 'normal',
         source: fields.source || 'manual',
-        assignee_id: fields.assigneeId || (me() ? me().id : null)
+        assignee_id: fields.assigneeId || (me() ? me().id : null),
+        /* A sender the CRM has no contact for (audit #1): the raw address so
+           a reply still has somewhere to go, kept as a fallback that yields
+           to a contact linked here or later on the ticket's edit dialog. */
+        requester_email: fields.requesterEmail || null,
+        requester_name: fields.requesterName || null
       }).select().single(), 'create the ticket');
+    },
+
+    /* What an edit to a ticket changes (ticketsModel.ticketChanges), and only
+       that — its subject, contact, company, project and product; status,
+       priority and owner keep their own selects and saves above. `since` is
+       the updated_at the change was made against (0023's own touch trigger
+       moves it on every update), so a change made meanwhile is refused, not
+       overwritten — the same rule updateEvent already uses. */
+    async updateTicket(ticketId, changes, since) {
+      var EDITABLE = ['subject', 'contact_id', 'company_id', 'project_id', 'product'];
+      var fields = changes || {};
+      var keys = Object.keys(fields);
+      must(keys.length, 'Nothing was changed.');
+      must(keys.every(function (key) { return EDITABLE.indexOf(key) !== -1; }),
+        'Only a ticket’s subject, contact, company, project and product can be changed here.');
+      if ('subject' in fields) must(String(fields.subject || '').trim(), 'A ticket needs a subject.');
+      var update = sb().from('support_tickets').update(fields).eq('id', ticketId);
+      if (since) update = update.eq('updated_at', since);
+      return touched(await update.select(), 'save the ticket',
+        'The ticket was not saved: it was changed since this was opened, or you may not change it. Close this and open the ticket again.')[0];
+    },
+
+    /* Soft delete: only a manager, and the database enforces the same rule
+       (guard_soft_delete, 0012) whichever way a ticket's deleted_at is
+       changed — this check just fails fast with a sentence a person can
+       read, the way archiveProject's own check does. .is('deleted_at', null)
+       makes an already-deleted ticket a refusal rather than a silent no-op. */
+    async deleteTicket(ticketId) {
+      must(window.workspaceSession.isManager && window.workspaceSession.isManager(),
+        'Only an owner or admin can delete a ticket.');
+      touched(await sb().from('support_tickets')
+        .update({ deleted_at: new Date().toISOString() }).eq('id', ticketId).is('deleted_at', null).select('id'),
+        'delete the ticket', 'The ticket was not deleted: it has been removed already, or only an owner or admin can remove one.');
+    },
+
+    /* By its number, the one a manager already has from the moment they
+       deleted it — deleted tickets are not listed anywhere in the workspace
+       for one to be picked from instead (0056). */
+    async restoreTicket(number) {
+      must(window.workspaceSession.isManager && window.workspaceSession.isManager(),
+        'Only an owner or admin can restore a ticket.');
+      must(Number.isInteger(number) && number > 0, 'That is not a ticket number.');
+      touched(await sb().from('support_tickets')
+        .update({ deleted_at: null }).eq('number', number).not('deleted_at', 'is', null).select('id'),
+        'restore the ticket', 'No deleted ticket has that number, or only an owner or admin can restore one.');
+    },
+
+    /* ── Ticket attachments (0056) ──────────────────────────────────────
+       Stored first, then recorded — the same order uploadProjectFile uses,
+       for the same reason: an upload whose record will not save is taken
+       away again, since without its record nobody would ever see it. */
+    async uploadTicketAttachment(ticketId, file) {
+      var problem = ticketsModel.fileProblem(file);
+      must(!problem, problem);
+      must(ticketId, 'That ticket has no id yet.');
+      var contentType = file.type || 'application/octet-stream';
+      var path = ticketId + '/' + window.crypto.randomUUID() + '/' + mailModel.storageName(file.name);
+      var stored = await sb().storage.from('ticket-attachments').upload(path, file, { contentType: contentType, upsert: false });
+      if (stored.error) throw new Error('Could not upload "' + file.name + '": ' + stored.error.message);
+      var res = await sb().from('ticket_attachments').insert({
+        ticket_id: ticketId, storage_path: path, name: String(file.name),
+        size_bytes: Number(file.size), content_type: contentType
+      }).select().single();
+      if (res.error) {
+        await sb().storage.from('ticket-attachments').remove([path]);
+        throw new Error('Could not add "' + file.name + '" to the ticket: ' + res.error.message);
+      }
+      return res.data;
+    },
+
+    /* The upload goes first, as removeProjectFile's does: a record left
+       without its upload shows as missing and can still be removed; an
+       upload left without its record would be found by nobody. */
+    async removeTicketAttachment(file) {
+      must(file && file.id && file.storagePath, 'That attachment is not loaded any more. Reload the page.');
+      var label = '"' + (file.name || 'the file') + '"';
+      var removed = await sb().storage.from('ticket-attachments').remove([file.storagePath]);
+      if (removed.error) throw new Error('Could not remove ' + label + ': ' + removed.error.message);
+      return touched(await sb().from('ticket_attachments').delete().eq('id', file.id).select(),
+        'remove ' + label,
+        'Only whoever uploaded it, or an owner or admin, can remove this attachment.');
+    },
+
+    /* A minute is long enough to start a download, and short enough that a
+       link copied out of the page soon stops working — the same choice
+       projectFileLink makes. */
+    async ticketAttachmentLink(path, name) {
+      var res = await sb().storage.from('ticket-attachments').createSignedUrl(path, 60, name ? { download: name } : undefined);
+      if (res.error) throw new Error('Could not open the file: ' + res.error.message);
+      must(res.data && /^https:\/\//.test(res.data.signedUrl || ''), 'Could not open the file.');
+      return res.data.signedUrl;
+    },
+
+    /* Two tickets about the same problem, made one (0056's merge_tickets()):
+       p_drop's thread, notes and conversations move to p_keep, p_drop closes
+       pointing at it. Any signed-in staff member, not managers only — the
+       same as everything else this page lets a team member do to a ticket. */
+    async mergeTickets(keepId, dropId) {
+      var res = await sb().rpc('merge_tickets', { p_keep: keepId, p_drop: dropId });
+      if (res.error) throw new Error('Could not merge the tickets: ' + res.error.message);
+      return res.data;
     },
 
     /* ── Tasks ───────────────────────────────────────────────────────── */
@@ -187,10 +328,19 @@
        a non-manager sends them, so do not bother sending them. RLS refuses a
        tick someone may not make by touching nothing (0050): the rows changed
        are asked back, and none is said as a refusal rather than as
-       supabase-js's "no rows returned". */
-    async setTaskDone(taskId, done) {
+       supabase-js's "no rows returned".
+
+       Unticking only ever knows "done" or "not done" — a checkbox has no room
+       for "in progress" or "blocked" — so on its own it cannot say which of
+       those a task should go back to. `revertTo` is that answer, when the
+       caller has one (data/writes.js reads it off the checkbox that ticked
+       the task done in the first place, from before the task became done): a
+       status a task can be reopened to, or it is ignored and the task goes
+       back to "to do", as it always has. */
+    async setTaskDone(taskId, done, revertTo) {
+      var reopenAs = REOPEN_STATUSES.indexOf(revertTo) !== -1 ? revertTo : 'todo';
       return touched(await sb().from('tasks').update({
-        status: done ? 'done' : 'todo',
+        status: done ? 'done' : reopenAs,
         completed_at: done ? new Date().toISOString() : null
       }).eq('id', taskId).select(), 'update the task',
         'The task was not changed: only its assignee, its project’s team, or an owner or admin can tick it off.')[0];
@@ -229,6 +379,10 @@
 
     /* ── Projects ────────────────────────────────────────────────────── */
 
+    /* ownerId: undefined means nothing was said, so whoever adds it owns it —
+       null is a deliberate "no owner", same as createCompany already reads
+       it. `fields.ownerId || me()` could not tell those apart, so "No owner"
+       picked in the New project dialog silently became the creator anyway. */
     async createProject(fields) {
       must(fields && fields.name && fields.name.trim(), 'A project needs a name.');
       return one(await sb().from('client_projects').insert({
@@ -238,8 +392,9 @@
         accent: fields.accent || 'default',
         status: fields.status || 'discovery',
         description: fields.description || null,
+        starts_on: fields.startsOn || null,
         due_on: fields.dueOn || null,
-        owner_id: fields.ownerId || (me() ? me().id : null)
+        owner_id: fields.ownerId !== undefined ? fields.ownerId : (me() ? me().id : null)
       }).select().single(), 'create the project');
     },
 
@@ -274,6 +429,20 @@
       return one(await sb().from('client_projects')
         .update({ deleted_at: new Date().toISOString() }).eq('id', projectId).select().single(),
         'archive the project');
+    },
+
+    /* The other direction: back onto the board and every list. guard_soft_delete
+       (0012) enforces owners and admins only for either direction of deleted_at,
+       so the check here is the same one archiving already makes, not a new
+       rule — and the row changed is asked back, so one already restored, or
+       gone outright, is a refusal rather than a silent no-op. */
+    async restoreProject(projectId) {
+      must(window.workspaceSession.isManager && window.workspaceSession.isManager(),
+        'Only an owner or admin can restore a project.');
+      return touched(await sb().from('client_projects')
+        .update({ deleted_at: null }).eq('id', projectId).select(),
+        'restore the project',
+        'The project was not restored: it is not archived any more, or only an owner or admin can restore it.')[0];
     },
 
     /* ── Projects: team, client people, files, budget (0039) ─────────── */
@@ -391,13 +560,21 @@
       var domain = (fields.domain || '').trim().toLowerCase()
         .replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/.*$/, '') || null;
       /* In the currency it was given (crmModel.companyForm), or the column's own default. */
-      return one(await sb().from('crm_companies').insert(Object.assign({
+      var res = await sb().from('crm_companies').insert(Object.assign({
         name: fields.name.trim(), domain: domain,
         kind: fields.kind || 'prospect', stage: fields.stage || 'lead',
         value: fields.value ?? null, notes: fields.notes || null,
         /* No owner, when the form says none; the person adding it, when nothing says. */
         owner_id: fields.ownerId !== undefined ? fields.ownerId : (me() ? me().id : null)
-      }, fields.currency ? { currency: fields.currency } : {})).select().single(), 'add the company');
+      }, fields.currency ? { currency: fields.currency } : {})).select().single();
+      /* The client already asks crmModel.duplicateCompanies before sending this
+         (crm-forms.js); this is only the same domain landing here anyway — a
+         race, or data that had not loaded yet — and the raw index name is not
+         a sentence anyone typed something wrong would understand. */
+      if (crmDuplicate(res, 'crm_companies_domain_idx')) {
+        throw new Error('A company at that domain is already in the CRM.');
+      }
+      return one(res, 'add the company');
     },
 
     /* What an edit to a company changes (crmModel.companyChanges), and only
@@ -410,15 +587,76 @@
         'The company was not saved: it has been removed from the CRM, or you may not change it.')[0];
     },
 
+    /* Soft delete: owners and admins only, and the database enforces the same
+       rule whichever way a company's deleted_at is changed (guard_soft_delete,
+       0012, wired to crm_companies by 0021) — this check just fails fast with
+       a sentence a person can read, the way archiveProject's own check does.
+       .is('deleted_at', null) makes a company already removed a refusal
+       rather than a silent no-op. Its people and its work stay exactly where
+       they are: a contact still names it (crm_contacts.company_id is left
+       alone), but the next load of `companies` leaves it out, so every page
+       reads them as having no company any more — the same as a company a
+       contact's own row never had. */
+    async deleteCompany(companyId) {
+      must(window.workspaceSession.isManager && window.workspaceSession.isManager(),
+        'Only an owner or admin can remove a company from the CRM.');
+      touched(await sb().from('crm_companies')
+        .update({ deleted_at: new Date().toISOString() }).eq('id', companyId).is('deleted_at', null).select('id'),
+        'remove the company', 'The company was not removed: it has been removed already, or only an owner or admin can remove one.');
+    },
+
     async createContact(fields) {
       must(fields && fields.fullName && fields.fullName.trim(), 'A contact needs a name.');
-      return one(await sb().from('crm_contacts').insert({
+      var res = await sb().from('crm_contacts').insert({
         full_name: fields.fullName.trim(),
         company_id: fields.companyId || null,
         email: (fields.email || '').trim().toLowerCase() || null,
         phone: fields.phone || null, title: fields.title || null,
         notes: fields.notes || null
-      }).select().single(), 'add the contact');
+      }).select().single();
+      /* Same reasoning as createCompany's domain check, above: the client
+         already asked crmModel.duplicateContacts, so this is a race or stale
+         data, not a typo — say so in a sentence, not the index's name. */
+      if (crmDuplicate(res, 'crm_contacts_email_idx')) {
+        throw new Error('That email address is already used by another contact.');
+      }
+      return one(res, 'add the contact');
+    },
+
+    /* A contact and, when none was picked, their company, in one transaction
+       (create_contact_with_company, 0053): the workspace used to add the two
+       with two requests (createCompany then createContact, above), so a
+       contact refused after its company was made — an address already in the
+       CRM, say — left the company behind, for a retry to add again. Exactly
+       one of companyId or companyName is sent, matching what the database
+       takes; neither means no company, as createContact's does. A refusal
+       that names the record it clashed with (a duplicate address, or more
+       than one company by that name) carries that id or those ids along, so
+       the dialog can point at it rather than only saying so. */
+    async createContactWithCompany(fields) {
+      var f = fields || {};
+      var res = await sb().rpc('create_contact_with_company', {
+        p_full_name: f.fullName || '',
+        p_email: f.email || null,
+        p_phone: f.phone || null,
+        p_title: f.title || null,
+        p_is_primary: Boolean(f.isPrimary),
+        p_notes: f.notes || null,
+        p_enquiry_id: f.enquiryId || null,
+        p_company_id: f.companyId || null,
+        p_company_name: f.companyName || null
+      });
+      if (res.error) {
+        var err = new Error('Could not add the contact: ' + res.error.message);
+        var detail = parsedDetail(res.error.details);
+        if (detail && detail.contact_id) err.conflictContactId = detail.contact_id;
+        if (detail && detail.company_ids) err.matchingCompanyIds = detail.company_ids;
+        throw err;
+      }
+      /* A function with OUT parameters answers one row: as a bare object from
+         most Postgres versions, as a one-row array from some — read either. */
+      var row = Array.isArray(res.data) ? res.data[0] : res.data;
+      return { contactId: row && row.contact_id, companyId: row && row.company_id };
     },
 
     /* What an edit to a contact changes (crmModel.contactChanges), and only that,
@@ -429,11 +667,49 @@
         'The contact was not saved: they have been removed from the CRM, or you may not change them.')[0];
     },
 
+    /* Soft delete, the same rule and the same reasoning as deleteCompany
+       above: owners and admins only, enforced again by guard_soft_delete
+       whichever way this is called. A project they are on, a ticket filed
+       under them or mail matched to them all keep pointing at their row —
+       only the next load of `contacts` leaves them off every list, so the
+       rest of the workspace reads them the way it already reads any contact
+       it cannot find by id. */
+    async deleteContact(contactId) {
+      must(window.workspaceSession.isManager && window.workspaceSession.isManager(),
+        'Only an owner or admin can remove a contact from the CRM.');
+      touched(await sb().from('crm_contacts')
+        .update({ deleted_at: new Date().toISOString() }).eq('id', contactId).is('deleted_at', null).select('id'),
+        'remove the contact', 'The contact was not removed: it has been removed already, or only an owner or admin can remove one.');
+    },
+
     /* Turn a /websites/ enquiry into a company + contact. Safe to call twice:
        the function returns the same contact rather than making a duplicate. */
     async promoteEnquiry(enquiryId) {
       var res = await sb().rpc('promote_enquiry_to_crm', { p_enquiry_id: enquiryId });
       if (res.error) throw new Error('Could not promote the enquiry: ' + res.error.message);
+      return res.data;
+    },
+
+    /* Merging two companies, or two contacts, into one (merge_companies() /
+       merge_contacts(), 0053; owners and admins only): everything that
+       pointed at the one merged away — its projects, tickets, mail, events,
+       invoices, notes and, for a contact, project links — points at the one
+       kept afterwards, and the merged record is deleted and marked where it
+       went. `keepId` stays in the CRM; `dropId` is folded into it. Answers
+       what the database moved, so the dialog can say so. */
+    async mergeCompanies(keepId, dropId) {
+      must(keepId && dropId, 'Pick the company to keep and the company to merge into it.');
+      must(keepId !== dropId, 'A company cannot be merged into itself.');
+      var res = await sb().rpc('merge_companies', { p_keep: keepId, p_drop: dropId });
+      if (res.error) throw new Error('Could not merge the companies: ' + res.error.message);
+      return res.data;
+    },
+
+    async mergeContacts(keepId, dropId) {
+      must(keepId && dropId, 'Pick the contact to keep and the contact to merge into it.');
+      must(keepId !== dropId, 'A contact cannot be merged into itself.');
+      var res = await sb().rpc('merge_contacts', { p_keep: keepId, p_drop: dropId });
+      if (res.error) throw new Error('Could not merge the contacts: ' + res.error.message);
       return res.data;
     },
 
@@ -527,21 +803,34 @@
       });
     },
 
-    /* Only a hand-made event, by whoever booked it or an owner or admin (0048).
+    /* A hand-made event, by whoever booked it or an owner or admin (0048):
        RLS refuses anything else by removing nothing, so the rows removed are
-       asked back: none is a refusal, and is said as one. */
-    async deleteEvent(eventId) {
+       asked back; none is a refusal, and is said as one. A SYNCED event
+       (connectionId given) is nobody's to delete straight through RLS —
+       delete-calendar-event removes it in Outlook first, then here (0057,
+       "Edits and deletes need to reach Outlook"). */
+    async deleteEvent(eventId, connectionId) {
+      if (connectionId) {
+        var res = await sb().functions.invoke('delete-calendar-event', { body: { eventId: eventId } });
+        if (res.error) throw new Error(await functionError(res, 'The event was not removed.'));
+        return res.data;
+      }
       touched(await sb().from('calendar_events').delete().eq('id', eventId).select('id'), 'remove the event',
-        'The event was not removed: it has been removed already, or only whoever booked it, or an owner or admin, can remove it — an event from a connected calendar is removed there.');
+        'The event was not removed: it has been removed already, or only whoever booked it, or an owner or admin, can remove it.');
     },
 
     /* Changing a hand-made event, by whoever booked it or an owner or admin
        (0048): only what an edit may change — its title, times, place and
-       details. `since` is the updated_at the change was made against, which
-       0026's trigger moves on every change: an event changed meanwhile is not
-       overwritten. RLS refuses by changing nothing, as do the connection_id and
-       updated_at filters; none changed is a refusal, and is said as one. */
-    async updateEvent(eventId, changes, since) {
+       details, checked here whichever event this is, since update-calendar-
+       event trusts this same allowlist rather than repeating the check for a
+       different reason to disagree. `since` is the updated_at the change was
+       made against, which 0026's trigger moves on every change: an event
+       changed meanwhile is not overwritten. For a hand-made event RLS refuses
+       by changing nothing, as do the connection_id and updated_at filters;
+       none changed is a refusal, said as one. A SYNCED event (connectionId
+       given) is nobody's to PATCH straight through RLS — update-calendar-
+       event changes it in Outlook first, then here (0057). */
+    async updateEvent(eventId, changes, since, connectionId) {
       var EDITABLE = ['title', 'detail', 'location', 'starts_at', 'ends_at'];
       var fields = changes || {};
       var keys = Object.keys(fields);
@@ -550,6 +839,13 @@
       if ('title' in fields) must(String(fields.title || '').trim(), 'An event needs a title.');
       if ('starts_at' in fields) must(!isNaN(Date.parse(fields.starts_at)), 'An event needs a start time.');
       if (fields.starts_at && fields.ends_at) must(Date.parse(fields.ends_at) > Date.parse(fields.starts_at), 'An event cannot end before it starts.');
+      if (connectionId) {
+        var synced = await sb().functions.invoke('update-calendar-event', {
+          body: { eventId: eventId, changes: fields, since: since || null }
+        });
+        if (synced.error) throw new Error(await functionError(synced, 'The event was not changed.'));
+        return synced.data;
+      }
       var update = sb().from('calendar_events').update(fields).eq('id', eventId).is('connection_id', null);
       if (since) update = update.eq('updated_at', since);
       return touched(await update.select(), 'change the event',
@@ -608,6 +904,79 @@
       return threadState(threadId, { starred: !!starred });
     },
 
+    /* An attachment's bytes, fetched from Graph through mail-attachment-content
+       (0063) — the content stays there until a person actually asks for one,
+       the same reasoning mail_attachments' own comment gives for storing only
+       its metadata. Returns the Blob supabase-js hands back, untouched: the
+       function's own response is always application/octet-stream, since only
+       that type (or application/pdf) reaches this far as a Blob rather than
+       mangled text, so mail.js is the one that re-types it with the
+       attachment's own contentType before showing or offering it. */
+    async mailAttachmentContent(attachmentId) {
+      must(attachmentId, 'That attachment is not loaded any more. Reload the page.');
+      var res = await sb().functions.invoke('mail-attachment-content', {
+        body: { attachmentId: attachmentId }
+      });
+      if (res.error) throw new Error(await functionError(res, 'Could not open that attachment.'));
+      must(res.data && typeof res.data.size === 'number', 'Could not open that attachment.');
+      return res.data;
+    },
+
+    /* ── Notifications ───────────────────────────────────────────────── */
+
+    /* Marks one bell item seen (notification_dismissals, 0061) — a plain
+       insert; there is nothing to change about a dismissal once it exists.
+       Dismissing the same key twice is a harmless repeat, not an error the
+       person needs to see: the table's own primary key catches it (23505). */
+    async dismissNotification(key) {
+      must(key && String(key).trim(), 'Nothing to dismiss.');
+      must(me(), 'You need to be signed in as a team member to dismiss this.');
+      var res = await sb().from('notification_dismissals')
+        .insert({ employee_id: me().id, notif_key: String(key) });
+      if (res.error && res.error.code !== '23505') {
+        throw new Error('Could not dismiss that: ' + res.error.message);
+      }
+    },
+
+    /* ── Company: the team, invitations and the studio profile ─────────── */
+
+    /* A role or status change on someone's employees row — the same guard as
+       0042 (companyModel.changeRefusal decides beforehand whether the form
+       offers it); a change RLS refuses touches no row, and the rows changed
+       are asked back so that is said as a refusal rather than a silent
+       success. Owner rows, and someone's own role or status, are refused the
+       same way the database refuses them. */
+    async updateEmployee(employeeId, changes) {
+      must(changes && Object.keys(changes).length, 'Nothing to save.');
+      return touched(await sb().from('employees').update(changes).eq('id', employeeId).select(),
+        'save that change',
+        'That was not saved: it changed since this was opened, or the database no longer allows it here.')[0];
+    },
+
+    /* Sends the invite-employee Edge Function exactly the fields it takes
+       (companyModel.inviteForm's payload); the function asks the same
+       questions the form already asked (_shared/team-rules.ts), so a refusal
+       here is either a race with someone else's change or the account's own
+       email delivery, never a surprise about who may invite whom. */
+    async inviteEmployee(fields) {
+      var res = await sb().functions.invoke('invite-employee', { body: fields });
+      if (res.error) throw new Error(await functionError(res, 'Could not send the invitation.'));
+      return res.data;
+    },
+
+    /* Only owners and admins may write workspace_settings (0016) — the same
+       upsert the admin already uses for any other setting, keyed so a value
+       already saved is replaced rather than duplicated. `changes` is
+       { workspace_settings key: new value }, built by whoever calls this from
+       companyModel.STUDIO_KEYS, not the model's own field names. */
+    async updateStudioProfile(changes) {
+      var keys = Object.keys(changes || {});
+      must(keys.length, 'Nothing to save.');
+      var rows = keys.map(function (key) { return { key: key, value: changes[key] }; });
+      return one(await sb().from('workspace_settings').upsert(rows, { onConflict: 'key' }).select(),
+        'save the studio profile');
+    },
+
     /* ── Connections ─────────────────────────────────────────────────── */
 
     /* Starts reconnecting a mailbox and resolves to Microsoft's consent page.
@@ -625,6 +994,67 @@
       var url = String(res.data && res.data.consentUrl || '');
       must(/^https:\/\/login\.microsoftonline\.com\//.test(url), 'Microsoft did not send a sign-in page back.');
       return url;
+    },
+
+    /* Starts connecting a brand NEW mailbox — never a reconnect, which
+       reconnectMailbox above already does — the same call as connectCalendar
+       below makes for the other provider (0057's own pattern, mirrored here
+       rather than a second one invented for mail): `employeeId` says whose it
+       is, null for the studio's, left out entirely for anyone connecting
+       their own; microsoft-connect itself decides who may say so (an owner
+       or admin for the studio's, anyone their own). */
+    async connectMailbox(address, employeeId) {
+      must(address && String(address).trim(), 'Say which mailbox to connect.');
+      var body = { provider: 'microsoft_mail', accountLabel: String(address).trim() };
+      if (employeeId !== undefined) body.employeeId = employeeId;
+      var res = await sb().functions.invoke('microsoft-connect', { body: body });
+      if (res.error) throw new Error(await functionError(res, 'Connecting could not start.'));
+      var url = String(res.data && res.data.consentUrl || '');
+      must(/^https:\/\/login\.microsoftonline\.com\//.test(url), 'Microsoft did not send a sign-in page back.');
+      return url;
+    },
+
+    /* Disconnecting, unlike reconnecting or connecting, needs no Edge
+       Function: it does not touch Microsoft at all, only this row's own
+       `status` — the one column (with last_error) 0038 already grants the
+       browser, and its own trigger (integration_connections_browser_can_
+       only_disconnect) refuses anything else written from here. 0055 widened
+       who may make this exact write to match reconnecting: a plain member of
+       staff their own personal mailbox, an owner or admin the studio's — so
+       RLS itself decides who, and a refused write comes back as zero rows,
+       said as one rather than a silent success. */
+    async disconnectMailbox(connectionId) {
+      must(connectionId, 'Which mailbox to disconnect was not given.');
+      return touched(await sb().from('integration_connections').update({ status: 'disconnected' }).eq('id', connectionId).select('id'),
+        'disconnect that mailbox',
+        'That mailbox could not be disconnected: it may already be, or this is not yours to change.')[0];
+    },
+
+    /* Starts connecting — or reconnecting — a calendar: the same call as
+       reconnectMailbox, for the other provider (0057, "No way to connect a
+       calendar or see its last sync"). `employeeId` is left out for a plain
+       reconnect, which keeps whose calendar it already is; passed as null it
+       says a brand new connection is the studio's, an owner or admin only —
+       microsoft-connect itself decides who may say so. */
+    async connectCalendar(address, employeeId) {
+      must(address && String(address).trim(), 'Say which calendar to connect.');
+      var body = { provider: 'microsoft_calendar', accountLabel: String(address).trim() };
+      if (employeeId !== undefined) body.employeeId = employeeId;
+      var res = await sb().functions.invoke('microsoft-connect', { body: body });
+      if (res.error) throw new Error(await functionError(res, 'Connecting could not start.'));
+      var url = String(res.data && res.data.consentUrl || '');
+      must(/^https:\/\/login\.microsoftonline\.com\//.test(url), 'Microsoft did not send a sign-in page back.');
+      return url;
+    },
+
+    /* Asks sync-outlook-calendar to pull this connection now, rather than
+       waiting for the schedule (0057 §3, every 15 minutes) or the next time
+       the Agenda happens to be opened. */
+    async syncCalendar(connectionId) {
+      must(connectionId, 'Which calendar to sync was not given.');
+      var res = await sb().functions.invoke('sync-outlook-calendar', { body: { connectionId: connectionId } });
+      if (res.error) throw new Error(await functionError(res, 'Syncing could not start.'));
+      return res.data;
     },
 
     /* ── Mail: sending ───────────────────────────────────────────────── */

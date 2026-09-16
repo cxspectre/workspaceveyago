@@ -30,6 +30,10 @@ const crmUi = (function () {
   /* A long list draws this many rows, and says how many a search can narrow. */
   const ROW_LIMIT = 200;
   const LIST_HEADING = 'crm-list-heading';
+  /* How long a keystroke waits before it redraws the list: long enough that
+     a fast typist's word lands as one redraw, not one per letter, short
+     enough that it still feels like typing rather than a delay. */
+  const SEARCH_DEBOUNCE_MS = 200;
 
   const text = value => String(value == null ? '' : value);
   const addressOf = value => text(value).trim().toLowerCase();
@@ -49,12 +53,89 @@ const crmUi = (function () {
     .map(t => financeModel.money(t.amount, t.currency))
     .join(' · ');
 
+  /* ── Narrowing and ordering the companies list ─────────────────────────
+     Search used to be the only way to make a long board or table shorter.
+     Kept for the session, as the search box's own typed words are
+     (queries.crm): opening a company and coming back does not reset it. */
+  const boardFilters = { stage: '', kind: '', owner: '', sort: 'name' };
+  const SORTS = Object.freeze([
+    { value: 'name', label: 'Name' },
+    { value: 'value', label: 'Value' },
+    { value: 'stage', label: 'Pipeline stage' }
+  ]);
+
+  /* Entries kept only where every filter set matches: the stage or kind
+     exactly, the owner by id — 'unowned' meaning no owner, never someone
+     whose id happens to read that way (crm_companies.owner_id is a uuid). */
+  function narrowedBy(entries, filters) {
+    const f = filters || {};
+    return entries.filter(entry => {
+      if (f.stage && entry.stage !== f.stage) return false;
+      if (f.kind && entry.kind !== f.kind) return false;
+      if (f.owner === 'unowned') { if (entry.ownerId) return false; }
+      else if (f.owner && entry.ownerId !== f.owner) return false;
+      return true;
+    });
+  }
+
+  /* Entries in the order a person picked, without changing the list given:
+     by name; by value, most valuable first, nothing worth last; or by where
+     each is in the pipeline (crmModel.STAGES' own order). Sorting first is
+     what leaves each board column, and each page of the table, in the same
+     order — pipeline() only groups the list handed to it. */
+  function sortedBy(entries, sort) {
+    const list = [...entries];
+    if (sort === 'value') {
+      return list.sort((a, b) => (b.amount === null ? -Infinity : b.amount) - (a.amount === null ? -Infinity : a.amount)
+        || a.name.localeCompare(b.name));
+    }
+    if (sort === 'stage') {
+      const order = C.STAGES.map(s => s.value);
+      return list.sort((a, b) => order.indexOf(a.stage) - order.indexOf(b.stage) || a.name.localeCompare(b.name));
+    }
+    return list.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /* Whether anything is narrowing the list right now — a search, or a
+     filter — so an empty result reads as "nothing matches" rather than
+     "the CRM has nothing in it". */
+  const isNarrowed = query => Boolean(text(query).trim() || boardFilters.stage || boardFilters.kind || boardFilters.owner);
+
+  /* The filter and sort controls above the pipeline and the companies table.
+     Owner choices come from the team actually loaded; without it, only the
+     stage, kind and sort controls are offered — a select with one option
+     nobody could pick from is worse than one left out. */
+  function filterBar() {
+    const stageOptions = C.STAGES.map(s => `<option value="${esc(s.value)}"${boardFilters.stage === s.value ? ' selected' : ''}>${esc(s.label)}</option>`).join('');
+    const kindOptions = C.KINDS.map(k => `<option value="${esc(k.value)}"${boardFilters.kind === k.value ? ' selected' : ''}>${esc(k.label)}</option>`).join('');
+    const sortOptions = SORTS.map(s => `<option value="${esc(s.value)}"${boardFilters.sort === s.value ? ' selected' : ''}>${esc(s.label)}</option>`).join('');
+    const ownerField = has('team')
+      ? (() => {
+        const owners = [...team].sort((a, b) => a.name.localeCompare(b.name));
+        const ownerOptions = owners.map(m => `<option value="${esc(m.id)}"${boardFilters.owner === m.id ? ' selected' : ''}>${esc(m.name)}</option>`).join('')
+          + `<option value="unowned"${boardFilters.owner === 'unowned' ? ' selected' : ''}>No owner</option>`;
+        return `<label class="filter-field">Owner<select data-crm-filter="owner"><option value="">Any owner</option>${ownerOptions}</select></label>`;
+      })() : '';
+    const cleared = boardFilters.stage || boardFilters.kind || boardFilters.owner;
+    return `<div class="filter-bar" role="group" aria-label="Narrow and order the list">`
+      + `<label class="filter-field">Stage<select data-crm-filter="stage"><option value="">Any stage</option>${stageOptions}</select></label>`
+      + `<label class="filter-field">Kind<select data-crm-filter="kind"><option value="">Any kind</option>${kindOptions}</select></label>`
+      + ownerField
+      + `<label class="filter-field">Sort by<select data-crm-sort>${sortOptions}</select></label>`
+      + (cleared ? `<button type="button" class="text-btn" data-crm-clear-filters>Clear filters</button>` : '')
+      + `</div>`;
+  }
+
   /* The strip at the top of the CRM, as statStrip() takes it: [label, value,
-     caption] for each figure. `companies` is the companies as loaded — null
-     when they did not load, and then what is worked out from them is a dash,
-     never a zero. `main` is the studio's currency, when it is known. */
+     caption] for each figure. `contacts` and `companies` are the lists as
+     loaded — null when either did not load, and then what is worked out from
+     them is a dash, never a zero: a studio that has not answered yet is not
+     the same as one with nobody in it. `main` is the studio's currency, when
+     it is known. */
   function stats(contacts, companies, main) {
-    const people = ['Contacts', (contacts || []).length, 'People in your network'];
+    const people = Array.isArray(contacts)
+      ? ['Contacts', contacts.length, 'People in your network']
+      : ['Contacts', NONE, 'Contacts did not load'];
     if (!Array.isArray(companies)) {
       return Object.freeze([
         people,
@@ -91,6 +172,12 @@ const crmUi = (function () {
   const stored = () => (window.workspaceStore && workspaceStore.state) || {};
   /* The companies as loaded, or null when they did not load. */
   const loadedCompanies = () => (has('companies') ? stored().companies || [] : null);
+  /* The contacts as loaded, or null when they did not load: `contacts` is a
+     shared array that starts empty and stays that way until the store fills
+     it (data/store.js), so reading it before then read as "no contacts" —
+     "0 Contacts" in the strip, "No contacts yet" on the list — on the very
+     first paint, before sign-in has even asked for anything. */
+  const loadedContacts = () => (has('contacts') ? contacts : null);
   /* The studio's currency, as the Overview has it (0041), when it is known. */
   const studioCurrency = () => {
     const overview = stored().overview;
@@ -99,6 +186,86 @@ const crmUi = (function () {
   /* An id written in capitals is the same record: the database writes uuids in
      lower case, and the breadcrumb names the record either way. */
   const addressParts = () => routeParts.map(part => (typeof part === 'string' && UUID.test(part) ? part.toLowerCase() : part));
+
+  /* ── Website enquiries ─────────────────────────────────────────────────
+     Leads from the public "Get a quote" form (0019): readable by owners and
+     admins only (manager reads enquiries) — staff get none back, not a
+     failure, so the tab is hidden from them entirely rather than shown as
+     an empty inbox nobody can explain. Unlike the workspace's other lists,
+     these are asked for on demand, here, rather than with the rest of the
+     workspace (data/store.js): almost no session ever opens this tab, and
+     nobody but a manager can read the answer anyway. */
+  let enquiriesState = { status: 'idle', list: null };
+
+  function loadEnquiries() {
+    if (enquiriesState.status === 'loading') return;
+    enquiriesState = { status: 'loading', list: null };
+    const done = () => { if (typeof repaintKeepingFocus === 'function') repaintKeepingFocus(); else if (typeof render === 'function') render(); };
+    Promise.resolve()
+      .then(() => window.workspaceData.enquiries())
+      .then(list => { enquiriesState = { status: 'ready', list }; done(); },
+        err => {
+          console.error('[workspace] enquiries did not load:', err);
+          enquiriesState = { status: 'failed', list: null };
+          done();
+        });
+  }
+
+  /* An enquiry already promoted (crm_contacts.enquiry_id, 0021) is linked to
+     the contact it became rather than offered a second time. */
+  function promotedContacts() {
+    const found = new Map();
+    (loadedContacts() || []).forEach(c => {
+      const eid = c.row && c.row.enquiry_id;
+      if (eid && !found.has(eid)) found.set(eid, c.id);
+    });
+    return found;
+  }
+
+  function enquiryRow(promoted) {
+    return e => {
+      const contactId = promoted.get(e.id);
+      const action = contactId
+        ? `<a class="text-btn" href="#crm/${esc(contactId)}">Already in the CRM</a>`
+        : `<button class="btn" type="button" data-crm-promote="${esc(e.id)}">Promote</button>`;
+      return `<tr><td><div class="cell-main"><div><strong>${esc(e.name || 'No name given')}</strong>${e.email ? `<small>${esc(e.email)}</small>` : ''}</div></div></td>`
+        + `<td>${e.business ? esc(e.business) : quiet(NONE)}</td>`
+        + `<td class="break-word">${e.message ? esc(e.message) : quiet(NONE)}</td>`
+        + `<td>${esc(e.when)}</td><td>${action}</td></tr>`;
+    };
+  }
+
+  function enquiriesBody() {
+    if (enquiriesState.status === 'idle') loadEnquiries();
+    if (enquiriesState.status === 'idle' || enquiriesState.status === 'loading') {
+      return `<section class="panel">${empty('Loading enquiries…', 'They are read from the public site’s "Get a quote" form.')}</section>`;
+    }
+    if (enquiriesState.status === 'failed') {
+      return `<section class="panel">${empty('Enquiries did not load', 'They are tried again by themselves.')}<button type="button" class="btn" data-crm-enquiries-retry>Try again</button></section>`;
+    }
+    return listPanel('Enquiries', ['From', 'Business', 'Message', 'Received', ''], enquiriesState.list || [],
+      enquiryRow(promotedContacts()),
+      ['No enquiries yet', 'New "Get a quote" submissions from the site will show up here.']);
+  }
+
+  /* Owners and admins only, matching the RLS that already limits reading
+     website_enquiries to them (0019) — this tab does not change who may
+     read enquiries, only gives managers a way to act on them without
+     leaving the workspace for the site admin. */
+  function enquiriesPage() {
+    const manager = isManagerNow();
+    return titlebar('Website enquiries.', 'Leads from the public "Get a quote" form, ready to bring into the CRM.')
+      + subnav(crmTabs(), 'enquiries')
+      + (manager ? enquiriesBody()
+        : `<section class="panel">${empty('Owners and admins only', 'Website enquiries are visible to owners and admins, the same as in the site admin.')}</section>`);
+  }
+
+  /* Enquiries is offered only to whoever could ever see one — the same
+     reasoning nav() already applies to Finance. */
+  const crmTabs = () => [
+    ['crm', 'Pipeline', 'pipeline'], ['crm/companies', 'Companies', 'companies'], ['crm/contacts', 'Contacts', 'contacts'],
+    ...(isManagerNow() ? [['crm/enquiries', 'Enquiries', 'enquiries']] : [])
+  ];
 
   /* The meetings the page has: the weeks loaded and the project meetings
      coming up, each once. */
@@ -155,6 +322,7 @@ const crmUi = (function () {
     const companies = loadedCompanies();
     const parts = addressParts();
     if (parts[1] === 'contacts' && !parts[2]) return listPage('contacts', companies);
+    if (parts[1] === 'enquiries' && !parts[2]) return enquiriesPage();
     const route = C.route(parts, contacts, companies || []);
     if (route.kind === 'list') return listPage('pipeline', companies);
     if (route.kind === 'companies') return listPage('companies', companies);
@@ -178,32 +346,43 @@ const crmUi = (function () {
   function listPage(tab, companies) {
     const query = queries.crm;
     const main = studioCurrency();
+    const people = loadedContacts();
     const body = tab === 'contacts'
-      ? contactTable(C.contactList(contacts, companies).filter(person => C.matchesQuery(person, query)))
+      ? (people
+        ? contactTable(C.contactList(people, companies).filter(person => C.matchesQuery(person, query)))
+        : `<section class="panel">${empty('Contacts did not load', 'They are tried again by themselves.')}</section>`)
       : companyView(tab, companies, query, main);
     return titlebar('Good relationships, in one place.', 'Keep the people, conversations, and work connected.',
       `<button class="btn" type="button" data-crm-new-company>${icon('plus')}New company</button>` + createButton('Add contact', 'crm'))
-      + statStrip(stats(contacts, companies, main))
-      + subnav([['crm', 'Pipeline', 'pipeline'], ['crm/companies', 'Companies', 'companies'], ['crm/contacts', 'Contacts', 'contacts']], tab)
+      + statStrip(stats(people, companies, main))
+      + subnav(crmTabs(), tab)
       + `<div class="view-toolbar">${queryInput('crm', tab === 'contacts' ? 'Search contacts' : 'Search companies and their people')}</div>`
       + body;
   }
 
-  /* The pipeline or the companies list: every company with its people and work. */
+  /* The pipeline or the companies list: every company with its people and
+     work, narrowed by search and by the filter bar, then in the order picked. */
   function companyView(tab, companies, query, main) {
     if (!companies) return `<section class="panel">${empty('Companies did not load', 'They are tried again by themselves.')}</section>`;
-    const entries = C.companyList(companies, sources(companies)).filter(entry => C.matchesQuery(entry, query));
-    return tab === 'companies' ? companyTable(entries) : board(entries, main);
+    const matching = C.companyList(companies, sources(companies)).filter(entry => C.matchesQuery(entry, query));
+    const entries = sortedBy(narrowedBy(matching, boardFilters), boardFilters.sort);
+    const narrowed = isNarrowed(query);
+    return filterBar() + (tab === 'companies' ? companyTable(entries, narrowed) : board(entries, main, narrowed));
   }
 
   /* A column for each of the six stages, each company on it once, with what
-     the column is worth in each currency. */
-  function board(entries, main) {
+     the column is worth in each currency. Every card and column carries what
+     a drop needs to know (data-crm-card, data-crm-column): the drag itself is
+     the browser's own, native to a link and a section, and cannot be run
+     without one — verified here by reading the handler below, not by a
+     browser test (tests/crm-ui.test.mjs's harness has no DOM to drag across). */
+  function board(entries, main, narrowed) {
     const columns = C.pipeline(entries).columns.map(column => {
       const id = `crm-stage-${esc(column.stage)}`;
-      return `<section class="board-column" aria-labelledby="${id}"><div class="board-heading"><h2 id="${id}">${esc(column.heading)}</h2>${countTag(column.count)}</div>`
+      const empty = narrowed ? 'Nothing here matches.' : 'No companies at this stage.';
+      return `<section class="board-column" aria-labelledby="${id}" data-crm-column="${esc(column.stage)}"><div class="board-heading"><h2 id="${id}">${esc(column.heading)}</h2>${countTag(column.count)}</div>`
         + (column.totals.length ? `<p class="board-total">${esc(moneyLine(column.totals, main))}</p>` : '')
-        + `<div class="board-cards">${column.companies.map(companyCard).join('') || '<div class="board-empty">No companies at this stage.</div>'}</div></section>`;
+        + `<div class="board-cards">${column.companies.map(companyCard).join('') || `<div class="board-empty">${esc(empty)}</div>`}</div></section>`;
     });
     return `<div class="project-board stage-board crm-board">${columns.join('')}</div>`;
   }
@@ -211,7 +390,8 @@ const crmUi = (function () {
   function companyCard(entry) {
     const people = entry.contacts;
     const who = people.length ? people[0].name + (people.length > 1 ? ` and ${people.length - 1} more` : '') : 'Nobody here yet';
-    return `<a class="panel contact-card" href="#${esc(entry.route)}"><div class="card-top">${avatar(entry.name, null, 'contact-avatar')}${icon('chevron')}</div>`
+    return `<a class="panel contact-card" href="#${esc(entry.route)}" draggable="true" data-crm-card="${esc(entry.id)}">`
+      + `<div class="card-top">${avatar(entry.name, null, 'contact-avatar')}${icon('chevron')}</div>`
       + `<h3>${esc(entry.name)}</h3><p>${esc(who)}</p>`
       + `<div class="contact-value"><strong>${esc(valueText(entry))}</strong><span>${entry.stage === 'client' ? 'Yearly value' : 'Deal value'}</span></div>`
       + (entry.domain ? `<small>${esc(entry.domain)}</small>` : '')
@@ -233,7 +413,7 @@ const crmUi = (function () {
     return `<section class="panel"><div class="list-toolbar"><h2 id="${LIST_HEADING}">${esc(title)} ${countTag(entries.length)}</h2></div>${table}</section>`;
   }
 
-  function companyTable(entries) {
+  function companyTable(entries, narrowed) {
     const ownerCell = ownerId => {
       const owner = ownerOf(ownerId);
       return owner.name ? esc(owner.name) : quiet(ownerId ? owner.words : NONE);
@@ -241,7 +421,7 @@ const crmUi = (function () {
     return listPanel('Companies', ['Company', 'Stage', 'People', 'Value', 'Owner'], entries, entry =>
       `<tr><td><div class="cell-main">${avatar(entry.name)}<div>${recordLink(entry.route, `<strong>${esc(entry.name)}</strong>`)}<small>${esc(entry.domain || entry.kindLabel)}</small></div></div></td>`
         + `<td>${stageCell(entry.stageLabel)}</td><td>${entry.contacts.length}</td><td>${esc(valueText(entry))}</td><td>${ownerCell(entry.ownerId)}</td></tr>`,
-      queries.crm ? ['No companies found', 'Try another name, domain or person.'] : ['No companies yet', 'Add one with New company, or with its first contact or project.']);
+      narrowed ? ['No companies found', 'Try another search, or clear a filter.'] : ['No companies yet', 'Add one with New company, or with its first contact or project.']);
   }
 
   function contactTable(people) {
@@ -323,6 +503,77 @@ const crmUi = (function () {
       + (start ? pastPanel(key, { ...filter, limit: PAST_SHOWN, before: start.toISOString() }, shown, fileUnder) : '');
   }
 
+  /* ── A record's linked mail ─────────────────────────────────────────────
+     Mail links to the CRM by itself, so far (0025's own address match;
+     0059's domain fallback) — there is still no "link this thread" or "add
+     sender to the CRM" affordance, and old threads are never back-filled;
+     both are bigger, separate pieces, left undone here. What this adds is
+     narrower: mail_threads already carries contact_id/company_id, and
+     nothing on either page read it straight — a contact's own "Conversations"
+     panel only ever knew what was already loaded for the Mail view, which
+     keeps a working window of a few hundred a folder (queries.mailThreads),
+     not everything ever linked. queries.mailThreadsFor(filter) asks
+     mail_threads directly, by contact_id or company_id; this asks for it once
+     a page opens and keeps it by `key` ('contact:<id>' / 'company:<id>'), the
+     way a client's past meetings are kept, but locally — this is the only
+     place that asks, so there is nothing here for data/store.js to share. */
+  const linkedMailState = new Map();
+
+  function askLinkedMail(key, filter) {
+    const cached = linkedMailState.get(key);
+    if (cached) return cached;
+    const loading = { status: 'loading', threads: null, more: false };
+    linkedMailState.set(key, loading);
+    const done = () => { if (typeof repaintKeepingFocus === 'function') repaintKeepingFocus(); else if (typeof render === 'function') render(); };
+    Promise.resolve()
+      .then(() => window.workspaceData.mailThreadsFor(filter))
+      .then(result => { linkedMailState.set(key, { status: 'ready', threads: result.threads || [], more: Boolean(result.more) }); done(); },
+        err => {
+          console.error('[workspace] linked mail did not load:', err);
+          linkedMailState.set(key, { status: 'failed', threads: null, more: false });
+          done();
+        });
+    return loading;
+  }
+
+  const linkedMailSection = body => `<section class="panel content-panel related-panel"><h2 id="linked-mail" tabindex="-1">Linked mail</h2>${body}</section>`;
+  const mailThreadItems = threads => threads.map(t =>
+    [mailModel.mailRoute({ mailbox: mailModel.ALL, folder: mailModel.folderForThread(t, 'inbox'), threadId: t.id }), t.subject, t.time, 'mail']);
+
+  /* `exclude` leaves out a thread already listed elsewhere on the page — a
+     contact's own "Conversations & invoices" panel, built from whatever mail
+     is already loaded — so nothing linked shows twice. A company's page has
+     nothing else to exclude against, and passes none. */
+  function linkedMailPanel(key, filter, exclude) {
+    const asked = askLinkedMail(key, filter);
+    if (asked.status === 'loading') return linkedMailSection('<p class="quiet-text" role="status">Loading linked mail…</p>');
+    if (asked.status === 'failed') {
+      return linkedMailSection('<p class="quiet-text" role="status">Linked mail did not load. They are tried again by themselves.</p>'
+        + `<button type="button" class="btn" data-crm-mail-retry="${esc(key)}">Try again</button>`);
+    }
+    const shown = exclude && exclude.size ? asked.threads.filter(t => !exclude.has(String(t.id))) : asked.threads;
+    /* Empty two different ways: genuinely nothing linked, or everything found
+       is already listed above (a contact's own "Conversations" panel) — the
+       first is not true of the second, and saying it anyway would read as
+       this contact having no mail at all when they plainly do. */
+    const empty = asked.threads.length ? 'Already listed above.' : 'No linked mail yet.';
+    return linkedMailSection(shown.length ? meetingLinks(mailThreadItems(shown)) : `<p class="quiet-text">${esc(empty)}</p>`)
+      + (asked.more ? note('Older mail is not listed.') : '');
+  }
+
+  /* Linked mail that did not load, asked for again — the page redrawn without
+     the button, so the keyboard goes to the panel's own heading, the way a
+     client's past meetings already do this. */
+  document.addEventListener('click', e => {
+    const retry = e.target.closest && e.target.closest('[data-crm-mail-retry]');
+    if (!retry) return;
+    e.preventDefault();
+    linkedMailState.delete(retry.dataset.crmMailRetry);
+    if (typeof render === 'function') render();
+    const heading = document.getElementById('linked-mail');
+    if (heading && heading.focus) heading.focus();
+  });
+
   /* A company's page: its people, its projects and tickets, its meetings
      coming up and its past ones — filed under it, its projects or its people,
      by id — and the invoices sent to its people; its notes on a tab of their
@@ -336,12 +587,15 @@ const crmUi = (function () {
     const notes = tab === 'activity';
     const actions = (c.stageLabel ? pill(c.stageLabel) : '')
       + `<button class="btn" type="button" data-crm-new-contact="${id}">${icon('plus')}Add person</button>`
+      + (isManagerNow() ? `<button class="btn" type="button" data-crm-merge-company="${id}">Merge…</button>` : '')
+      + (isManagerNow() ? `<button class="btn" type="button" data-crm-delete-company="${id}">Remove company</button>` : '')
       + `<button class="btn btn-primary" type="button" data-crm-edit-company="${id}">Edit company</button>`;
     /* Drawn only on the Overview tab: it asks for past meetings, which the notes tab does not show. */
     const overview = notes ? '' : `<section class="panel contact-summary">${avatar(c.name, null, 'contact-avatar')}<div><span class="eyebrow">${esc((c.kindLabel || 'Company').toUpperCase())}</span><h2>${esc(c.name)}</h2><p>${esc(c.domain || 'No domain on record')}</p></div></section>`
       + (c.notes ? `<section class="panel content-panel"><h2>About</h2><p class="body-copy">${esc(c.notes)}</p></section>` : '')
       + linkedPanel('People', work.contacts.map(person =>
-        [person.route, person.name, [person.title, person.email].filter(Boolean).join(' · ') || 'Contact', 'crm']))
+        [person.route, person.name,
+          [person.row && person.row.is_primary ? 'Primary contact' : null, person.title, person.email].filter(Boolean).join(' · ') || 'Contact', 'crm']))
       + linkedPanel('Projects & support', [
         ...work.projects.map(project => ['projects/' + project.id, project.name, 'Project · ' + text(project.status), 'projects']),
         ...work.tickets.map(ticket => ['tickets/' + ticket.id, ticket.title, 'VYG-' + ticket.id + ' · ' + text(ticket.status), 'tickets'])
@@ -353,14 +607,17 @@ const crmUi = (function () {
       + (sent.shown
         ? linkedPanel('Invoices to its people', invoiceItems(sent.list || []))
           + note(sent.list ? 'Invoices are listed by the address they were sent to: one of its people\'s.' : 'Invoices did not load. They are tried again by themselves.')
-        : '');
+        : '')
+      + linkedMailPanel(`company:${c.id}`, { companyId: c.id });
     return detailHeader('crm/companies', 'All companies', c.name, [c.kindLabel, c.domain].filter(Boolean).join(' · ') || 'Company', actions)
       + subnav([[`crm/companies/${id}`, 'Overview', 'overview'], [`crm/companies/${id}/activity`, 'Activity & notes', 'activity']], notes ? 'activity' : 'overview')
       + `<div class="record-layout"><div class="record-main">${notes ? notesPanel('companies', c.id) : overview}</div><aside class="record-aside">`
       + properties([
         ['Stage', c.stageLabel ? esc(c.stageLabel) : NONE],
+        ...(record.clientNumber != null ? [['Client No.', esc(String(record.clientNumber))]] : []),
         ['Kind', c.kindLabel ? esc(c.kindLabel) : NONE],
         ['Value', esc(valueText(c))],
+        ['Currency', esc(c.currency)],
         ['Owner', esc(owner.words)],
         ['Domain', c.domain ? `<span class="break-word">${esc(c.domain)}</span>` : NONE]
       ])
@@ -411,9 +668,12 @@ const crmUi = (function () {
         ...invoiceItems(sent.list || [])
       ])
       + (mailLoaded ? '' : note('Conversations did not load. They are tried again by themselves.'))
-      + invoiceNote(person, sent);
+      + invoiceNote(person, sent)
+      + linkedMailPanel(`contact:${person.id}`, { contactId: person.id }, new Set(threads.map(m => String(m.id))));
     return detailHeader('crm/contacts', 'All contacts', person.name, person.companyName || 'No company',
       `<button class="btn" type="button" data-crm-edit-contact="${id}">Edit contact</button>`
+      + (isManagerNow() ? `<button class="btn" type="button" data-crm-merge-contact="${id}">Merge…</button>` : '')
+      + (isManagerNow() ? `<button class="btn" type="button" data-crm-delete-contact="${id}">Remove contact</button>` : '')
       + (person.email ? `<button class="btn btn-primary" data-action="contact-email" data-id="${id}">${icon('mail')}Write email</button>` : ''))
       + subnav([[`crm/${id}`, 'Overview', 'overview'], [`crm/${id}/activity`, 'Activity & notes', 'activity']], notes ? 'activity' : 'overview')
       + `<div class="record-layout"><div class="record-main">${notes ? notesPanel('crm', person.id) : overview}</div><aside class="record-aside">`
@@ -423,6 +683,8 @@ const crmUi = (function () {
         ['Email', person.email ? `<span class="break-word">${esc(person.email)}</span>` : NONE],
         ['Phone', person.phone ? esc(person.phone) : NONE],
         ['Title', person.title ? esc(person.title) : NONE],
+        ['Primary contact', person.row && person.row.is_primary ? 'Yes' : NONE],
+        ['Source', person.row && person.row.enquiry_id ? 'A website enquiry' : NONE],
         ['Owner', owner ? esc(owner.words) : NONE]
       ])
       + `<section class="panel content-panel"><h2>Relationship activity</h2><div class="relationship-counts"><span><strong>${work.projects.length}</strong>Projects</span><span><strong>${work.tickets.length}</strong>Tickets</span><span><strong>${mailLoaded ? threads.length : NONE}</strong>Emails</span></div></section>`
@@ -440,6 +702,129 @@ const crmUi = (function () {
     const heading = document.getElementById('past-meetings');
     if (heading && heading.focus) heading.focus();
   });
+
+  /* Enquiries that did not load, asked for again. */
+  document.addEventListener('click', e => {
+    const retry = e.target.closest && e.target.closest('[data-crm-enquiries-retry]');
+    if (!retry) return;
+    e.preventDefault();
+    loadEnquiries();
+  });
+
+  /* Turning an enquiry into a company and contact (promote_enquiry_to_crm,
+     0021), using the RPC and RLS boundary as they already are — this button
+     only exists where the enquiries list itself is already manager-only. */
+  document.addEventListener('click', e => {
+    const button = e.target.closest && e.target.closest('[data-crm-promote]');
+    if (!button) return;
+    e.preventDefault();
+    if (button.disabled) return;
+    if (!window.workspaceStore || !workspaceStore.state.loaded) {
+      if (typeof toast === 'function') toast('Not yet: the workspace is still loading.');
+      return;
+    }
+    const enquiryId = button.dataset.crmPromote;
+    button.disabled = true;
+    workspaceStore.after(workspaceActions.promoteEnquiry(enquiryId), { only: ['contacts', 'companies'] })
+      .then(contactId => {
+        if (typeof toast === 'function') toast('Added to the CRM.');
+        if (typeof navigate === 'function' && contactId) navigate(`crm/${contactId}`);
+      })
+      .catch(() => {})
+      .then(() => { button.disabled = false; });
+  });
+
+  const repaint = () => (typeof repaintKeepingFocus === 'function' ? repaintKeepingFocus() : (typeof render === 'function' && render()));
+
+  /* Picking a stage, kind, owner or sort order: kept for the session
+     (boardFilters), same as the search box's own typed words, and the page
+     is drawn again keeping the keyboard on the control just used. */
+  document.addEventListener('change', e => {
+    const filter = e.target.closest && e.target.closest('[data-crm-filter]');
+    const sort = e.target.closest && e.target.closest('[data-crm-sort]');
+    if (!filter && !sort) return;
+    if (filter) boardFilters[filter.dataset.crmFilter] = filter.value;
+    else boardFilters.sort = sort.value;
+    repaint();
+  });
+
+  document.addEventListener('click', e => {
+    const clear = e.target.closest && e.target.closest('[data-crm-clear-filters]');
+    if (!clear) return;
+    e.preventDefault();
+    boardFilters.stage = '';
+    boardFilters.kind = '';
+    boardFilters.owner = '';
+    repaint();
+  });
+
+  /* Dragging a card onto another column's stage saves it there — the same
+     write the Edit company dialog's own Stage select makes (crm-forms.js),
+     so it follows the same rules. Native HTML5 drag and drop: a dragover
+     handler must call preventDefault() for a drop to be allowed onto an
+     element at all, and the id travels in the browser's own DataTransfer,
+     which nothing here invents. A real drag cannot be run in tests/crm-ui.
+     test.mjs's sandbox (no DOM to drag across); its harness calls these
+     three handlers directly with a stand-in event instead, and the case
+     that matters most — dropping a card back on the column it is already
+     on — is read here rather than run: shapeCompany(company).stage === stage
+     short-circuits before workspaceActions is ever reached. */
+  document.addEventListener('dragstart', e => {
+    const card = e.target.closest && e.target.closest('[data-crm-card]');
+    if (!card || !e.dataTransfer) return;
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', card.dataset.crmCard);
+  });
+
+  document.addEventListener('dragover', e => {
+    if (!(e.target.closest && e.target.closest('[data-crm-column]'))) return;
+    e.preventDefault();
+  });
+
+  document.addEventListener('drop', e => {
+    const column = e.target.closest && e.target.closest('[data-crm-column]');
+    if (!column) return;
+    e.preventDefault();
+    const id = e.dataTransfer && e.dataTransfer.getData('text/plain');
+    const stage = column.dataset.crmColumn;
+    const company = id && C.companyById(loadedCompanies(), id);
+    if (!company || !stage) return;
+    const shaped = C.shapeCompany(company);
+    if (shaped.stage === stage) return;
+    if (!window.workspaceStore || !workspaceStore.state.loaded) {
+      if (typeof toast === 'function') toast('Not yet: the workspace is still loading.');
+      return;
+    }
+    /* Only contacts and companies ever change from a CRM write — never mail,
+       tickets, invoices or anything else the workspace loads — so only those
+       two are asked for again rather than the whole workspace (store.js's
+       after(), the same fix crm-forms.js's own writes use below). */
+    workspaceStore.after(workspaceActions.updateCompany(id, { stage }), { only: ['contacts', 'companies'] })
+      .then(() => { if (typeof toast === 'function') toast(`${shaped.name} moved to ${C.stageLabel(stage)}.`); })
+      .catch(() => {});
+  });
+
+  /* The shared search box (workspace.js) redraws the whole page on every
+     keystroke — fine for a short list, felt like typing through mud on a
+     CRM with hundreds of rows. Registered in the CAPTURE phase, which runs
+     ahead of that bubble-phase listener regardless of which file loads
+     first (as writes.js's own capture-phase listeners already rely on), so
+     stopping it here also stops the immediate redraw for this one box —
+     every other view's search is untouched. window.setTimeout/clearTimeout,
+     not the bare globals, so a test can stand in for the clock. */
+  let searchTimer = null;
+  document.addEventListener('input', e => {
+    if (!(e.target.matches && e.target.matches('[data-query="crm"]'))) return;
+    e.stopImmediatePropagation();
+    const input = e.target;
+    const value = input.value;
+    window.clearTimeout(searchTimer);
+    searchTimer = window.setTimeout(() => {
+      searchTimer = null;
+      queries.crm = value;
+      if (typeof redrawPreservingFocus === 'function') redrawPreservingFocus(input);
+    }, SEARCH_DEBOUNCE_MS);
+  }, true);
 
   return Object.freeze({ ROW_LIMIT, stats, invoicesFor, moneyLine });
 })();

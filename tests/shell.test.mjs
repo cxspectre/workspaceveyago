@@ -57,6 +57,18 @@ test('an event is found with the day it is on, and a project meeting beyond the 
     'one with no day given keeps its time');
 });
 
+test('a database search for a past meeting or a far-off event (searchEvents, 0064) is found too, and not doubled up with what is already loaded', () => {
+  const withSearch = { ...sources, searchedEvents: [
+    { id: 'past1', title: 'Old kickoff', detail: 'Zoom', time: '10:00', when: 'Mon 12 Jan · 10:00' },
+    /* The database can easily re-find something already loaded (sources.events
+       has 'e1' under the same title) — it must not show up twice. */
+    { id: 'e1', title: 'Northline kickoff', detail: 'Zoom', time: '10:00', when: 'Thu 17 Sep · 10:00' }
+  ] };
+  const events = model.search(model.searchItems(withSearch), 'kickoff').results.filter(r => r.type === 'Event');
+  assert.equal(events.length, 2, 'the loaded one and the one only the database knew about — not three');
+  assert.deepEqual([...events.map(r => r.route)], ['agenda/e1', 'agenda/past1']);
+});
+
 test('a company opens its own page, whoever works there', () => {
   assert.ok(found('northline').includes('Company:crm/companies/co1'));
   assert.deepEqual([...found('quiet')], ['Company:crm/companies/co2']);
@@ -160,6 +172,37 @@ test('the bell lists what needs someone, each leading to it', () => {
   assert.equal(items[2].title, '2 unread conversations');
   assert.equal(items[3].title, '1 event today');
   assert.equal(items[3].detail, 'Kickoff');
+});
+
+test('a dismissed item is left out, whichever kind it is', () => {
+  const items = model.attention({
+    tickets: [
+      { id: 7, uuid: 't7', client: 'Ana', priority: 'High', status: 'Open' },
+      { id: 8, uuid: 't8', client: 'Bo', priority: 'Urgent', status: 'Open' }
+    ],
+    invoices: [{ id: 'INV-1', uuid: 'i1', client: 'Northline', amount: '$1,200', status: 'Overdue' }],
+    unreadMail: 3, eventsToday: [{ title: 'Kickoff' }], isManager: true,
+    dismissed: ['ticket:t7', 'invoice:i1', 'mail:unread']
+  });
+  assert.deepEqual([...items.map(i => i.key)], ['ticket:t8', 'events:today']);
+});
+
+test('a dismissed ticket frees its slot for the one after it, rather than just shortening the list', () => {
+  const tickets = Array.from({ length: 6 }, (_, i) => (
+    { id: i + 1, uuid: 't' + (i + 1), client: 'Client', priority: 'High', status: 'Open' }));
+  const items = model.attention({
+    tickets, invoices: [], unreadMail: 0, eventsToday: [], isManager: true, dismissed: ['ticket:t1']
+  });
+  assert.deepEqual([...items.map(i => i.key)], ['ticket:t2', 'ticket:t3', 'ticket:t4', 'ticket:t5', 'ticket:t6']);
+});
+
+test('with nothing dismissed, or the option left out entirely, everything shows as before', () => {
+  const facts = {
+    tickets: [{ id: 7, uuid: 't7', client: 'Ana', priority: 'High', status: 'Open' }],
+    invoices: [], unreadMail: 0, eventsToday: [], isManager: true
+  };
+  assert.deepEqual([...model.attention(facts).map(i => i.key)], ['ticket:t7']);
+  assert.deepEqual([...model.attention({ ...facts, dismissed: [] }).map(i => i.key)], ['ticket:t7']);
 });
 
 test('someone who cannot read Finance is not told about invoices', () => {

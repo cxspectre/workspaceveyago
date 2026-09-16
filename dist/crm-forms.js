@@ -42,14 +42,12 @@ const crmForms = (function () {
   const signedIn = () => (window.workspaceSession && workspaceSession.employee) || null;
   const values = form => Object.fromEntries(new FormData(form).entries());
 
-  /* What each open dialog was drawn with, the question it last asked, and the
-     company it added for a contact that was then refused. */
+  /* What each open dialog was drawn with, and the question it last asked. */
   const drawn = new WeakMap();
   const asked = new WeakMap();
-  const madeFor = new WeakMap();
   /* Saying what is wrong, a clean form for each send, and one write at a time:
      as every dialog does them (dialog-forms.js). */
-  const { sentence, field, options, say, quiet, closeDialog, sending } = dialogForms;
+  const { field, options, say, quiet, closeDialog, sending } = dialogForms;
 
   /* The fields the person changed since the dialog opened. */
   const edited = form => {
@@ -142,15 +140,19 @@ const crmForms = (function () {
   /* Whether the save goes on. A record the database would refuse it for stops
      it, naming whose that is; records that only look the same are listed, and
      the save goes on once the person presses "… anyway" for those same
-     records — one a reload brings in afterwards is asked about too. */
-  function clearOf(form, found, typed) {
+     records — one a reload brings in afterwards is asked about too. Blocked
+     on a domain, the field marked is `domainField` — the New company dialog's
+     own "domain" input, but the new-contact dialog has no such field: there
+     the domain comes from the address instead, so its "company" name field
+     (the only one naming the new company at all) takes the focus instead. */
+  function clearOf(form, found, typed, domainField = 'domain') {
     const box = form.querySelector('.form-candidates');
     const button = form.querySelector('[type="submit"]');
     const blocking = found.find(c => c.blocking);
     if (blocking) {
       box.innerHTML = `<p>${linkTo(blocking)} already has ${esc(why(blocking))}.</p>`;
       say(form, `${blocking.name} already has ${why(blocking)}: change it, or open ${blocking.name} instead.`,
-        blocking.reasons.includes('email') ? 'email' : 'domain');
+        blocking.reasons.includes('email') ? 'email' : domainField);
       return false;
     }
     const question = JSON.stringify([typed, found.map(c => c.id)]);
@@ -175,10 +177,12 @@ const crmForms = (function () {
     if (company.problem) { say(form, company.problem, company.field); return; }
     const found = C.duplicateCompanies(loadedCompanies(), { name: company.values.name, domain: company.values.domain });
     if (!clearOf(form, found, [company.values.name, company.values.domain])) return;
+    /* Only ever changes companies — never a contact, since this dialog adds
+       none — so only that part is asked for again (store.js's after()). */
     sending(form, () => workspaceActions.createCompany(company.values), made => {
       toast(`${company.values.name} added.`);
       navigate(C.companyRoute(made));
-    });
+    }, { only: ['companies'] });
   }
 
   /* A form field's column, for judging an edit against the right record. */
@@ -214,7 +218,14 @@ const crmForms = (function () {
     const found = C.duplicateCompanies(loadedCompanies(), { name: renamedTo, domain: movedTo }, opened.id);
     if (!clearOf(form, found, [renamedTo, movedTo])) return;
     const name = renamedTo || C.shapeCompany(current).name;
-    sending(form, () => workspaceActions.updateCompany(opened.id, edit.changes), () => toast(`${name} saved.`));
+    /* Contacts embed their company's name, stage, value and currency
+       (queries.contacts()), and the ticket queue embeds a company's name
+       too (queries.tickets(), for a ticket filed under one with no contact
+       of its own) — both would otherwise show a company edit stale until
+       the next quiet refresh. Nothing else loaded embeds a company's own
+       fields this way (only a single open ticket's own page re-asks for its
+       company fresh, which already happens whenever that page is opened). */
+    sending(form, () => workspaceActions.updateCompany(opened.id, edit.changes), () => toast(`${name} saved.`), { only: ['contacts', 'companies', 'tickets'] });
   }
 
   function openCompany(company) {
@@ -232,77 +243,49 @@ const crmForms = (function () {
 
   /* ── Contacts ──────────────────────────────────────────────────────── */
 
-  /* The company first, when there is a new one — or the one this dialog added
-     before, renamed if its name was corrected — then the contact at it. A
-     contact refused once its company is in the CRM leaves that company chosen
-     for them, and says so. */
-  async function addContact(form, person, company, kept) {
-    let companyId = kept ? kept.id : person.companyId;
-    if (kept && kept.rename) {
-      try {
-        await workspaceActions.updateCompany(kept.id, { name: kept.rename });
-      } catch (err) {
-        /* Refused — gone from the CRM, or not this person's to change — it is
-           nobody's to keep. A rename that never reached the database leaves
-           the company this dialog added still this dialog's to rename. */
-        if (err && err.refused) madeFor.delete(form);
-        throw err;
-      }
-      madeFor.set(form, { id: kept.id, name: kept.rename });
-    }
-    if (company) {
-      const row = await workspaceActions.createCompany(company);
-      madeFor.set(form, { id: row.id, name: company.name });
-      companyId = row.id;
-    }
-    try {
-      return await workspaceActions.createContact({ ...person, companyId });
-    } catch (err) {
-      const made = madeFor.get(form);
-      if (!made || made.id !== companyId) throw err;
-      /* With its dialog still open the company stays chosen there; closed, the
-         next dialog knows nothing of it, so this says where it is. */
-      const where = dialogForms.showing(form) ? `${made.name} stays chosen for them.` : `${made.name} is in the CRM: pick it when you add them again.`;
-      throw new Error(`${made.name} was added, but ${person.fullName} was not: ${sentence(err.message)} ${where}`);
-    }
-  }
-
-  /* The company a new contact goes to, when it is a new one: what to add, or
-     the company this dialog already added — or why neither can be. */
-  function newCompanyFor(form, v) {
-    const typed = text(v.company).trim();
-    if (!typed) return { problem: 'Give the new company a name, or pick one.' };
-    const made = madeFor.get(form);
-    if (made) {
-      const rename = typed !== made.name ? typed : '';
-      const checked = rename ? C.companyForm({ name: rename }) : null;
-      return checked && checked.problem ? { problem: checked.problem } : { kept: { id: made.id, rename }, name: rename };
-    }
-    /* Owned by whoever adds it, as a company added on its own is. */
-    const me = signedIn();
-    const company = C.companyForm({ name: typed, currency: studioCurrency(), ownerId: me ? me.id : '' });
-    return company.problem ? { problem: company.problem } : { company: company.values, name: typed };
+  /* The domain a new company gets when none is typed for it directly: the
+     contact's own address, unless it is a public mailbox — never a guess at
+     a company nobody named, only the same address a person adding the
+     company by hand would type into its own domain field. Filing mail from
+     that address under it later (0025) is the point. */
+  function domainFromEmail(email) {
+    if (!text(email).includes('@')) return '';
+    const domain = C.domainKey(email);
+    return domain && !C.isPublicMail(domain) ? domain : '';
   }
 
   function submitNewContact(form) {
     const v = values(form);
     quiet(form);
     const atNew = v.companyId === NEW_COMPANY;
+    const companyName = atNew ? text(v.company).trim() : '';
+    if (atNew && !companyName) { say(form, 'Give the new company a name, or pick one.', 'company'); return; }
     const person = C.contactForm({ ...v, companyId: atNew ? '' : v.companyId });
     if (person.problem) { say(form, person.problem, person.field); return; }
-    const place = atNew ? newCompanyFor(form, v) : {};
-    if (place.problem) { say(form, place.problem, 'company'); return; }
-    const exceptId = place.kept ? place.kept.id : undefined;
+    /* A domain the address gives away is asked about — and, exactly as a
+       typed domain would, blocks outright when it is one another company
+       already has — the same way the New company dialog treats a typed one;
+       before this, only the same NAME was ever checked here. */
+    const domain = atNew ? domainFromEmail(person.values.email) : '';
     const found = [
       ...C.duplicateContacts(contacts, { name: person.values.fullName, email: person.values.email }),
-      ...(place.name ? C.duplicateCompanies(loadedCompanies(), { name: place.name, email: person.values.email }, exceptId) : [])
+      ...(atNew ? C.duplicateCompanies(loadedCompanies(), { name: companyName, domain, email: person.values.email }) : [])
     ];
-    if (!clearOf(form, found, [person.values.fullName, person.values.email, v.companyId, text(v.company).trim()])) return;
-    const spare = !atNew && madeFor.get(form);
-    sending(form, () => addContact(form, person.values, place.company || null, place.kept || null), row => {
-      toast(`${person.values.fullName} added.${spare ? ` ${spare.name}, added a moment ago, stays in the CRM.` : ''}`);
-      navigate(C.contactRoute(row));
-    });
+    if (!clearOf(form, found, [person.values.fullName, person.values.email, v.companyId, companyName], 'company')) return;
+    /* create_contact_with_company (0053) adds the contact and, when none was
+       picked, its company, in one transaction — matched by name among live
+       companies, or made new when none matches. A contact refused no longer
+       leaves a company behind for a retry to add again: nothing this call
+       inserts is kept unless all of it is, so there is no spare row here to
+       track or rename as there was with two separate requests. */
+    sending(form, () => workspaceActions.createContactWithCompany({
+      fullName: person.values.fullName, email: person.values.email, phone: person.values.phone,
+      title: person.values.title, notes: person.values.notes,
+      companyId: atNew ? null : person.values.companyId, companyName: atNew ? companyName : null
+    }), made => {
+      toast(`${person.values.fullName} added.`);
+      navigate(C.contactRoute(made.contactId));
+    }, { only: ['contacts', 'companies'] });
   }
 
   /* What the person changed, and only that is checked against the others. */
@@ -319,7 +302,7 @@ const crmForms = (function () {
     const found = C.duplicateContacts(contacts, { name: renamedTo, email: movedTo }, opened.id);
     if (!clearOf(form, found, [renamedTo, movedTo])) return;
     const name = renamedTo || C.shapeContact(current, loadedCompanies()).name;
-    sending(form, () => workspaceActions.updateContact(opened.id, edit.changes), () => toast(`${name} saved.`));
+    sending(form, () => workspaceActions.updateContact(opened.id, edit.changes), () => toast(`${name} saved.`), { only: ['contacts'] });
   }
 
   function openContact(contact, companyId) {
@@ -340,6 +323,94 @@ const crmForms = (function () {
     });
   }
 
+  /* ── Merging two companies, or two contacts (merge_companies / merge_contacts,
+     0053) ───────────────────────────────────────────────────────────────
+     Opened from the record that is kept: the person picks which other one —
+     never itself — is folded into it. Owners and admins only, which crm-ui.js
+     already checks before drawing the button; the database checks again. */
+  const MERGE = Object.freeze({
+    company: {
+      noun: 'company', list: () => loadedCompanies(), shape: r => C.shapeCompany(r),
+      action: (keep, drop) => workspaceActions.mergeCompanies(keep, drop)
+    },
+    contact: {
+      noun: 'contact', list: () => contacts, shape: r => C.shapeContact(r, loadedCompanies()),
+      action: (keep, drop) => workspaceActions.mergeContacts(keep, drop)
+    }
+  });
+
+  function submitMerge(form, kind, keep) {
+    const cfg = MERGE[kind];
+    const dropId = text(values(form).dropId);
+    quiet(form);
+    if (!dropId) { say(form, `Pick the ${cfg.noun} to merge in.`, 'dropId'); return; }
+    const drop = cfg.shape(cfg.list().find(r => r && r.id === dropId));
+    /* No `only` here: a merge repoints the merged record's projects, tickets,
+       mail, meetings, invoices and notes onto the one kept (0053) — every
+       part the workspace loads, not only contacts and companies — so this is
+       the one CRM write that still asks for the whole workspace again, the
+       same as before this file started scoping the others. Rare and
+       deliberate, unlike a keystroke or a single field, so the cost of
+       asking for everything is not the problem here that it is elsewhere. */
+    sending(form, () => cfg.action(keep.id, dropId), () => {
+      toast(`${drop.name || 'The record'} merged into ${keep.name}.`);
+    });
+  }
+
+  function openMerge(record, kind) {
+    const cfg = MERGE[kind];
+    const keep = cfg.shape(record);
+    const others = cfg.list().filter(r => r && r.id !== keep.id).map(r => cfg.shape(r))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    showModal(`CRM · MERGE`, `<h2>Merge into ${esc(keep.name)}</h2>`
+      + `<p class="form-note">Everything the other ${cfg.noun} has — its projects, tickets, mail, meetings, invoices and notes — moves to ${esc(keep.name)}, and it is then removed from the CRM. This cannot be undone here.</p>`
+      + dialogForm('crm-merge-form',
+        field(`The ${cfg.noun} to merge in`, `<select name="dropId" required><option value="">Pick one…</option>${options(others.map(o => ({ value: o.id, label: o.name })), '')}</select>`),
+        'Merge'));
+    const form = document.getElementById('crm-merge-form');
+    form.addEventListener('submit', e => { e.preventDefault(); submitMerge(form, kind, keep); });
+  }
+
+  /* ── Removing a company or a contact (deleted_at, actions.deleteCompany/
+     deleteContact) ─────────────────────────────────────────────────────
+     A confirm step first, the same pattern established projects-wide for
+     anything this permanent (project-panels.js's confirmLeaveTeam and
+     confirmRemovePerson): a plain dialog naming what stays behind, since a
+     removed record is off every list from the next load on, and there is no
+     "… anyway" here to press by mistake. Owners and admins only, which
+     crm-ui.js already checks before drawing the button; guard_soft_delete
+     (0012) checks again regardless of what the button offered. */
+  const REMOVE = Object.freeze({
+    company: {
+      noun: 'company', shape: r => C.shapeCompany(r), route: 'crm/companies', only: ['contacts', 'companies', 'tickets'],
+      warning: 'It leaves the pipeline, the companies list and its own page. Its people and its work — projects, tickets, mail and invoices — stay exactly where they are, filed under no company.',
+      action: id => workspaceActions.deleteCompany(id)
+    },
+    contact: {
+      noun: 'contact', shape: r => C.shapeContact(r, loadedCompanies()), route: 'crm/contacts', only: ['contacts'],
+      warning: 'It leaves every list and their own page. The projects, tickets and mail already linked to them stay exactly where they are.',
+      action: id => workspaceActions.deleteContact(id)
+    }
+  });
+
+  function submitDelete(form, kind, record) {
+    const cfg = REMOVE[kind];
+    sending(form, () => cfg.action(record.id), () => {
+      toast(`${record.name || 'It'} is removed from the CRM.`);
+      navigate(cfg.route);
+    }, { only: cfg.only });
+  }
+
+  function openDelete(record, kind) {
+    const cfg = REMOVE[kind];
+    const shaped = cfg.shape(record);
+    showModal('CRM · REMOVE', `<h2>Remove ${esc(shaped.name)} from the CRM?</h2>`
+      + `<p class="form-note">${cfg.warning}</p>`
+      + dialogForms.form(`crm-delete-${kind}-form`, '', `Remove ${cfg.noun}`));
+    const form = document.getElementById(`crm-delete-${kind}-form`);
+    form.addEventListener('submit', e => { e.preventDefault(); quiet(form); submitDelete(form, kind, shaped); });
+  }
+
   /* ── What the CRM's buttons do ─────────────────────────────────────── */
 
   /* A plain click, which opens a link here — not one for a new tab or window. */
@@ -353,7 +424,8 @@ const crmForms = (function () {
       if (plainClick(e) && typeof modal !== 'undefined' && modal.open) modal.close();
       return;
     }
-    const button = at('[data-crm-new-company], [data-crm-edit-company], [data-crm-new-contact], [data-crm-edit-contact]');
+    const button = at('[data-crm-new-company], [data-crm-edit-company], [data-crm-new-contact], [data-crm-edit-contact], '
+      + '[data-crm-merge-company], [data-crm-merge-contact], [data-crm-delete-company], [data-crm-delete-contact]');
     if (!button) return;
     e.preventDefault();
     if (!ready()) return;
@@ -365,6 +437,30 @@ const crmForms = (function () {
       const company = C.companyById(loadedCompanies(), id('crmEditCompany'));
       if (company) openCompany(company);
       else toast('That company is no longer in the CRM.');
+      return;
+    }
+    if (d.crmMergeCompany !== undefined) {
+      const company = C.companyById(loadedCompanies(), id('crmMergeCompany'));
+      if (company) openMerge(company, 'company');
+      else toast('That company is no longer in the CRM.');
+      return;
+    }
+    if (d.crmMergeContact !== undefined) {
+      const contact = C.contactById(contacts, id('crmMergeContact'));
+      if (contact) openMerge(contact, 'contact');
+      else toast('That contact is no longer in the CRM.');
+      return;
+    }
+    if (d.crmDeleteCompany !== undefined) {
+      const company = C.companyById(loadedCompanies(), id('crmDeleteCompany'));
+      if (company) openDelete(company, 'company');
+      else toast('That company is no longer in the CRM.');
+      return;
+    }
+    if (d.crmDeleteContact !== undefined) {
+      const contact = C.contactById(contacts, id('crmDeleteContact'));
+      if (contact) openDelete(contact, 'contact');
+      else toast('That contact is no longer in the CRM.');
       return;
     }
     const contact = C.contactById(contacts, id('crmEditContact'));
@@ -383,5 +479,5 @@ const crmForms = (function () {
     };
   }
 
-  return Object.freeze({ openCompany, openContact });
+  return Object.freeze({ openCompany, openContact, openMerge, openDelete });
 })();

@@ -87,6 +87,9 @@ function load({ tasks = [], viewer = { id: ME, role: 'employee', status: 'active
   let reloading = null;
   /* The loads begun so far, and the one each part last arrived from (store.js mark and loadedSince). */
   const loads = { begun: 0, arrived: {} };
+  /* Every options object handed to workspaceStore.after(), in order — what a
+     test checks to see whether a save named `only` a narrower reload. */
+  const afterOptions = [];
   let refusals = refuseUpdates ? Infinity : 0;
   let onPage = [];
   let onBoxes = [];
@@ -108,13 +111,16 @@ function load({ tasks = [], viewer = { id: ME, role: 'employee', status: 'active
       /* As store.js's after() does: once the write is in, the workspace is
          loaded again; a refusal is said in a toast unless the caller says it
          itself ({ toast: false }), and passed on. */
-      after: (work, options) => Promise.resolve(work).then(
-        value => (reloading ? reloading.promise : Promise.resolve()).then(() => {
-          loads.begun += 1;
-          if (!misses.includes('projects')) loads.arrived.projects = loads.begun;
-          return value;
-        }),
-        err => { if (!(options && options.toast === false)) toasts.push(err.message); throw err; }),
+      after: (work, options) => {
+        afterOptions.push(options || null);
+        return Promise.resolve(work).then(
+          value => (reloading ? reloading.promise : Promise.resolve()).then(() => {
+            loads.begun += 1;
+            if (!misses.includes('projects')) loads.arrived.projects = loads.begun;
+            return value;
+          }),
+          err => { if (!(options && options.toast === false)) toasts.push(err.message); throw err; });
+      },
       /* The loads begun so far, and the one the projects — and their tasks — last arrived from (store.js). */
       mark: () => loads.begun,
       loadedSince: (part, mark) => loads.arrived[part] !== undefined && loads.arrived[part] > mark
@@ -179,7 +185,7 @@ function load({ tasks = [], viewer = { id: ME, role: 'employee', status: 'active
     arrive: part => { loads.begun += 1; loads.arrived[part] = loads.begun; },
     /* A reload without the task: someone removed it. */
     remove: id => { project.taskList = project.taskList.filter(t => t.id !== id); },
-    timers, toasts, modals, updates, removals, created, pageFocus, modal: context.modal
+    timers, toasts, modals, updates, removals, created, pageFocus, afterOptions, modal: context.modal
   };
 }
 
@@ -526,6 +532,16 @@ test('its assignee moves a task along: the status is saved, and a task no longer
   await settle();
   assert.deepEqual(h.updates, [['a', { status: 'in_progress', completed_at: null }]]);
   assert.deepEqual(h.toasts, ['Task a: In progress.']);
+});
+
+test('a task status save reloads only projects and the overview, not the whole workspace', async () => {
+  const h = load({ tasks: [task('a', { assignee_id: YOU })], viewer: { id: YOU, role: 'employee', status: 'active' } });
+  const select = statusSelect('a', 'in_progress');
+  h.change(on(select));
+  h.fire();
+  await settle();
+  assert.equal(h.afterOptions.length, 1);
+  assert.deepEqual([...h.afterOptions[0].only], ['projects', 'overview']);
 });
 
 test('someone who may not move or edit a task is refused, even with a forged control', () => {

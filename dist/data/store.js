@@ -48,7 +48,19 @@
     failed: [], notice: null,
     overview: null, revenue: [], revenueMix: [], companies: [], projectEvents: [],
     projectMembers: [], projectContacts: [], projectFiles: [], projectBudgets: [],
-    mailboxes: [], mailTruncated: []
+    /* mailboxesFailed: the mailbox LIST itself did not load — different from
+       there being none. Threads still load (loadMail falls back to no
+       connection filter at all), so `mail` still "arrives"; this is the only
+       place that failure survives to be shown. */
+    mailboxes: [], mailboxesFailed: false, mailTruncated: [], calendars: [],
+    /* The true unread count per mailbox (mail_unread_counts(), 0062) — null
+       until it has answered once, or on a database from before it: unknown,
+       not zero, so mail-model.js's own floor guess is what shows until then. */
+    mailUnreadCounts: null,
+    /* The Company page's own parts: connections (companyModel.connectionRows),
+       the studio's public profile (companyModel.studioProfile) and which bell
+       items this person has already dismissed. */
+    integrations: [], studioProfile: [], dismissedNotifications: []
   };
 
   /* When each part last arrived, and what it looked like then. */
@@ -68,13 +80,43 @@
      (agendaModel.loadRange), so one that began the week before is there too. */
   var shownWeek = null;
   var loadedWeeks = {};
+  /* The week keys whose events failed on their last try, and are not being
+     asked for again right now — so a week that failed once is not shown as
+     failing forever, a week that never asked is not shown as failing at all,
+     and a week asked for again shows loading, not the last try's failure,
+     while that ask is on its way. Cleared the moment a new request covers a
+     key (markWeeksAsking, called before the fetch in loadOnce and loadParts —
+     the same windowKey the fetch itself asks weeksToLoad() for, one request
+     covering it and failing or succeeding for all of them at once), and again
+     on that request's own success (markWeeks) in case a stale key from a
+     different, still-failing request rode along. */
+  var failedWeeks = {};
+  function markWeeksAsking(weeksKey) {
+    weeksKey.split('|').forEach(function (key) { delete failedWeeks[key]; });
+  }
+  function markWeeksFailed(weeksKey) {
+    weeksKey.split('|').forEach(function (key) { failedWeeks[key] = true; });
+  }
   function weeksToLoad() {
     var now = new Date();
     var today = agendaModel.weekOf(now);
     var shown = shownWeek || agendaModel.startWeek(now);
     return shown.key === today.key ? [today] : [today, shown];
   }
-  var windowKey = function () { return weeksToLoad().map(function (week) { return week.key; }).join('|'); };
+  /* The month view (agenda-ui.js showMonth): a grid of whole weeks, wider than
+     the one or two weeksToLoad() already covers, asked for as one range
+     rather than one request per row. Set only while the agenda shows it —
+     showMonth(null) clears it, so a view nobody is looking at stops asking
+     for a month's worth of events every two minutes. { key, since, to } —
+     `key` names the month ("2026-10") for monthLoaded(); `since`/`to` are
+     what eventsOverlapping() takes, the same shape agendaModel.loadRange()
+     gives a week. */
+  var shownMonth = null;
+  var loadedMonth = null;
+  var windowKey = function () {
+    var key = weeksToLoad().map(function (week) { return week.key; }).join('|');
+    return shownMonth ? key + '+' + shownMonth.key : key;
+  };
 
   /* Events from more than one week, each once — one over a weekend is in both —
      in the order they start. */
@@ -93,7 +135,15 @@
 
   function markWeeks(loaded) {
     loadedWeeks = {};
-    loaded.weeks.forEach(function (key) { loadedWeeks[key] = true; });
+    /* markWeeksAsking already cleared these keys before this fetch began, so
+       this delete never has anything left to do — kept as a second line of
+       defence, in case a future caller of markWeeks skips that step. */
+    loaded.weeks.forEach(function (key) { loadedWeeks[key] = true; delete failedWeeks[key]; });
+    /* Cleared, not left as it was, when this load did not ask for a month
+       (loaded.month undefined on an answer kept from before weekFailed's
+       `keep`, or null once nobody asked for one): a month shown again after
+       being left is loaded again rather than trusted stale. */
+    loadedMonth = loaded.month || null;
   }
 
   /* options.sign: what counts as a change, when not the whole answer.
@@ -126,15 +176,20 @@
       function (rows) { swap(team, rows); }),
     /* The weeks travel with the rows, so a week that moved counts as a change.
        Before queries.js can ask for the events overlapping a week, the events
-       starting in it. */
+       starting in it. The month view's range (showMonth) rides along the same
+       request, one more eventsOverlapping call rather than a load of its own —
+       every event a month, a week or a day view could show is one array. */
     part('events', 'the agenda',
       function (d) {
         var weeks = weeksToLoad();
-        return Promise.all(weeks.map(function (week) {
+        var month = shownMonth;
+        var asks = weeks.map(function (week) {
           var range = agendaModel.loadRange(week);
           return typeof d.eventsOverlapping === 'function' ? d.eventsOverlapping(range) : d.events(range.from, range.to);
-        })).then(function (lists) {
-          return { weeks: weeks.map(function (week) { return week.key; }), rows: mergeEvents(lists) };
+        });
+        if (month) asks.push(d.eventsOverlapping({ since: month.since, to: month.to }));
+        return Promise.all(asks).then(function (lists) {
+          return { weeks: weeks.map(function (week) { return week.key; }), month: month ? month.key : null, rows: mergeEvents(lists) };
         });
       },
       function (loaded) {
@@ -152,15 +207,26 @@
       function (rows) { swap(workspaceActivity, rows); }),
     part('mail', 'mail', loadMail, applyMail, {
       /* A mailbox's sync time moves every few minutes with nothing new to show:
-         not a change worth a repaint, but kept for the next one. */
+         not a change worth a repaint, but kept for the next one. Whether the
+         mailbox list itself is currently failing is not, on its own, either —
+         mailboxesFailed is kept the same way — but IS part of the signature,
+         so recovering from a failure (even onto the same empty list) repaints.
+         unreadCounts is too: a thread outside the loaded window going from
+         unread to read moves the true count with nothing else here to show it. */
       sign: function (value) {
         return {
           threads: value.threads,
           truncated: value.truncated,
-          mailboxes: value.mailboxes.map(function (b) { return Object.assign({}, b, { last_synced_at: null }); })
+          mailboxesFailed: value.mailboxesFailed,
+          mailboxes: value.mailboxes.map(function (b) { return Object.assign({}, b, { last_synced_at: null }); }),
+          unreadCounts: value.unreadCounts
         };
       },
-      keep: function (value) { state.mailboxes = value.mailboxes; }
+      keep: function (value) {
+        state.mailboxes = value.mailboxes;
+        state.mailboxesFailed = Boolean(value.mailboxesFailed);
+        state.mailUnreadCounts = value.unreadCounts || null;
+      }
     }),
     part('overview', 'the overview figures',
       function (d) { return d.overview(); },
@@ -194,7 +260,31 @@
       function (rows) { state.projectBudgets = rows; }),
     part('notes', 'notes',
       function (d) { return d.notes(); },
-      function (rows) { lastNotes = rows; })
+      function (rows) { lastNotes = rows; }),
+    /* The studio's calendar connections and this person's own (0057): which
+       calendar a synced event came from (agenda-ui.js), and a connections
+       panel to reconnect one or ask it to sync now. Not CORE: an agenda with
+       no calendars connected is exactly what a studio with none looks like. */
+    part('calendars', 'connected calendars',
+      function (d) { return d.calendars(); },
+      function (rows) { state.calendars = rows; }),
+    /* The studio's and this person's own connections (0044), for the
+       Company/Studio integrations panel. */
+    part('integrations', 'integrations',
+      function (d) { return d.integrations(); },
+      function (rows) { state.integrations = rows; }),
+    /* The studio's public profile (studio_profile(), 0061): [] for a database
+       from before 0061 or for anyone it answers nothing to — either way
+       companyModel.studioProfile() reads that as the studio's own defaults. */
+    part('studioProfile', 'the studio profile',
+      function (d) { return d.studioProfile(); },
+      function (rows) { state.studioProfile = rows; }),
+    /* Which bell items this person has already dismissed (0061): [] for a
+       database from before 0061, which the bell then shows everything on, as
+       it always has. */
+    part('dismissedNotifications', 'dismissed notifications',
+      function (d) { return d.notificationDismissals(); },
+      function (rows) { state.dismissedNotifications = rows; })
   ];
 
   /* A load asked for while one is running is queued, not dropped: the running
@@ -272,12 +362,16 @@
     if (!everLoaded && !state.notice) repaint(false);
 
     var key = windowKey();
+    /* Asked for again now, so its last failure — if it had one — is not the
+       last word on it while this is on its way. */
+    markWeeksAsking(key);
     var startedAt = lastStart = Math.max(Date.now(), lastStart + 1);
     var outcomes = await Promise.all(PARTS.map(function (p) { return fetchPart(p, window.workspaceData); }));
 
     var applied = applyOutcomes(outcomes, quiet, startedAt);
     var changed = applied.changed;
     var failures = applied.failures;
+    if (failures.some(function (o) { return o.part.key === 'events'; })) markWeeksFailed(key);
     if (changed || !quiet) regroupNotes();
 
     var coreMissing = CORE.filter(function (key) { return !arrivedAt[key]; });
@@ -361,9 +455,14 @@
     var parts = PARTS.filter(function (p) { return only.indexOf(p.key) !== -1; });
     var keys = parts.map(function (p) { return p.key; });
     var key = windowKey();
+    /* Only when events are among the parts asked for here — otherwise these
+       weeks are not being asked about at all, and a real failure of theirs
+       must not read as cleared. */
+    if (keys.indexOf('events') !== -1) markWeeksAsking(key);
     var startedAt = lastStart = Math.max(Date.now(), lastStart + 1);
     var outcomes = await Promise.all(parts.map(function (p) { return fetchPart(p, window.workspaceData); }));
     var applied = applyOutcomes(outcomes, quiet, startedAt);
+    if (applied.failures.some(function (o) { return o.part.key === 'events'; })) markWeeksFailed(key);
     lastFailures = lastFailures
       .filter(function (o) { return keys.indexOf(o.part.key) === -1; })
       .concat(applied.failures);
@@ -372,7 +471,13 @@
     state.notice = noticeFor(lastFailures, state.loaded, CORE.filter(function (k) { return !arrivedAt[k]; }));
     paintNotice();
     if (applied.changed || !quiet) regroupNotes();
-    if (applied.changed || applied.failures.length) repaint(quiet && state.loaded);
+    /* A load someone asked for repaints regardless of changed — loadOnce does
+       the same for the whole workspace (after(), with `only`, is the one
+       caller that reaches here not quiet: a write's own dialog has already
+       closed by the time this runs, and a write that happened to change
+       nothing the signature could tell apart must not leave the page as it
+       was before it). */
+    if (!quiet || applied.changed || applied.failures.length) repaint(quiet && state.loaded);
     if (applied.failures.length) scheduleRetry(applied.failures.map(function (o) { return o.part.key; }));
     /* Nothing left failing: no retry is needed, and the next failure starts
        from the first delay — a retry that has just fired included. */
@@ -607,19 +712,45 @@
   /* The mailboxes first, then each mailbox's own inbox, sent and starred: one
      shared limit let a busy hello@ push a personal mailbox out of the load.
      Losing the mailbox list degrades to one query per folder across
-     everything, rather than taking mail down with it. */
+     everything (RLS decides what comes back), rather than taking mail down
+     with it — but that IS a failure, and mail.js must not read it as "no
+     mailbox connected": the caller gets mailboxesFailed alongside the empty
+     list, rather than the error being swallowed into indistinguishable rows. */
   function loadMail(d) {
-    return d.mailboxes()
-      .catch(function (err) {
-        console.error('[workspace] could not load the mailboxes:', err);
-        return [];
-      })
-      .then(function (boxes) {
-        var ids = boxes.map(function (b) { return b.id; });
-        return d.mailThreads(['inbox', 'sent', 'starred'], ids).then(function (result) {
-          return { mailboxes: boxes, threads: result.threads, truncated: result.truncated };
-        });
+    return Promise.all([
+      d.mailboxes().then(
+        function (boxes) { return { boxes: boxes, failed: false }; },
+        function (err) {
+          console.error('[workspace] could not load the mailboxes:', err);
+          return { boxes: [], failed: true };
+        }
+      ),
+      /* A COUNT-based answer (mail_unread_counts(), 0062): the true unread
+         total for every mailbox this person can read, not only the 200 most
+         recent inbox threads mailThreads() keeps. Missing on a database from
+         before 0062, or failing for any other reason, degrades to null —
+         mail-model.js's own floor-based guess (unreadCountInfo) is what the
+         badges already showed before this existed, and stays the fallback
+         rather than a failure here taking the rest of mail down with it. */
+      d.mailUnreadCounts().then(
+        function (counts) { return counts; },
+        function (err) {
+          console.error('[workspace] the true unread count did not load:', err);
+          return null;
+        }
+      )
+    ]).then(function (loaded) {
+      var mailboxes = loaded[0];
+      var unreadCounts = loaded[1];
+      var ids = mailboxes.boxes.map(function (b) { return b.id; });
+      return d.mailThreads(['inbox', 'sent', 'starred'], ids).then(function (result) {
+        return {
+          mailboxes: mailboxes.boxes, mailboxesFailed: mailboxes.failed,
+          threads: result.threads, truncated: result.truncated,
+          unreadCounts: unreadCounts
+        };
       });
+    });
   }
 
   /* Thread bodies, fetched when a thread is opened rather than with the list,
@@ -656,7 +787,16 @@
     Object.keys(bodies).forEach(function (id) { if (!present[id]) delete bodies[id]; });
     swap(mails, result.threads);
     state.mailboxes = result.mailboxes;
+    state.mailboxesFailed = Boolean(result.mailboxesFailed);
     state.mailTruncated = result.truncated;
+    state.mailUnreadCounts = result.unreadCounts || null;
+    /* "Load more"'s own cursor (below) is the oldest thread `mails` held the
+       moment it was last asked for; a fresh mail load can move that window
+       forward (new mail arrived) or, more rarely, back, so a page reached
+       through it is not trusted across one — asked for again, from `mails`
+       as it now stands, rather than risking a silently skipped or repeated
+       stretch of mail. */
+    moreMailBy = {};
   }
 
   /* Which version of a thread is loaded: a new message changes both. */
@@ -691,6 +831,93 @@
       });
   }
 
+  /* ── "Load more": older mail, one page beyond what mailThreads() keeps ──
+     Kept apart from `mails` itself (never pushed into it) rather than folded
+     into the ordinary mail part: a background refresh's own swap(mails, …)
+     (applyMail, above) always answers with the newest 200-per-folder window
+     again, which would silently throw an appended older page away the next
+     time mail refreshes — kept here instead, mail.js's own list draws both
+     together (mailModel.mergeOlder), and applyMail clears this cache outright
+     the moment mail genuinely reloads, since the window a further page would
+     continue past may have moved. */
+  var moreMailBy = {};
+  var moreMailKey = function (mailbox, folder) { return String(mailbox) + '|' + String(folder); };
+  var MORE_MAIL_IDLE = Object.freeze({ state: 'idle', more: true, threads: Object.freeze([]) });
+
+  /* The oldest last_message_at among a list of threads matching this mailbox
+     and folder — Starred spans every folder a thread could actually be filed
+     under, exactly as mailModel.visibleThreads() itself reads "starred". */
+  function oldestInScope(list, mailbox, folder) {
+    return list.reduce(function (min, t) {
+      var matches = (folder === 'starred' ? Boolean(t.starred) : t.folder === folder)
+        && (mailbox === 'all' || t.mailboxId === mailbox);
+      var at = matches && t.row ? t.row.last_message_at : null;
+      return at && (!min || at < min) ? at : min;
+    }, null);
+  }
+
+  function loadMoreMail(mailbox, folder) {
+    var key = moreMailKey(mailbox, folder);
+    var existing = moreMailBy[key] || MORE_MAIL_IDLE;
+    if (existing.state === 'loading') return existing;
+    /* Continues past whatever "Load more" has already reached for this key,
+       falling back to the ordinary loaded window the first time it is asked. */
+    var before = oldestInScope(existing.threads, mailbox, folder) || oldestInScope(mails, mailbox, folder);
+    if (!before) {
+      moreMailBy[key] = { state: 'ready', more: false, threads: existing.threads };
+      repaint(true);
+      return moreMailBy[key];
+    }
+    var entry = { state: 'loading', more: existing.more, threads: existing.threads };
+    moreMailBy[key] = entry;
+    var ids = mailbox === 'all' ? state.mailboxes.map(function (b) { return b.id; }) : [mailbox];
+    window.workspaceData.mailThreads([folder], ids, before)
+      .then(function (result) {
+        if (moreMailBy[key] !== entry) return;
+        moreMailBy[key] = {
+          state: 'ready',
+          /* Any one (mailbox, folder) pair hitting queries.js's own PER_FOLDER
+             cap means there is more still further back than this page reached. */
+          more: result.truncated.length > 0,
+          threads: existing.threads.concat(result.threads)
+        };
+        repaint(true);
+      }, function (err) {
+        if (moreMailBy[key] !== entry) return;
+        console.error('[workspace] older mail did not load:', err);
+        moreMailBy[key] = { state: 'failed', more: existing.more, threads: existing.threads };
+        repaint(true);
+      });
+    return entry;
+  }
+
+  /* ── A word search across every message this person could read ──────────
+     Kept by the exact query typed (search_mail, 0055) — the same word
+     searched twice while nothing else has happened should not ask again —
+     and forgotten on a write (after(), below), the same as every other
+     page's own "asked for" cache: a send, a star or a read may change what
+     matches or what a hit's own row now says. */
+  var mailSearchBy = {};
+  var MAIL_SEARCH_LOADING = Object.freeze({ state: 'loading', results: Object.freeze([]) });
+  var MAIL_SEARCH_EMPTY = Object.freeze({ state: 'ready', results: Object.freeze([]) });
+
+  function loadMailSearch(query) {
+    var entry = { state: 'loading', results: [] };
+    mailSearchBy[query] = entry;
+    window.workspaceData.searchMail(query)
+      .then(function (results) {
+        if (mailSearchBy[query] !== entry) return;
+        mailSearchBy[query] = { state: 'ready', results: results || [] };
+        repaint(true);
+      }, function (err) {
+        if (mailSearchBy[query] !== entry) return;
+        console.error('[workspace] mail search did not load:', err);
+        mailSearchBy[query] = { state: 'failed', results: [] };
+        repaint(true);
+      });
+    return entry;
+  }
+
   /* A client's past meetings, asked for when their page is drawn rather than
      with the workspace — the weeks the agenda loads do not reach back — and
      kept by page and by what was asked, until a write, which may have changed
@@ -715,6 +942,33 @@
         if (pastMeetingsBy[id] !== entry) return;
         console.error('[workspace] past meetings did not load:', err);
         pastMeetingsBy[id] = { state: 'failed', meetings: [], more: false };
+        repaint(true);
+      });
+    return entry;
+  }
+
+  /* Transactions in a window, asked for only once Finance's own page wants
+     them (finance-ui.js): a manager who never opens Finance this session
+     never asks for one, and a write anywhere else in the workspace does not
+     refetch them either — after() clears this cache like the others below
+     rather than folding it into the whole-workspace reload every write does.
+     Kept by the window's since-date, until a write. */
+  var transactionsBy = {};
+  var TX_LOADING = Object.freeze({ state: 'loading', rows: Object.freeze([]) });
+
+  function loadTransactions(since) {
+    var entry = { state: 'loading', rows: [] };
+    transactionsBy[since] = entry;
+    Promise.resolve()
+      .then(function () { return window.workspaceData.transactions(since); })
+      .then(function (rows) {
+        if (transactionsBy[since] !== entry) return;
+        transactionsBy[since] = { state: 'ready', rows: rows || [] };
+        repaint(true);
+      }, function (err) {
+        if (transactionsBy[since] !== entry) return;
+        console.error('[workspace] transactions did not load:', err);
+        transactionsBy[since] = { state: 'failed', rows: [] };
         repaint(true);
       });
     return entry;
@@ -754,6 +1008,71 @@
   var INVITEES_MISSING = Object.freeze({ state: 'missing', attendees: Object.freeze([]) });
   var inviteesAskedFor = {};
 
+  /* A ticket's whole conversation — every message, worded and attributed —
+     apart from the list, which carries only enough of each message to know
+     whether the conversation changed (queries.js: messageCount,
+     lastMessageAt). Kept by the ticket's uuid, alongside the version it was
+     fetched for: a background refresh that leaves both numbers the same
+     leaves the cached conversation alone, and ANY write anywhere reloads the
+     list (store.after()) without pulling every open ticket's thread with it —
+     the version comparison is what tells "this ticket changed" from "some
+     other save happened while this ticket's page was open" (audit #12). This
+     is deliberately NOT reset in after(), unlike pastMeetingsBy and the two
+     below: doing that would reload every open ticket's conversation after
+     every save in the workspace, which is the exact cost this exists to
+     avoid. A change to THIS ticket's own thread already moves its
+     messageCount or lastMessageAt on the next load, which is enough. */
+  var TICKET_THREAD_LOADING = Object.freeze({ state: 'loading', messages: Object.freeze([]) });
+  var ticketThreadsAskedFor = {};
+
+  function ticketThreadVersion(t) {
+    return String(t && t.messageCount != null ? t.messageCount : '') + '|' + String((t && t.lastMessageAt) || '');
+  }
+
+  function loadTicketThread(uuid, version) {
+    var entry = { state: 'loading', messages: [], version: version };
+    ticketThreadsAskedFor[uuid] = entry;
+    Promise.resolve()
+      .then(function () { return window.workspaceData.ticketMessages(uuid); })
+      .then(function (messages) {
+        if (ticketThreadsAskedFor[uuid] !== entry) return;
+        ticketThreadsAskedFor[uuid] = { state: 'ready', messages: messages, version: version };
+        repaint(true);
+      }, function (err) {
+        if (ticketThreadsAskedFor[uuid] !== entry) return;
+        console.error('[workspace] the ticket\'s conversation did not load:', err);
+        ticketThreadsAskedFor[uuid] = { state: 'failed', messages: [], version: version };
+        repaint(true);
+      });
+    return entry;
+  }
+
+  /* A ticket's attachments (0056), kept by uuid until a write — any write, as
+     pastMeetingsBy and inviteesAskedFor already are: there is no cheap
+     per-ticket signal for these the way messageCount and lastMessageAt are
+     for the conversation, and attachments are added and removed rarely
+     enough that reloading them after every save costs little. */
+  var TICKET_FILES_LOADING = Object.freeze({ state: 'loading', files: Object.freeze([]) });
+  var ticketFilesAskedFor = {};
+
+  function loadTicketFiles(uuid) {
+    var entry = { state: 'loading', files: [] };
+    ticketFilesAskedFor[uuid] = entry;
+    Promise.resolve()
+      .then(function () { return window.workspaceData.ticketAttachments(uuid); })
+      .then(function (files) {
+        if (ticketFilesAskedFor[uuid] !== entry) return;
+        ticketFilesAskedFor[uuid] = { state: 'ready', files: files };
+        repaint(true);
+      }, function (err) {
+        if (ticketFilesAskedFor[uuid] !== entry) return;
+        console.error('[workspace] the ticket\'s attachments did not load:', err);
+        ticketFilesAskedFor[uuid] = { state: 'failed', files: [] };
+        repaint(true);
+      });
+    return entry;
+  }
+
   function loadInvitees(key) {
     var entry = { state: 'loading', attendees: [] };
     inviteesAskedFor[key] = entry;
@@ -772,16 +1091,98 @@
     return entry;
   }
 
-  /* Past meetings, events and invitees a page asked for that did not load: a load that
-     works tries them again, as everything else is tried again by itself.
-     Answers whether any were let go. */
+  /* Archived projects (deleted_at set): left out of `projects` entirely, the
+     same way the client_project_progress view leaves them out, so there was
+     no way to see or restore one again. Asked for only when the Projects
+     page switches to its Archived view — not with the rest of the workspace,
+     since most visits never need it — and kept until a write, which may add
+     to or shrink the list (archiving, restoring). One shared entry: unlike
+     project activity there is only ever one archived list, not one per id. */
+  var archivedProjectsBy = null;
+  var ARCHIVED_PROJECTS_LOADING = Object.freeze({ state: 'loading', projects: Object.freeze([]) });
+
+  function loadArchivedProjects() {
+    var entry = { state: 'loading', projects: [] };
+    archivedProjectsBy = entry;
+    Promise.resolve()
+      .then(function () { return window.workspaceData.archivedProjects(); })
+      .then(function (rows) {
+        if (archivedProjectsBy !== entry) return;
+        archivedProjectsBy = { state: 'ready', projects: rows || [] };
+        repaint(true);
+      }, function (err) {
+        if (archivedProjectsBy !== entry) return;
+        console.error('[workspace] archived projects did not load:', err);
+        archivedProjectsBy = { state: 'failed', projects: [] };
+        repaint(true);
+      });
+    return entry;
+  }
+
+  /* A person's phone and notes (employee_private(), 0043), asked for by their
+     page and kept by id until a write, as events asked for are — companyModel
+     reads a missing answer, whatever the reason, the same way it reads one it
+     was never entitled to: not shown, never "none on file". */
+  var employeePrivateAskedFor = {};
+
+  function loadEmployeePrivate(id) {
+    var entry = { state: 'loading', details: null };
+    employeePrivateAskedFor[id] = entry;
+    Promise.resolve()
+      .then(function () { return window.workspaceData.employeePrivate(id); })
+      .then(function (details) {
+        if (employeePrivateAskedFor[id] !== entry) return;
+        employeePrivateAskedFor[id] = { state: 'ready', details: details };
+        repaint(true);
+      }, function (err) {
+        if (employeePrivateAskedFor[id] !== entry) return;
+        console.error('[workspace] their phone and notes did not load:', err);
+        employeePrivateAskedFor[id] = { state: 'failed', details: null };
+        repaint(true);
+      });
+    return entry;
+  }
+
+  /* A project's own activity (0052), asked for when its page is drawn rather
+     than with the whole workspace — the studio-wide feed is capped to its
+     most recent rows and a project's own history can reach further back than
+     that. Kept by project id until a write, which may have added to it. */
+  var projectActivityBy = {};
+  var PROJECT_ACTIVITY_LOADING = Object.freeze({ state: 'loading', activity: Object.freeze([]) });
+
+  function loadProjectActivity(id) {
+    var entry = { state: 'loading', activity: [] };
+    projectActivityBy[id] = entry;
+    Promise.resolve()
+      .then(function () { return window.workspaceData.projectActivity(id); })
+      .then(function (rows) {
+        if (projectActivityBy[id] !== entry) return;
+        projectActivityBy[id] = { state: 'ready', activity: rows || [] };
+        repaint(true);
+      }, function (err) {
+        if (projectActivityBy[id] !== entry) return;
+        console.error('[workspace] a project\'s activity did not load:', err);
+        projectActivityBy[id] = { state: 'failed', activity: [] };
+        repaint(true);
+      });
+    return entry;
+  }
+
+  /* Past meetings, events, invitees, a ticket's conversation and its
+     attachments, a project's own activity, and a person's phone and notes, a
+     page asked for that did not load: a load that works tries them again, as
+     everything else is tried again by itself. Answers whether any were let
+     go. A failed conversation still carries the version it failed at
+     (ticketThreadVersion), so this does not undo that — the next
+     askTicketThread simply finds nothing cached and asks afresh. */
   function clearFailedAsks() {
     var cleared = false;
-    [pastMeetingsBy, eventsAskedFor, inviteesAskedFor].forEach(function (asks) {
+    [pastMeetingsBy, eventsAskedFor, inviteesAskedFor, ticketThreadsAskedFor, ticketFilesAskedFor, projectActivityBy, employeePrivateAskedFor].forEach(function (asks) {
       Object.keys(asks).forEach(function (id) {
         if (asks[id].state === 'failed') { delete asks[id]; cleared = true; }
       });
     });
+    if (archivedProjectsBy && archivedProjectsBy.state === 'failed') { archivedProjectsBy = null; cleared = true; }
     return cleared;
   }
 
@@ -819,6 +1220,23 @@
     },
     /* Whether a week's events are in: until then the agenda says it is loading. */
     weekLoaded: function (key) { return Boolean(loadedWeeks[key]); },
+    /* Whether that week's own events failed on their last try — not some
+       other week's, and not stuck true once it has since loaded. */
+    weekFailed: function (key) { return Boolean(failedWeeks[key]); },
+
+    /* The month the agenda shows (agenda-ui.js, month mode): { key, since, to }
+       — since/to as eventsOverlapping() takes a week's. null clears it, so
+       leaving month view stops asking for a whole month's events every two
+       minutes. One not loaded yet is fetched in the background, as showWeek
+       fetches a week; one already loaded is not asked for again. */
+    showMonth: function (month) {
+      shownMonth = (month && month.key) ? month : null;
+      return shownMonth && state.loaded && loadedMonth !== shownMonth.key
+        ? load({ quiet: true, only: ['events'] })
+        : Promise.resolve();
+    },
+    /* Whether a month's events are in: until then the month view says it is loading. */
+    monthLoaded: function (key) { return Boolean(key) && loadedMonth === key; },
 
     /* A company's or a person's past meetings (crm-ui.js), as { state:
        'loading' | 'ready' | 'failed', meetings, more }. The first ask for a
@@ -863,26 +1281,140 @@
       return inviteesAskedFor[key] || loadInvitees(key);
     },
 
+    /* A ticket's whole conversation (tickets-ui.js), as { state: 'loading' |
+       'ready' | 'failed', messages }. Takes the ticket itself, not only its
+       id: the version that decides whether a cached copy still answers for it
+       (messageCount, lastMessageAt) lives on the ticket the list just loaded,
+       not in this cache. */
+    askTicketThread: function (ticket) {
+      var uuid = ticket && ticket.uuid;
+      if (!uuid) return TICKET_THREAD_LOADING;
+      var version = ticketThreadVersion(ticket);
+      var cached = ticketThreadsAskedFor[uuid];
+      if (cached && cached.version === version) return cached;
+      if (!state.loaded || !window.workspaceData || typeof window.workspaceData.ticketMessages !== 'function') return TICKET_THREAD_LOADING;
+      return loadTicketThread(uuid, version);
+    },
+    /* Ask again for a ticket's conversation that did not load. */
+    retryTicketThread: function (uuid) {
+      if (ticketThreadsAskedFor[uuid] && ticketThreadsAskedFor[uuid].state === 'failed') delete ticketThreadsAskedFor[uuid];
+    },
+
+    /* A ticket's attachments (tickets-ui.js), as { state: 'loading' | 'ready'
+       | 'failed', files }. */
+    askTicketAttachments: function (uuid) {
+      if (!uuid) return TICKET_FILES_LOADING;
+      if (!state.loaded || !window.workspaceData || typeof window.workspaceData.ticketAttachments !== 'function') return TICKET_FILES_LOADING;
+      return ticketFilesAskedFor[uuid] || loadTicketFiles(uuid);
+    },
+    /* Ask again for a ticket's attachments that did not load. */
+    retryTicketAttachments: function (uuid) {
+      if (ticketFilesAskedFor[uuid] && ticketFilesAskedFor[uuid].state === 'failed') delete ticketFilesAskedFor[uuid];
+    },
+
+    /* A project's own activity (project-panels.js), as { state: 'loading' |
+       'ready' | 'failed', activity }. The first ask for a project, once the
+       workspace has loaded, starts the load; its page is drawn again once it
+       lands. */
+    projectActivity: function (id) {
+      if (!state.loaded || !window.workspaceData || typeof window.workspaceData.projectActivity !== 'function') return PROJECT_ACTIVITY_LOADING;
+      return projectActivityBy[id] || loadProjectActivity(id);
+    },
+    /* Ask again for a project's activity that did not load. */
+    retryProjectActivity: function (id) {
+      if (projectActivityBy[id] && projectActivityBy[id].state === 'failed') delete projectActivityBy[id];
+    },
+
+    /* Archived projects (projects-ui.js's Archived view), as { state:
+       'loading' | 'ready' | 'failed', projects }. The first ask starts the
+       load; the page is drawn again once it lands. */
+    archivedProjects: function () {
+      if (!state.loaded || !window.workspaceData || typeof window.workspaceData.archivedProjects !== 'function') return ARCHIVED_PROJECTS_LOADING;
+      return archivedProjectsBy || loadArchivedProjects();
+    },
+    /* Ask again for the archived list once it has failed. */
+    retryArchivedProjects: function () {
+      if (archivedProjectsBy && archivedProjectsBy.state === 'failed') archivedProjectsBy = null;
+    },
+
+    /* Transactions since a day (finance-ui.js), as { state: 'loading' |
+       'ready' | 'failed', rows }. The first ask for a window starts the
+       load; the page is drawn again when it lands. */
+    transactions: function (since) {
+      if (!state.loaded || !window.workspaceData || typeof window.workspaceData.transactions !== 'function') return TX_LOADING;
+      return transactionsBy[since] || loadTransactions(since);
+    },
+    /* Ask again for a window of transactions that did not load. */
+    retryTransactions: function (since) {
+      if (transactionsBy[since] && transactionsBy[since].state === 'failed') delete transactionsBy[since];
+    },
+
+    /* A person's phone and notes (company-forms.js, workspace.js personDetail),
+       by their employee id: the row employee_private() answered, or null while
+       it is on its way, was refused, or is not this person's to see —
+       companyModel.personDetails() treats every one of those the same way. */
+    askEmployeePrivate: function (id) {
+      var key = String(id == null ? '' : id).toLowerCase();
+      if (!UUID_TEXT.test(key) || !state.loaded || !window.workspaceData
+          || typeof window.workspaceData.employeePrivate !== 'function') return null;
+      var entry = employeePrivateAskedFor[key] || loadEmployeePrivate(key);
+      return entry.state === 'ready' ? entry.details : null;
+    },
+
     /* Views call this after a write so the screen and the database agree. A
        refusal is said in a toast — unless the view says it itself, where it
        happened, and asks for none with { toast: false }: a dialog's error
-       line (dialog-forms.js), which a screen reader would otherwise hear twice. */
+       line (dialog-forms.js), which a screen reader would otherwise hear
+       twice. options.only: the parts this write can have changed — a CRM
+       save touches only contacts and companies, an event save only
+       ['events'] (and ['events','projectEvents'] for one on a project), not
+       the other parts a note or a task save still reloads whole; named ones
+       are reloaded on their own, fewer requests for the same repaint.
+       Left out, every part reloads exactly as it always has: `only` is
+       something a caller opts INTO, never assumed. A write that FAILS
+       always reloads everything regardless, in a full, quiet reload — a
+       refusal can still land after an earlier step of a multi-step write
+       went through, and `only` naming what the caller expected to change is
+       not proof nothing else did. */
     async after(promise, options) {
+      var only = options && Array.isArray(options.only) && options.only.length ? options.only : null;
+      /* Not quiet: a write's own dialog has already closed by the time this
+         runs, and loadParts() only skips its repaint on a quiet load that
+         changed nothing — a write that happened to change nothing the
+         signature could tell apart must still redraw, or the page is left
+         showing the record as still saving. */
+      var reload = only ? { only: only } : undefined;
       try {
         var out = await promise;
         pastMeetingsBy = {};
         eventsAskedFor = {};
         inviteesAskedFor = {};
-        await load();
+        ticketFilesAskedFor = {};
+        projectActivityBy = {};
+        archivedProjectsBy = null;
+        transactionsBy = {};
+        employeePrivateAskedFor = {};
+        mailSearchBy = {};
+        await load(reload);
         return out;
       } catch (err) {
         pastMeetingsBy = {};
         eventsAskedFor = {};
         inviteesAskedFor = {};
+        ticketFilesAskedFor = {};
+        projectActivityBy = {};
+        archivedProjectsBy = null;
+        transactionsBy = {};
+        employeePrivateAskedFor = {};
+        mailSearchBy = {};
         if (typeof toast === 'function' && !(options && options.toast === false)) toast(err.message);
         /* A write that failed may still have changed something — a row saved
            before a later step was refused — so the page is brought back to
-           what the database has, and a second try starts from the truth. */
+           what the database has, and a second try starts from the truth.
+           Always the whole workspace, never scoped to `only`: a caller
+           naming the parts it expected to change is not proof nothing else
+           did, and the safety net a failure needs is not narrower just
+           because the write happened to name a part. */
         load({ quiet: true });
         throw err;
       }
@@ -933,6 +1465,32 @@
       loadThread(threadId);
     },
 
+    /* "Load more" for one folder of one mailbox (mail.js), as { state:
+       'idle' | 'loading' | 'ready' | 'failed', more, threads } — never
+       started merely by asking (unlike pastMeetings/transactions above):
+       a page rendered over and over must not turn into a stream of older-
+       mail requests nobody clicked for. loadMoreMail is the one thing that
+       starts it. */
+    moreMail: function (mailbox, folder) { return moreMailBy[moreMailKey(mailbox, folder)] || MORE_MAIL_IDLE; },
+    loadMoreMail: loadMoreMail,
+
+    /* A word search across every mailbox this person can read (mail.js),
+       as { state: 'loading' | 'ready' | 'failed', results }. A blank query
+       is answered at once, with nothing asked for: search_mail itself
+       answers nothing for one, and skipping the round trip is one less
+       place a slow network shows on every keystroke that clears the box. */
+    searchMail: function (query) {
+      var q = String(query || '').trim();
+      if (!q) return MAIL_SEARCH_EMPTY;
+      if (!state.loaded || !window.workspaceData || typeof window.workspaceData.searchMail !== 'function') return MAIL_SEARCH_LOADING;
+      return mailSearchBy[q] || loadMailSearch(q);
+    },
+    /* Ask again for a search that did not load. */
+    retrySearchMail: function (query) {
+      var q = String(query || '').trim();
+      if (mailSearchBy[q] && mailSearchBy[q].state === 'failed') delete mailSearchBy[q];
+    },
+
     /* Projects are known by id (projects-model.js), never by position. */
     projectById: function (id) { return projectsModel.projectById(projects, String(id || '')); },
     /* A contact by its uuid — never by its place in the list, which changes
@@ -968,6 +1526,24 @@
      come back to the tab, and as soon as the connection is back. */
   setInterval(refreshIfDue, CHECK_EVERY_MS);
   document.addEventListener('visibilitychange', refreshIfDue);
+
+  /* Mail was otherwise read again only after a write, a send or a date
+     change — someone reading their inbox waited up to two minutes (the whole
+     workspace's own clock) for new mail to show, or for a "Synced … ago"
+     label to stop lying. Asked for on its own, more often, but only while
+     Mail is the page open and someone is looking at it: everywhere else the
+     two-minute clock above already carries it. */
+  var MAIL_REFRESH_MS = 45 * 1000;
+
+  function refreshMailIfOpen() {
+    if (!authed || running) return;
+    if (typeof page === 'undefined' || page !== 'mail') return;
+    if (document.visibilityState === 'hidden') return;
+    if (arrivedAt.mail != null && Date.now() - arrivedAt.mail < MAIL_REFRESH_MS) return;
+    load({ quiet: true, only: ['mail'] });
+  }
+  setInterval(refreshMailIfOpen, MAIL_REFRESH_MS);
+  document.addEventListener('visibilitychange', refreshMailIfOpen);
   window.addEventListener('online', function () {
     if (!authed) return;
     /* Even with a load running: it may be the one that is failing, and the

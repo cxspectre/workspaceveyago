@@ -87,7 +87,10 @@ function target(attributes) {
   return { closest: selector => (selector.split(',').map(s => s.trim().replace(/^\[|\]$/g, '')).some(name => name in attributes) ? element : null) };
 }
 
-/* refuse: 'company', 'contact' or 'update' — which write the database refuses. */
+const lower = s => String(s ?? '').trim().toLowerCase();
+
+/* refuse: 'company', 'contact', 'companyName' (more than one company by that
+   name) or 'update' — which write the database refuses. */
 function load({ companies = [], contacts = [], team = TEAM, loaded = true, parts = ['companies', 'contacts', 'team'], refuse = null } = {}) {
   const listeners = {};
   const toasts = [];
@@ -127,6 +130,32 @@ function load({ companies = [], contacts = [], team = TEAM, loaded = true, parts
         if (refusing === 'contact') throw new Error('Could not add the contact: duplicate key value violates unique constraint');
         return { id: ADDED, full_name: fields.fullName };
       },
+      /* create_contact_with_company (0053): matches p_company_name among the
+         live companies by lower(btrim(name)), refuses more than one match,
+         and otherwise makes a new one owned by the caller — all in the one
+         call, so a refused contact leaves nothing behind to track or rename. */
+      createContactWithCompany: async fields => {
+        writes.push(['createContactWithCompany', { ...fields }]);
+        if (refusing === 'contact') {
+          throw Object.assign(new Error('Could not add the contact: A contact with that email address is already in the CRM.'), { conflictContactId: 'existing-1' });
+        }
+        if (refusing === 'offline') throw new Error('Failed to fetch');
+        let companyId = fields.companyId || null;
+        if (fields.companyName) {
+          const matches = companies.filter(c => lower(c.name) === lower(fields.companyName));
+          if (refusing === 'companyName' || matches.length > 1) {
+            throw new Error(`Could not add the contact: More than one company is called "${fields.companyName}". Pick one of them.`);
+          }
+          if (matches.length === 1) {
+            companyId = matches[0].id;
+          } else {
+            companyId = MADE;
+            const row = { id: MADE, name: fields.companyName, domain: null, kind: 'prospect', stage: 'lead', value: null, currency: 'USD', owner_id: ME, notes: null };
+            companies.push({ id: MADE, name: row.name, domain: '', stage: 'Lead', kind: 'Prospect', value: '—', notes: '', row });
+          }
+        }
+        return { contactId: ADDED, companyId };
+      },
       updateCompany: async (id, changes) => {
         writes.push(['updateCompany', id, { ...changes }]);
         /* 'update': no row came back, which touched() says as a refusal; 'offline': it never reached the database. */
@@ -134,7 +163,25 @@ function load({ companies = [], contacts = [], team = TEAM, loaded = true, parts
         if (refusing === 'offline') throw new Error('Failed to fetch');
         return { id };
       },
-      updateContact: async (id, changes) => { writes.push(['updateContact', id, { ...changes }]); return { id }; }
+      updateContact: async (id, changes) => { writes.push(['updateContact', id, { ...changes }]); return { id }; },
+      mergeCompanies: async (keep, drop) => {
+        writes.push(['mergeCompanies', keep, drop]);
+        if (refusing === 'merge') throw new Error('Only an owner or admin can merge companies.');
+        return { kept_id: keep, merged_id: drop };
+      },
+      mergeContacts: async (keep, drop) => {
+        writes.push(['mergeContacts', keep, drop]);
+        if (refusing === 'merge') throw new Error('Only an owner or admin can merge contacts.');
+        return { kept_id: keep, merged_id: drop };
+      },
+      deleteCompany: async id => {
+        writes.push(['deleteCompany', id]);
+        if (refusing === 'delete') throw new Error('The company was not removed: it has been removed already, or only an owner or admin can remove one.');
+      },
+      deleteContact: async id => {
+        writes.push(['deleteContact', id]);
+        if (refusing === 'delete') throw new Error('The contact was not removed: it has been removed already, or only an owner or admin can remove one.');
+      }
     },
     document: {
       addEventListener: (type, fn) => { (listeners[type] = listeners[type] || []).push(fn); },
@@ -162,16 +209,20 @@ function load({ companies = [], contacts = [], team = TEAM, loaded = true, parts
   };
 }
 
-test('a contact refused after its new company was added, once its dialog is closed, says where the company is rather than that it stays chosen', async () => {
+test('a contact refused leaves nothing behind: a later attempt makes its company fresh rather than finding a ghost from before', async () => {
   const h = load({ refuse: 'contact' });
   h.create('crm');
   h.fill({ name: 'Ana Lima', email: 'ana@northline.example', companyId: 'new', company: 'Northline' });
-  h.send();
-  h.modal.close();
-  await settle();
-  assert.deepEqual(h.writes.map(([what]) => what), ['createCompany', 'createContact']);
-  assert.equal(h.toasts.at(-1),
-    'Northline was added, but Ana Lima was not: Could not add the contact: duplicate key value violates unique constraint. Northline is in the CRM: pick it when you add them again.');
+  await h.submit();
+  assert.deepEqual(h.writes.map(([what]) => what), ['createContactWithCompany'], 'one call — company and contact together');
+  assert.equal(h.part('.form-error').textContent, 'Could not add the contact: A contact with that email address is already in the CRM.');
+  assert.equal(h.modal.open, true, 'the dialog stays open to fix and try again');
+  h.refuse(null);
+  h.fill({ email: 'ben@northline.example' });
+  await h.submit();
+  assert.equal(h.writes.length, 2);
+  assert.equal(h.writes[1][1].companyName, 'Northline', 'the same company is asked for again — nothing was kept from the failed attempt to reuse or rename');
+  assert.equal(h.toasts.at(-1), 'Ana Lima added.');
 });
 
 /* ── Companies ────────────────────────────────────────────────────────── */
@@ -406,7 +457,8 @@ test('a new contact needs a name and nothing else, and at a company in the CRM i
   assert.equal(h.part('.form-error').textContent, `A contact needs a name.${String.fromCharCode(160)}`, 'said again, so it is read out again');
   h.fill({ name: 'Ben Ortiz' });
   await h.submit();
-  assert.deepEqual(h.writes, [['createContact', { fullName: 'Ben Ortiz', companyId: null, email: null, phone: null, title: null, notes: null }]]);
+  assert.deepEqual(h.writes, [['createContactWithCompany',
+    { fullName: 'Ben Ortiz', companyId: null, companyName: null, email: null, phone: null, title: null, notes: null }]]);
   assert.deepEqual(h.navigated, [`crm/${ADDED}`]);
   assert.equal(h.toasts.at(-1), 'Ben Ortiz added.');
 
@@ -414,7 +466,8 @@ test('a new contact needs a name and nothing else, and at a company in the CRM i
   at.create('crm');
   at.fill({ name: 'Ana Lima', email: 'Ana@Northline.example', companyId: NORTHLINE });
   await at.submit();
-  assert.deepEqual(at.writes, [['createContact', { fullName: 'Ana Lima', companyId: NORTHLINE, email: 'ana@northline.example', phone: null, title: null, notes: null }]]);
+  assert.deepEqual(at.writes, [['createContactWithCompany',
+    { fullName: 'Ana Lima', companyId: NORTHLINE, companyName: null, email: 'ana@northline.example', phone: null, title: null, notes: null }]]);
 });
 
 test('the new company\'s name is asked for only when a new company is picked', () => {
@@ -430,7 +483,7 @@ test('the new company\'s name is asked for only when a new company is picked', (
   assert.equal(h.part('[data-crm-company-name]').hidden, true);
 });
 
-test('a contact at a new company adds the company first, and an address someone has stops both before anything is written', async () => {
+test('a contact at a new company is added with it in one call, and an address someone has stops it before anything is written', async () => {
   const h = load({ contacts: [contact(ANA, 'Ana Lima', 'ana@northline.example')] });
   h.create('crm');
   h.fill({ name: 'Ben Ortiz', companyId: 'new', company: ' ' });
@@ -444,52 +497,50 @@ test('a contact at a new company adds the company first, and an address someone 
   assert.equal(h.part('[name="email"]').focused, 1);
   h.fill({ name: 'Ben Ortiz', email: 'ben@northline.example' });
   await h.submit();
-  assert.deepEqual(h.writes.map(([what]) => what), ['createCompany', 'createContact']);
-  assert.equal(h.writes[0][1].name, 'Northline');
-  assert.equal(h.writes[0][1].ownerId, ME, 'owned by whoever adds it, as a company added on its own is');
-  assert.equal(h.writes[1][1].companyId, MADE);
+  assert.deepEqual(h.writes.map(([what]) => what), ['createContactWithCompany'], 'one call — no spare company can be left behind by the other failing');
+  assert.equal(h.writes[0][1].companyName, 'Northline');
+  assert.equal(h.writes[0][1].companyId, null);
+  assert.deepEqual(h.navigated, [`crm/${ADDED}`]);
 });
 
-test('a new company added before its contact was refused stays chosen, is said on the form, and is used when the form is sent again', async () => {
+test('a contact refused for a duplicate address is said as one, not the database\'s own words, and a retry sends the same company again', async () => {
   const h = load({ refuse: 'contact' });
   h.create('crm');
   h.fill({ name: 'Ana Lima', email: 'ana@northline.example', companyId: 'new', company: 'Northline' });
   await h.submit();
-  assert.deepEqual(h.writes.map(([what]) => what), ['createCompany', 'createContact']);
-  const said = 'Northline was added, but Ana Lima was not: Could not add the contact: duplicate key value violates unique constraint. Northline stays chosen for them.';
-  assert.ok(!h.toasts.includes(said), 'said once, on the form, rather than in a toast as well');
-  assert.equal(h.part('.form-error').textContent, said);
+  assert.deepEqual(h.writes.map(([what]) => what), ['createContactWithCompany']);
+  assert.equal(h.part('.form-error').textContent, 'Could not add the contact: A contact with that email address is already in the CRM.');
   assert.equal(h.modal.open, true);
   assert.equal(h.part('[type="submit"]').disabled, false);
   h.refuse(null);
+  h.fill({ email: 'ana2@northline.example' });
   await h.submit();
-  assert.deepEqual(h.writes.map(([what]) => what), ['createCompany', 'createContact', 'createContact'], 'no second Northline');
-  assert.equal(h.writes[2][1].companyId, MADE);
+  assert.deepEqual(h.writes.map(([what]) => what), ['createContactWithCompany', 'createContactWithCompany']);
+  assert.equal(h.writes[1][1].companyName, 'Northline');
 });
 
-test('a kept company is renamed when its name is corrected, without being asked about itself, and said to stay when another is picked instead', async () => {
-  const companies = [];
-  const h = load({ refuse: 'contact', companies });
+test('more than one company already sharing the new company\'s name, found only once the database is asked, is said as the database says it', async () => {
+  const h = load({ refuse: 'companyName' });
   h.create('crm');
-  h.fill({ name: 'Ana Lima', companyId: 'new', company: 'Nortline' });
+  h.fill({ name: 'Ana Lima', companyId: 'new', company: 'Northline' });
   await h.submit();
-  companies.push(company(MADE, { name: 'Nortline', domain: null }));
-  h.refuse(null);
-  h.fill({ company: 'Nortline B.V.' });
-  await h.submit();
-  assert.deepEqual(h.writes.map(([what]) => what), ['createCompany', 'createContact', 'updateCompany', 'createContact']);
-  assert.deepEqual(h.writes[2], ['updateCompany', MADE, { name: 'Nortline B.V.' }]);
-  assert.equal(h.writes[3][1].companyId, MADE);
+  assert.equal(h.part('.form-error').textContent, 'Could not add the contact: More than one company is called "Northline". Pick one of them.');
+  assert.equal(h.writes.length, 1);
+});
 
-  const other = load({ refuse: 'contact', companies: [company(HARBOR, { name: 'Harbor', domain: null })] });
-  other.create('crm');
-  other.fill({ name: 'Ben Ortiz', companyId: 'new', company: 'Nortline' });
-  await other.submit();
-  other.refuse(null);
-  other.fill({ companyId: HARBOR });
-  await other.submit();
-  assert.equal(other.writes.at(-1)[1].companyId, HARBOR);
-  assert.equal(other.toasts.at(-1), 'Ben Ortiz added. Nortline, added a moment ago, stays in the CRM.');
+test('a new company at the same domain as another already in the CRM is refused and names it, exactly as the New company dialog\'s own domain field would', async () => {
+  const northline = company(NORTHLINE, { name: 'Northline', domain: 'northline.example' });
+  const h = load({ companies: [northline] });
+  h.create('crm');
+  h.fill({ name: 'Ben Ortiz', email: 'ben@northline.example', companyId: 'new', company: 'Northline Studio' });
+  await h.submit();
+  assert.deepEqual(h.writes, [], 'blocked before anything is sent');
+  assert.equal(h.part('.form-error').textContent, 'Northline already has the same domain: change it, or open Northline instead.');
+  assert.match(h.part('.form-candidates').innerHTML, new RegExp(`<a href="#crm/companies/${NORTHLINE}">Northline</a>`));
+  assert.equal(h.part('[name="company"]').focused, 1, 'the dialog has no domain field of its own to focus — the company name is the one naming it');
+  h.fill({ email: 'ben@gmail.com' });
+  await h.submit();
+  assert.equal(h.writes.length, 1, 'a public mailbox names no domain, so this one goes through unblocked');
 });
 
 test('editing a contact saves only what changed, and a contact whose company left the CRM keeps it unless another is picked', async () => {
@@ -518,39 +569,118 @@ test('editing a contact saves only what changed, and a contact whose company lef
   assert.equal(h.part('.form-error').textContent, 'Ana Lima already has the same email address: change it, or open Ana Lima instead.');
 });
 
-test('a kept company whose name is cleared asks for one, and one that could not be renamed is not said to stay', async () => {
+test('clearing the new company\'s name on a retry asks for one again, and switching away from a new company altogether sends none', async () => {
   const h = load({ refuse: 'contact' });
   h.create('crm');
-  h.fill({ name: 'Ana Lima', companyId: 'new', company: 'Nortline' });
+  h.fill({ name: 'Ana Lima', companyId: 'new', company: 'Northline' });
   await h.submit();
+  assert.equal(h.writes.length, 1);
   h.refuse(null);
   h.fill({ company: ' ' });
   await h.submit();
   assert.equal(h.part('.form-error').textContent, 'Give the new company a name, or pick one.');
-  assert.equal(h.writes.length, 2, 'nothing more is written');
-  h.refuse('update');
-  h.fill({ company: 'Northline' });
-  await h.submit();
-  assert.deepEqual(h.writes.map(([what]) => what), ['createCompany', 'createContact', 'updateCompany']);
-  h.refuse(null);
+  assert.equal(h.writes.length, 1, 'nothing more is written');
   h.fill({ companyId: '' });
   await h.submit();
   assert.equal(h.writes.at(-1)[1].companyId, null);
-  assert.equal(h.toasts.at(-1), 'Ana Lima added.', 'a company that could not be renamed is not said to stay');
+  assert.equal(h.writes.at(-1)[1].companyName, null);
+  assert.equal(h.toasts.at(-1), 'Ana Lima added.');
 });
 
-test('a kept company whose rename never reached the database is renamed when sent again, not added a second time', async () => {
-  const h = load({ refuse: 'contact' });
+test('an answer that never arrived while adding a contact is said as plainly as any other refusal, and the dialog stays open to try again', async () => {
+  const h = load({ refuse: 'offline' });
   h.create('crm');
-  h.fill({ name: 'Ana Lima', companyId: 'new', company: 'Nortline' });
+  h.fill({ name: 'Ana Lima', companyId: 'new', company: 'Northline' });
   await h.submit();
-  h.refuse('offline');
-  h.fill({ company: 'Northline' });
+  assert.equal(h.writes.length, 1);
+  assert.equal(h.part('.form-error').textContent, 'Failed to fetch.');
+  assert.equal(h.modal.open, true);
+});
+
+/* ── Merging companies and contacts (0053) ─────────────────────────────── */
+
+test('Merge lists every other company, never itself, and needs one picked', async () => {
+  const northline = company(NORTHLINE, { name: 'Northline' });
+  const harbor = company(HARBOR, { name: 'Harbor' });
+  const h = load({ companies: [northline, harbor] });
+  h.click({ 'data-crm-merge-company': NORTHLINE });
+  assert.match(h.body(), /<h2>Merge into Northline<\/h2>/);
+  assert.match(h.body(), new RegExp(`<option value="${HARBOR}">Harbor</option>`));
+  assert.doesNotMatch(h.body(), new RegExp(`<option value="${NORTHLINE}">`), 'not itself');
   await h.submit();
-  h.refuse(null);
+  assert.equal(h.part('.form-error').textContent, 'Pick the company to merge in.');
+  assert.deepEqual(h.writes, []);
+  h.fill({ dropId: HARBOR });
   await h.submit();
-  assert.deepEqual(h.writes.map(([what]) => what), ['createCompany', 'createContact', 'updateCompany', 'updateCompany', 'createContact']);
-  assert.equal(h.writes.at(-1)[1].companyId, MADE, 'filed under the company added the first time');
+  assert.deepEqual(h.writes, [['mergeCompanies', NORTHLINE, HARBOR]]);
+  assert.equal(h.toasts.at(-1), 'Harbor merged into Northline.');
+  assert.equal(h.modal.open, false);
+});
+
+test('Merge on a contact lists every other contact, and a refusal (owners and admins only) is said on the dialog', async () => {
+  const northline = company(NORTHLINE);
+  const ana = contact(ANA, 'Ana Lima', 'ana@northline.example', northline);
+  const ben = contact(BEN, 'Ben Ortiz', 'ben@northline.example', northline);
+  const h = load({ companies: [northline], contacts: [ana, ben], refuse: 'merge' });
+  h.click({ 'data-crm-merge-contact': ANA });
+  assert.match(h.body(), /<h2>Merge into Ana Lima<\/h2>/);
+  assert.match(h.body(), new RegExp(`<option value="${BEN}">Ben Ortiz</option>`));
+  h.fill({ dropId: BEN });
+  await h.submit();
+  assert.deepEqual(h.writes, [['mergeContacts', ANA, BEN]]);
+  assert.equal(h.part('.form-error').textContent, 'Only an owner or admin can merge contacts.');
+  assert.equal(h.modal.open, true, 'stays open so a manager watching can see why it did not go');
+});
+
+test('the Merge button is offered on a company\'s page and on a contact\'s', () => {
+  const northline = company(NORTHLINE, { name: 'Northline' });
+  const ana = contact(ANA, 'Ana Lima', 'ana@northline.example', northline);
+  const h = load({ companies: [northline], contacts: [ana] });
+  h.click({ 'data-crm-merge-company': 'not-loaded' });
+  assert.equal(h.toasts.at(-1), 'That company is no longer in the CRM.');
+  h.click({ 'data-crm-merge-contact': 'not-loaded' });
+  assert.equal(h.toasts.at(-1), 'That contact is no longer in the CRM.');
+});
+
+/* ── Removing a company or a contact (soft delete, deleted_at) ─────────── */
+
+test('Remove company asks first, names what stays behind, and removes it once confirmed', async () => {
+  const northline = company(NORTHLINE, { name: 'Northline' });
+  const h = load({ companies: [northline] });
+  h.click({ 'data-crm-delete-company': NORTHLINE });
+  assert.match(h.body(), /<h2>Remove Northline from the CRM\?<\/h2>/);
+  assert.match(h.body(), /Its people and its work — projects, tickets, mail and invoices — stay exactly where they are, filed under no company\./);
+  assert.doesNotMatch(h.body(), /form-candidates/, 'nothing here to ask about a look-alike record');
+  await h.submit();
+  assert.deepEqual(h.writes, [['deleteCompany', NORTHLINE]]);
+  assert.equal(h.toasts.at(-1), 'Northline is removed from the CRM.');
+  assert.deepEqual(h.navigated, ['crm/companies']);
+  assert.equal(h.modal.open, false);
+});
+
+test('Remove contact asks first, names what stays behind, and a refusal (owners and admins only) is said on the dialog', async () => {
+  const northline = company(NORTHLINE);
+  const ana = contact(ANA, 'Ana Lima', 'ana@northline.example', northline);
+  const h = load({ companies: [northline], contacts: [ana], refuse: 'delete' });
+  h.click({ 'data-crm-delete-contact': ANA });
+  assert.match(h.body(), /<h2>Remove Ana Lima from the CRM\?<\/h2>/);
+  assert.match(h.body(), /The projects, tickets and mail already linked to them stay exactly where they are\./);
+  await h.submit();
+  assert.deepEqual(h.writes, [['deleteContact', ANA]]);
+  assert.equal(h.part('.form-error').textContent,
+    'The contact was not removed: it has been removed already, or only an owner or admin can remove one.');
+  assert.equal(h.modal.open, true, 'stays open so a manager watching can see why it did not go');
+  assert.deepEqual(h.navigated, [], 'not navigated away on a refusal');
+});
+
+test('Remove is offered on a company\'s page and on a contact\'s, and a record no longer loaded says so', () => {
+  const northline = company(NORTHLINE, { name: 'Northline' });
+  const ana = contact(ANA, 'Ana Lima', 'ana@northline.example', northline);
+  const h = load({ companies: [northline], contacts: [ana] });
+  h.click({ 'data-crm-delete-company': 'not-loaded' });
+  assert.equal(h.toasts.at(-1), 'That company is no longer in the CRM.');
+  h.click({ 'data-crm-delete-contact': 'not-loaded' });
+  assert.equal(h.toasts.at(-1), 'That contact is no longer in the CRM.');
 });
 
 /* ── Around the dialogs ───────────────────────────────────────────────── */
@@ -601,8 +731,10 @@ test('what anyone typed stays text in the dialogs and in what they ask', async (
   const h = load({ companies: [evil], contacts: [person] });
   h.click({ 'data-crm-edit-company': NORTHLINE });
   h.click({ 'data-crm-edit-contact': ANA });
+  h.click({ 'data-crm-delete-company': NORTHLINE });
+  h.click({ 'data-crm-delete-contact': ANA });
   h.create('crm');
-  assert.equal(h.modals.length, 3);
+  assert.equal(h.modals.length, 5);
   for (const { body } of h.modals) {
     assert.doesNotMatch(body, /<img src=x|<script>|"><script|<\/textarea><img/i);
     assert.match(body, /&lt;img src=x onerror=alert\(1\)&gt;/, 'shown as what was typed');

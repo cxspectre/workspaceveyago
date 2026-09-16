@@ -120,7 +120,7 @@ function dialog(id, body) {
    error it is refused with. */
 function load({ list = [event()], me = 'e-me', manager = false, loaded = true, refuse = false, page = [EDIT_BUTTON, HEADING], active = null, misses = [],
   on = 'overview', projects = [], booked = { calendar: 'studio@veyago.cloud' }, now = NOW, days = DAYS, agenda = true, hiddenCalendars = {},
-  companies = [], contacts = [] } = {}) {
+  companies = [], contacts = [], canChange = e => e.row.connection_id === null && (manager || e.row.created_by === me) } = {}) {
   const listeners = {};
   const toasts = [];
   const modals = [];
@@ -156,7 +156,7 @@ function load({ list = [event()], me = 'e-me', manager = false, loaded = true, r
     workspaceSession: { employee: me ? { id: me } : null, isManager: () => manager },
     /* As agenda-ui.js decides them: who may change an event made here, the parts it comes back in, and the days New event offers. */
     agendaUi: {
-      canChange: e => e.row.connection_id === null && (manager || e.row.created_by === me),
+      canChange,
       partsOf: e => (e.row.project_id ? ['events', 'projectEvents'] : ['events']),
       hiddenCalendar: kind => (Object.prototype.hasOwnProperty.call(hiddenCalendars, kind) ? hiddenCalendars[kind] : null),
       ...(agenda ? { dayOptions: options => { dayCalls.push({ ...options }); return days; } } : {})
@@ -178,8 +178,8 @@ function load({ list = [event()], me = 'e-me', manager = false, loaded = true, r
       loadedSince: (part, mark) => loads.arrived[part] !== undefined && loads.arrived[part] > mark
     },
     workspaceActions: {
-      updateEvent: async (id, changes, since) => {
-        updates.push([id, { ...changes }, since]);
+      updateEvent: async (id, changes, since, connectionId) => {
+        updates.push([id, { ...changes }, since, connectionId]);
         if (holds.write) await holds.write.promise;
         if (refuse) throw Object.assign(new Error(REFUSAL), { refused: true });
         return { id, ...changes };
@@ -653,7 +653,7 @@ test('a changed event is saved with only what changed, made against when it last
   h.click(target('data-agenda-edit', 'ev-1'));
   h.fill({ title: 'Dentist, moved', startsAt: '2026-09-21T14:30', endsAt: '2026-09-21T15:30' });
   await h.submit();
-  assert.deepEqual(h.updates, [['ev-1', { title: 'Dentist, moved', starts_at: '2026-09-21T12:30:00.000Z', ends_at: '2026-09-21T13:30:00.000Z' }, STAMP]]);
+  assert.deepEqual(h.updates, [['ev-1', { title: 'Dentist, moved', starts_at: '2026-09-21T12:30:00.000Z', ends_at: '2026-09-21T13:30:00.000Z' }, STAMP, null]], 'null: a hand-made event, not routed to update-calendar-event');
   assert.deepEqual(h.toasts, ['Event saved.']);
   assert.equal(h.modal.open, false);
   assert.deepEqual(h.pageFocus, [EDIT_BUTTON]);
@@ -668,6 +668,28 @@ test('a changed event is saved with only what changed, made against when it last
   elsewhere.fill({ title: 'Dentist, moved' });
   await elsewhere.submit();
   assert.deepEqual(elsewhere.pageFocus, [], 'a keyboard somewhere on the page is left there');
+});
+
+/* 0057, "Events can't be edited, moved or deleted": a synced event can now be
+   edited too, for whoever agenda-ui.js's canChange says may (the studio's
+   calendar or your own) — event-edit.js itself does not decide that, only
+   passes the row's own connection_id through so actions.updateEvent knows to
+   route the write to update-calendar-event instead of the table. */
+test('a synced event\'s change is sent with its connection id, says it also reached Outlook, and the dialog says so up front', async () => {
+  const synced = event({ connection_id: 'conn-1' });
+  const h = load({ list: [synced], canChange: () => true });
+  h.click(target('data-agenda-edit', 'ev-1'));
+  assert.match(h.modals[0].body, /<p class="form-note">It is in a connected calendar: saving here changes it in Outlook too\.<\/p>/);
+  h.fill({ title: 'Dentist, moved' });
+  await h.submit();
+  assert.deepEqual(h.updates, [['ev-1', { title: 'Dentist, moved' }, STAMP, 'conn-1']]);
+  assert.deepEqual(h.toasts, ['Event saved, and updated in Outlook.']);
+});
+
+test('a hand-made event\'s dialog carries no such note', () => {
+  const h = load();
+  h.click(target('data-agenda-edit', 'ev-1'));
+  assert.doesNotMatch(h.modals[0].body, /connected calendar/);
 });
 
 test('an edit that changes nothing saves nothing; a refusal is said once, on the dialog, which stays open', async () => {
@@ -716,7 +738,7 @@ test('a problem is said on its field, and the next send starts from a clean dial
   await h.submit();
   assert.equal(h.form().error.textContent, '');
   assert.equal(h.form().field('endsAt').attributes['aria-invalid'], undefined);
-  assert.deepEqual(h.updates, [['ev-1', { ends_at: '2026-09-18T09:00:00.000Z' }, STAMP]]);
+  assert.deepEqual(h.updates, [['ev-1', { ends_at: '2026-09-18T09:00:00.000Z' }, STAMP, null]]);
 });
 
 test('the change is judged, and made, against the event as the dialog showed it, so what someone changed meanwhile is not undone', async () => {
@@ -726,7 +748,7 @@ test('the change is judged, and made, against the event as the dialog showed it,
   list[0] = event({ title: 'Dentist (moved by Ana)', location: 'Prinsengracht 5', updated_at: '2026-09-15T09:30:00.000000+00:00' });
   h.fill({ detail: 'Bring the forms and the card' });
   await h.submit();
-  assert.deepEqual(h.updates, [['ev-1', { detail: 'Bring the forms and the card' }, STAMP]],
+  assert.deepEqual(h.updates, [['ev-1', { detail: 'Bring the forms and the card' }, STAMP, null]],
     'only the details, and against the event as it was — which the database refuses, now that Ana changed it');
 });
 

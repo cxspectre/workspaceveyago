@@ -24,7 +24,7 @@ function take(prefix) {
   assert.equal(found.length, 1, `app.js has one line starting ${prefix}`);
   return found[0];
 }
-const WIRING = ['const todayEvents=', 'function overviewCounts(){', 'function agendaPanel(){', 'function attentionItems(){', 'function createForm(kind){']
+const WIRING = ['const todayEvents=', 'const mailUnreadTotal=', 'function overviewCounts(){', 'function agendaPanel(){', 'function attentionItems(){', 'function createForm(kind){']
   .map(take).join('\n');
 
 /* An event as queries.js hands it to the store, the row under `row`. */
@@ -38,7 +38,7 @@ const OFFSITE = event('offsite', at(14, 10), at(15, 16), { title: 'Studio offsit
 const STANDUP = event('standup', at(15, 9), at(15, 9, 30), { title: 'Standup' });
 const LATER = event('later', at(22, 11), at(22, 12), { title: 'Next week\'s review' });
 
-function load({ events = [OFFSITE, STANDUP, LATER], has = ['events'], weeks = [THIS_WEEK], failed = [], page = 'overview', days = [] } = {}) {
+function load({ events = [OFFSITE, STANDUP, LATER], has = ['events'], weeks = [THIS_WEEK], failed = [], failedWeeks = null, legacyStore = false, page = 'overview', days = [] } = {}) {
   const modals = [];
   const dayCalls = [];
   const context = vm.createContext({
@@ -56,9 +56,18 @@ function load({ events = [OFFSITE, STANDUP, LATER], has = ['events'], weeks = [T
     shapedInvoices: () => [],
     mailModel: { ALL: 'all', unreadCount: () => 0 },
     projectsModel: { isActive: () => true },
-    workspaceStore: { has: part => has.includes(part), weekLoaded: key => weeks.includes(key), state: { overview: null, failed } },
+    workspaceStore: {
+      has: part => has.includes(part), weekLoaded: key => weeks.includes(key), state: { overview: null, failed },
+      /* A test naming failedWeeks gets exactly those weeks failed; one that
+         only names failed (the whole-agenda list) is every week, matching
+         the fallback app.js used before store.js kept this. */
+      weekFailed: key => (failedWeeks ? failedWeeks.includes(key) : failed.includes('the agenda'))
+    },
     agendaUi: { dayOptions: options => { dayCalls.push({ ...options }); return days; } }
   });
+  /* A store from before weekFailed existed: app.js falls back to the old
+     whole-agenda check (state.failed) rather than throwing. */
+  if (legacyStore) delete context.workspaceStore.weekFailed;
   context.window = context;
   vm.runInContext(`const RealDate = Date; var __now = ${NOW};
     Date = class extends RealDate { constructor(...a) { super(...(a.length ? a : [__now])); } static now() { return __now; } };`, context);
@@ -132,6 +141,19 @@ test('while today\'s week is not in, the Overview says it is loading, or that it
   assert.match(load({ weeks: [], failed: ['the agenda'] }).context.agendaPanel(), /The agenda did not load\. It is tried again by itself\./);
 });
 
+test('the Overview panel says "did not load" for today\'s own failure, not a failure that was another week\'s', () => {
+  const own = load({ weeks: [], failedWeeks: [THIS_WEEK] }).context.agendaPanel();
+  assert.match(own, /The agenda did not load\. It is tried again by itself\./);
+  const elsewhere = load({ weeks: [], failedWeeks: ['2026-10-05'] }).context.agendaPanel();
+  assert.match(elsewhere, /Today’s agenda is loading…/, 'a different week\'s failure does not say today did not load');
+  assert.doesNotMatch(elsewhere, /did not load/);
+});
+
+test('a store from before weekFailed existed still says today did not load, from the old whole-agenda list', () => {
+  assert.match(load({ weeks: [], failed: ['the agenda'], legacyStore: true }).context.agendaPanel(), /The agenda did not load\. It is tried again by itself\./);
+  assert.match(load({ weeks: [], legacyStore: true }).context.agendaPanel(), /Today’s agenda is loading…/);
+});
+
 /* ── The create forms ─────────────────────────────────────────────────── */
 
 /* New event is event-edit.js's own dialog (tests/event-edit.test.mjs). */
@@ -167,12 +189,78 @@ test('search is handed the project meetings coming up, beside the weeks loaded',
   });
   /* As on a page, where window is the global the scripts share. */
   context.window = context;
-  vm.runInContext(take('function searchSources(){'), context);
+  vm.runInContext(['let searchedEvents=', 'function searchSources(){'].map(take).join('\n'), context);
   const handed = vm.runInContext('searchSources()', context);
   assert.deepEqual([...handed.projectEvents].map(e => e.id), ['pm9']);
   assert.deepEqual([...handed.events].map(e => e.id), ['standup']);
+  assert.deepEqual([...handed.searchedEvents], [], 'nothing asked for yet');
   delete context.workspaceStore;
   assert.deepEqual([...vm.runInContext('searchSources()', context).projectEvents], [], 'before the store is on the page, none');
+});
+
+/* app.js's own searchEventsForBox(): the database half of global search
+   (0064's search_events), asked only once typing settles and only for a
+   query still current when the answer lands. */
+function loadSearchEvents({ searchEvents = null } = {}) {
+  const timers = [];
+  const asked = [];
+  const context = vm.createContext({
+    setTimeout: (fn, ms) => { timers.push({ fn, ms, cleared: false, fired: false }); return timers.length - 1; },
+    clearTimeout: id => { if (timers[id]) timers[id].cleared = true; },
+    showResults: () => {},
+    workspaceData: searchEvents ? { searchEvents: q => { asked.push(q); return searchEvents(q); } } : undefined
+  });
+  context.window = context;
+  vm.runInContext(['let searchedEvents=', 'const GLOBAL_SEARCH_DEBOUNCE_MS=', 'function searchEventsForBox(q){'].map(take).join('\n'), context);
+  return {
+    call: q => vm.runInContext(`searchEventsForBox(${JSON.stringify(q)})`, context),
+    fire: () => timers.filter(t => !t.cleared && !t.fired).forEach(t => { t.fired = true; t.fn(); }),
+    searchedEvents: () => vm.runInContext('searchedEvents', context),
+    asked
+  };
+}
+
+test('a query asks the database only once typing settles, and a slow answer superseded by a newer query is dropped', async () => {
+  let resolveFirst;
+  const h = loadSearchEvents({
+    searchEvents: q => (q === 'first' ? new Promise(resolve => { resolveFirst = resolve; }) : Promise.resolve([{ id: 'e1' }]))
+  });
+  h.call('first');
+  h.fire();
+  h.call('second');
+  h.fire();
+  await Promise.resolve(); await Promise.resolve();
+  assert.deepEqual(h.asked, ['first', 'second']);
+  assert.deepEqual([...h.searchedEvents()].map(e => e.id), ['e1'], '"second" already answered');
+  resolveFirst([{ id: 'stale' }]);
+  await Promise.resolve(); await Promise.resolve();
+  assert.deepEqual([...h.searchedEvents()].map(e => e.id), ['e1'], 'the late, superseded answer for "first" never overwrites "second"\'s');
+});
+
+test('typing again before the debounce elapses never asks the database for what was typed first', () => {
+  const h = loadSearchEvents({ searchEvents: () => Promise.resolve([]) });
+  h.call('fir');
+  h.call('first');
+  h.fire();
+  assert.deepEqual(h.asked, ['first'], 'the debounce timer for "fir" was cleared before it ever fired');
+});
+
+test('a blank query asks nothing, and clears whatever the last query found — without waiting for a debounce that will never fire', async () => {
+  const h = loadSearchEvents({ searchEvents: () => Promise.resolve([{ id: 'e1' }]) });
+  h.call('retro');
+  h.fire();
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(h.searchedEvents().length, 1);
+  h.call('');
+  assert.deepEqual([...h.searchedEvents()], []);
+  assert.deepEqual(h.asked, ['retro']);
+});
+
+test('no workspaceData.searchEvents (a store from before 0064) asks nothing and throws nothing', () => {
+  const h = loadSearchEvents();
+  assert.doesNotThrow(() => h.call('retro'));
+  assert.doesNotThrow(() => h.fire());
+  assert.deepEqual(h.asked, []);
 });
 
 /* ── A project page ───────────────────────────────────────────────────── */

@@ -83,7 +83,7 @@ function load({ actions = {}, loaded = true, after = promise => promise, confirm
     noteDrafts
   });
   context.window = context;
-  for (const file of ['projects-model.js', 'tickets-model.js', 'data/writes.js']) {
+  for (const file of ['mail-model.js', 'projects-model.js', 'tickets-model.js', 'data/writes.js']) {
     vm.runInContext(readFileSync(new URL(`../dist/${file}`, import.meta.url), 'utf8'), context);
   }
   /* Answers whether a listener stopped the rest from running. */
@@ -387,6 +387,44 @@ test('a sent reply leaves the draft before the page is drawn again, not after', 
   assert.deepEqual(sentWhenRepainted, [1], 'a repaint before it would draw the sent reply back into the box');
 });
 
+/* ── Reply and set to Waiting (audit #5) ─────────────────────────────────── */
+
+test('reply and set to Waiting sends the reply, then the status, once the reply is confirmed sent', async () => {
+  const h = load();
+  h.fire('submit', replyForm({ body: 'Fixed now.', mode: 'reply', thenWaiting: 'on' }).form);
+  await ticks(8);
+  assert.deepEqual(h.calls, [['replyToTicket', 'u142', 'Fixed now.', 'reply'], ['setTicketStatus', 'u142', 'waiting']]);
+  assert.match(h.toasts.at(-1), /^Reply sent to ana@northline\.example\. Status: Waiting\./);
+});
+
+test('reply and set to Waiting does nothing extra for a note, or a reply only saved, not sent', async () => {
+  const note = load();
+  note.fire('submit', replyForm({ body: 'Provider outage.', mode: 'note', thenWaiting: 'on' }).form);
+  await ticks(8);
+  assert.deepEqual(note.calls, [['replyToTicket', 'u142', 'Provider outage.', 'note']], 'a note is never followed by a status change');
+
+  const unsent = load({ actions: { replyToTicket: () => Promise.resolve({ sent: false, reason: 'No mailbox is connected.' }) } });
+  unsent.fire('submit', replyForm({ body: 'Fixed now.', mode: 'reply', thenWaiting: 'on' }).form);
+  await ticks(8);
+  assert.deepEqual(unsent.calls, [['replyToTicket', 'u142', 'Fixed now.', 'reply']],
+    'a reply that was not actually sent leaves the status alone: "Waiting" would not be true');
+  assert.equal(unsent.toasts.at(-1), 'No mailbox is connected.');
+});
+
+test('an unchecked box leaves the status exactly as replying alone always has', async () => {
+  const h = load();
+  h.fire('submit', replyForm({ body: 'Fixed now.', mode: 'reply' }).form);
+  await ticks(8);
+  assert.deepEqual(h.calls, [['replyToTicket', 'u142', 'Fixed now.', 'reply']]);
+});
+
+test('reply and set to Waiting says so when the reply sent but the status could not be saved', async () => {
+  const h = load({ actions: { setTicketStatus: () => Promise.reject(new Error('Only staff can change a ticket.')) } });
+  h.fire('submit', replyForm({ body: 'Fixed now.', mode: 'reply', thenWaiting: 'on' }).form);
+  await ticks(8);
+  assert.equal(h.toasts.at(-1), 'Reply sent to ana@northline.example, but the status was not saved: Only staff can change a ticket.');
+});
+
 test('a note says nothing about whether the last reply went, either way', async () => {
   let asked = 0;
   const h = load({
@@ -464,6 +502,14 @@ test('a requester the CRM does not know is written into the opening note rather 
   await ticks(8);
   assert.deepEqual({ ...h.calls[0][1] }, { subject: 'Question', product: null, priority: 'urgent', contactId: null, companyId: null });
   assert.equal(h.calls[1][2], 'Requester: Someone New\n\nDo you ship to Canada?');
+});
+
+test('a requester the CRM does not know, typed as an address, is still kept for a reply to reach (audit #1)', async () => {
+  const h = load();
+  h.fire('submit', createForm({ name: 'A question', context: 'guest@example.invalid', description: 'Do you ship to Canada?', priority: 'Normal' }).form);
+  await ticks(8);
+  assert.deepEqual({ ...h.calls[0][1] },
+    { subject: 'A question', product: null, priority: 'normal', contactId: null, companyId: null, requesterEmail: 'guest@example.invalid' });
 });
 
 test('a name two contacts share is a question, not a guess: nothing is opened until an address says who', async () => {

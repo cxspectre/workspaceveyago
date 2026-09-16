@@ -94,6 +94,95 @@ const mailModel = (function () {
       t.folder === 'inbox' && t.unread && (!mailbox || mailbox === ALL || t.mailboxId === mailbox)).length;
   }
 
+  /* Whether a mailbox's folder hit queries.js's per-folder cap: the list is
+     not everything that folder holds, and neither is a count taken from it.
+     `truncated` is store.js's state.mailTruncated, each entry a "box|folder"
+     key (`box` is a connection id, or the literal "all" when the mailbox list
+     itself failed to load and threads were fetched with no connection filter
+     at all — RLS decided what came back, and it can still be more than the
+     cap). `folders` is which folders the caller's count draws from: Starred
+     spans inbox, sent and starred, so a cut inbox already puts its starred
+     count in doubt too. */
+  function isTruncated(truncated, mailbox, folders) {
+    const keys = truncated || [];
+    const wanted = folders || [];
+    return keys.some(key => {
+      const [box, folder] = String(key).split('|');
+      return wanted.includes(folder) && (mailbox === ALL || box === 'all' || box === mailbox);
+    });
+  }
+
+  /* An unread badge counts only what loaded. Past the cap, an older unread
+     thread is not being counted at all — `atLeast` says the number is a
+     floor, not the true count. A true one needs the database to count what
+     was never fetched (trueCounts, below): mail_unread_counts() (0062).
+     trueCounts: {connectionId: count}, once it has landed — a real count()
+     past whatever mailThreads() loaded beats the floor guess outright, so it
+     is used first, and All mailboxes sums every mailbox counted rather than
+     only the ones the loaded list still happens to hold unread mail from.
+     null/undefined (not yet asked, still loading, or a database from before
+     0062) falls back to the guess unreadCount() has always made. */
+  function unreadCountInfo(threads, mailbox, truncated, trueCounts) {
+    if (trueCounts) {
+      return Object.freeze({
+        count: mailbox === ALL ? trueUnreadTotal(trueCounts) : (Number(trueCounts[mailbox]) || 0),
+        atLeast: false
+      });
+    }
+    return Object.freeze({
+      count: unreadCount(threads, mailbox),
+      atLeast: isTruncated(truncated, mailbox, ['inbox'])
+    });
+  }
+
+  /* The grand total across every mailbox mail_unread_counts() named — each
+     value coerced through Number() since a bigint column can come back as a
+     string, however the client happens to serialise one. null while there is
+     nothing to sum yet: unknown is not the same as zero (app.js's nav badge
+     and the bell fall back to unreadCount()'s own loaded-list guess for
+     exactly that reason, only once this reads null). */
+  function trueUnreadTotal(trueCounts) {
+    if (!trueCounts) return null;
+    return Object.values(trueCounts).reduce((sum, n) => sum + (Number(n) || 0), 0);
+  }
+
+  /* mails plus a "Load more" page's own older threads (store.js
+     loadMoreMail), each once: the same thread can arrive in both once a
+     background refresh's fresh 200-per-folder window reaches back far
+     enough to retouch what "Load more" already fetched on its own. mails'
+     own copy is kept — its order, newest first, is what "Load more"
+     continues past — so a stale one an older page happened to answer with
+     is never shown over it. */
+  function mergeOlder(threads, older) {
+    const seen = new Set();
+    return Object.freeze([...(threads || []), ...(older || [])].filter(t => {
+      if (!t || seen.has(t.id)) return false;
+      seen.add(t.id);
+      return true;
+    }));
+  }
+
+  /* A thread search_mail (0055) found that mailThreads()'s own 200-per-
+     folder window never loaded — built from what the search hit already
+     answered: enough for the reading pane to open it and ask for its
+     messages by id (workspaceStore.loadThread/threadBody, which need only
+     the id, never the row). What only the loaded row would know — the true
+     sender, read and starred state, its folder, a linked ticket or contact —
+     is not guessed at: `fromSearch` tells the reader to withhold the two
+     controls (star, mark unread) that would otherwise toggle a state this
+     does not actually have. */
+  function threadFromSearchHit(hit) {
+    return Object.freeze({
+      id: hit.threadId, sender: 'Unknown sender', initial: '?', email: '',
+      subject: hit.subject, preview: hit.preview, time: hit.time,
+      unread: false, starred: false, count: undefined,
+      mailboxId: hit.mailboxId, folder: null,
+      ticketId: null, contactId: null,
+      body: undefined, bodyHtml: undefined, thread: undefined,
+      row: hit.row, fromSearch: true
+    });
+  }
+
   function recipientLine(list) {
     const all = (list || []).filter(Boolean).map(String);
     if (all.length <= RECIPIENTS_SHOWN) return all.join(', ');
@@ -182,26 +271,94 @@ const mailModel = (function () {
     return Object.freeze({ messageId: target.id, to: Object.freeze(to), cc: Object.freeze(cc) });
   }
 
-  /* One address as people paste it, with quotes, a mailto: and stray angle
-     brackets taken off. */
-  const bareAddress = token => String(token || '').trim()
-    .replace(/^mailto:/i, '')
-    .replace(/^["'<\s]+|["'>\s]+$/g, '')
+  /* One or several trailing parenthetical comments taken off ("a@x (Do not
+     reply) (Automated)"), balanced parens inside one counted rather than
+     matched by a regex — a regex retried across a long run of them, hunting
+     for one that never closes, backtracks in the square of the input's
+     length and can freeze the tab on a large paste; counting characters from
+     the end never backtracks at all. A leading comment is not handled (falls
+     back to invalid, same as before this existed — never a mangled or
+     fabricated address). A comment holding a comma, a semicolon or a new
+     line is already torn from what follows by the time this runs, so only
+     its first word survives whole; also left. */
+  function withoutComments(value) {
+    for (;;) {
+      var trimmed = value.replace(/\s+$/, '');
+      if (!trimmed.endsWith(')')) return trimmed;
+      var depth = 0, start = -1;
+      for (var i = trimmed.length - 1; i >= 0; i--) {
+        if (trimmed[i] === ')') depth++;
+        else if (trimmed[i] === '(') {
+          depth--;
+          if (depth === 0) { start = i; break; }
+        }
+      }
+      if (start < 0) return trimmed; // no opening match: not a comment, leave it
+      value = trimmed.slice(0, start);
+    }
+  }
+
+  /* One address as people paste it, with quotes, a mailto: (and any ?subject=
+     it carries, whatever ran between the colon and the address — only there,
+     so a literal ? in an address's own local part is left alone), a trailing
+     parenthetical comment, and stray angle brackets taken off. */
+  const bareAddress = token => withoutComments(String(token || '').trim()
+    .replace(/^mailto:\s*([^?\s]*)(?:\?.*)?$/i, '$1')
+    .replace(/^["'<\s]+|["'>\s]+$/g, ''))
     .trim();
 
-  /* What someone typed or pasted into an address field. A named address comes
-     out whole first, because its name may hold a comma ("Lima, Ana <ana@…>"):
-     before a <address>, semicolons and new lines always separate recipients,
-     and a comma does only where an address sits before it. The rest splits on
+  /* The piece touching a <address> is that address's own name — cut off,
+     never a second recipient — whatever else came before it, comma- or
+     semicolon-separated, and however many words it holds ("Lima, Ana <ana@…>"
+     keeps only ana@…). It is read as a name even when it looks like an
+     address in its own right, as some senders set their display name to
+     their own old or public one ("j.doe@old.example <j.doe@new.example>" —
+     the piece before it is dropped, not a second recipient) — UNLESS it
+     holds more than one @, which no name would: that is several addresses
+     pasted with a space and no comma between them ("a@x b@y <c@z>"; kept
+     whole here, split on whitespace by the flatMap below). Returns how many
+     of the pieces before the bracket to keep as separate addresses. */
+  function nameCutoff(pieces) {
+    const last = pieces.length - 1;
+    const lastAddress = pieces.map(piece => piece.includes('@')).lastIndexOf(true);
+    const nextToBracket = pieces[last] || '';
+    if (lastAddress === last && (nextToBracket.match(/@/g) || []).length <= 1) return lastAddress;
+    return lastAddress + 1;
+  }
+
+  /* A bracket can hold more than one address, comma- or semicolon-separated,
+     as some clients export them — a stray leading or trailing separator
+     leaves no piece of its own to fail this — but only when every piece left
+     is itself a whole address; a comma inside a quoted local part
+     ('<"Lima, Ana"@x>') must not be read as such a separator and fabricate
+     one out of a fragment. */
+  function bracketed(inside) {
+    const pieces = inside.split(/[,;]+/).map(piece => piece.trim()).filter(Boolean);
+    return pieces.length && pieces.every(piece => piece.includes('@')) ? pieces : [inside];
+  }
+
+  /* What someone typed or pasted into an address field. Before a <address>,
+     semicolons and new lines always separate recipients, and a comma does
+     only where an address sits before it (nameCutoff). The rest splits on
      commas, semicolons and new lines — and on spaces, when several addresses
      share one piece. */
   function parseAddresses(text) {
     const tokens = [];
-    const rest = String(text || '').replace(/([^<>]*)<([^<>]*)>/g, (_, before, inside) => {
+    const str = String(text || '');
+    /* The regex below can only ever match where there is a literal < — with
+       none in the whole string it is guaranteed to replace nothing, and
+       skipping it here avoids a real freeze on a long paste with no bracket
+       at all (a signature block, a quoted thread): failing to find one, a
+       regex built from two open-ended runs of "not < or >" backtracks in the
+       square of the remaining length once it reaches the end without one.
+       Pre-existing (not from this change), and only this common shape is
+       covered — a long run of text with no < AFTER a real <address> pair
+       backtracks the same way and is not, since fixing that would mean
+       replacing the regex itself, a larger change than today's fix called for. */
+    const rest = str.indexOf('<') === -1 ? str : str.replace(/([^<>]*)<([^<>]*)>/g, (_, before, inside) => {
       const segments = before.split(/[;\n]/);
       const pieces = segments.pop().split(',');
-      const lastAddress = pieces.map(piece => piece.includes('@')).lastIndexOf(true);
-      tokens.push(...segments, ...pieces.slice(0, lastAddress + 1), inside);
+      tokens.push(...segments, ...pieces.slice(0, nameCutoff(pieces)), ...bracketed(inside));
       return '\n';
     });
     tokens.push(...rest.split(/[,;\n]+/));
@@ -311,7 +468,8 @@ const mailModel = (function () {
   }
 
   return Object.freeze({
-    ALL, FOLDERS, mailboxesFor, mailboxNote, parseMailRoute, mailRoute, folderForThread, visibleThreads, unreadCount, recipientLine,
+    ALL, FOLDERS, mailboxesFor, mailboxNote, parseMailRoute, mailRoute, folderForThread, visibleThreads, unreadCount,
+    isTruncated, unreadCountInfo, trueUnreadTotal, mergeOlder, threadFromSearchHit, recipientLine,
     LIMITS, PURIFY_CONFIG, isAddress, subjectFor, answerFor, parseAddresses, storageName, attachmentProblem,
     signatureFor, sendProblem, addressBook
   });

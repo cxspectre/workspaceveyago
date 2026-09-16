@@ -53,10 +53,14 @@ const shellModel = (function () {
       [co.name, co.domain].join(' '), 'crm/companies/' + co.id)));
     (s.team || []).forEach(m => items.push(entry('Person', m.name, m.role,
       [m.name, m.role].join(' '), 'company/people/' + m.id)));
-    /* An event, found with the day it is on: the weeks loaded and the project
-       meetings coming up, which reach beyond them — each once. */
+    /* An event, found with the day it is on: the weeks loaded, the project
+       meetings that reach beyond them, and — once a query has actually gone
+       to the database (queries.js searchEvents, 0064) — a past meeting or a
+       plain event weeks away in either direction, which neither of those two
+       ever holds, being both just windows in time. Each counted once: the
+       database can easily re-find something already loaded. */
     const seenEvents = new Set();
-    [...(s.events || []), ...(s.projectEvents || [])].forEach(e => {
+    [...(s.events || []), ...(s.projectEvents || []), ...(s.searchedEvents || [])].forEach(e => {
       const key = text(e && e.id).toLowerCase();
       if (!key || seenEvents.has(key)) return;
       seenEvents.add(key);
@@ -113,12 +117,22 @@ const shellModel = (function () {
 
   /* What the bell lists: urgent open tickets, invoices waiting to be paid (for
      the people who can read Finance), unread mail and today's events — each
-     one leading to where it can be dealt with. */
+     one leading to where it can be dealt with, and never one this person has
+     already dismissed (f.dismissed: notification_dismissals' own keys, 0061).
+     A key is a fact about the RECORD ("ticket:<uuid>"), not about the moment it
+     became urgent, so dismissing a ticket is dismissing it for good: were it
+     to quiet down and turn urgent again later, the same key stays hidden.
+     That is the trade the workspace makes for a bell that does not repeat
+     itself — "unread mail" and "today's events" are counts, not records, and
+     are dismissed as a whole for the same reason a read email does not
+     unread itself. */
   function attention(facts) {
     const f = facts || {};
+    const dismissed = new Set((f.dismissed || []).map(text));
     const items = [];
     (f.tickets || [])
-      .filter(t => overviewModel.isOpenTicket(t) && overviewModel.URGENT.includes(t.priority))
+      .filter(t => overviewModel.isOpenTicket(t) && overviewModel.URGENT.includes(t.priority)
+        && !dismissed.has('ticket:' + t.uuid))
       .slice(0, PER_KIND)
       .forEach(t => items.push(Object.freeze({
         key: 'ticket:' + t.uuid,
@@ -129,7 +143,8 @@ const shellModel = (function () {
     if (f.isManager) {
       (f.invoices || [])
         .map((invoice, index) => ({ invoice, index }))
-        .filter(({ invoice }) => invoice.status === 'Overdue' || invoice.status === 'Sent')
+        .filter(({ invoice }) => (invoice.status === 'Overdue' || invoice.status === 'Sent')
+          && !dismissed.has('invoice:' + (invoice.uuid || invoice.id)))
         .sort((a, b) => (a.invoice.status === 'Overdue' ? 0 : 1) - (b.invoice.status === 'Overdue' ? 0 : 1) || a.index - b.index)
         .slice(0, PER_KIND)
         .forEach(({ invoice, index }) => items.push(Object.freeze({
@@ -139,14 +154,14 @@ const shellModel = (function () {
           route: 'finance/' + invoice.uuid
         })));
     }
-    if (f.unreadMail > 0) {
+    if (f.unreadMail > 0 && !dismissed.has('mail:unread')) {
       items.push(Object.freeze({
         key: 'mail:unread', title: plural(f.unreadMail, 'unread conversation'),
         detail: 'Across your mailboxes', route: 'mail'
       }));
     }
     const today = f.eventsToday || [];
-    if (today.length) {
+    if (today.length && !dismissed.has('events:today')) {
       items.push(Object.freeze({
         key: 'events:today', title: plural(today.length, 'event') + ' today',
         detail: today.map(e => text(e.title)).join(' · ').slice(0, 90), route: 'agenda/today'

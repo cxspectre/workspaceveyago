@@ -131,32 +131,350 @@ test('Starred reaches conversations filed away in Outlook, and Inbox and Sent st
   ]);
 });
 
+test('mailThreads asks for a page older than a given cursor, when "Load more" wants one', async () => {
+  const { data, queries } = loadTables();
+  await data.mailThreads(['inbox'], ['box-1'], '2026-09-01T00:00:00Z');
+  const filters = queries[0].calls.filter(([method]) => ['eq', 'lt'].includes(method)).map(call => call.join(' '));
+  assert.deepEqual(filters, ['eq folder inbox', 'eq connection_id box-1', 'lt last_message_at 2026-09-01T00:00:00Z']);
+});
+
+test('mailThreads asks for nothing older when no cursor is given, exactly as before', async () => {
+  const { data, queries } = loadTables();
+  await data.mailThreads(['inbox'], ['box-1']);
+  assert.ok(!queries[0].calls.some(([method]) => method === 'lt'), 'the ordinary load never bounds by date');
+});
+
+test('mailThreads asks for the other party, and no longer for whoever sent most recently', async () => {
+  const { data, queries } = loadTables();
+  await data.mailThreads(['inbox'], ['box-1']);
+  const select = queries[0].calls.find(([method]) => method === 'select')[1];
+  assert.ok(select.includes('other_party_name'), 'asks for other_party_name');
+  assert.ok(select.includes('other_party_email'), 'asks for other_party_email');
+  assert.ok(!select.includes('last_from_name'), 'the renamed column is gone, not just supplemented');
+});
+
+test('a thread shows the OTHER party — never whoever wrote most recently — and a CRM contact outranks both', async () => {
+  const { data } = loadTables(table => (table !== 'mail_threads' ? [] : [
+    { id: 't1', connection_id: 'box-1', folder: 'inbox', message_count: 2, last_message_at: '2026-09-10T09:00:00Z',
+      subject: 'Kickoff', snippet: 'Looking forward', is_read: true, is_starred: false,
+      other_party_name: 'Ana Lima', other_party_email: 'ana@northline.example',
+      ticket_id: null, contact_id: null, contact: null },
+    { id: 't2', connection_id: 'box-1', folder: 'inbox', message_count: 1, last_message_at: '2026-09-09T09:00:00Z',
+      subject: 'Intro', snippet: 'Hello', is_read: true, is_starred: false,
+      other_party_name: null, other_party_email: 'prospect@newbiz.example',
+      ticket_id: null, contact_id: null, contact: null },
+    { id: 't3', connection_id: 'box-1', folder: 'inbox', message_count: 3, last_message_at: '2026-09-08T09:00:00Z',
+      subject: 'Renewal', snippet: 'Thanks', is_read: true, is_starred: false,
+      other_party_name: 'Stale Name', other_party_email: 'stale@x.example',
+      ticket_id: null, contact_id: 'c1', contact: { full_name: 'Real Contact', email: 'real@x.example' } },
+    { id: 't4', connection_id: 'box-1', folder: 'inbox', message_count: 0, last_message_at: null,
+      subject: 'Nothing known', snippet: '', is_read: true, is_starred: false,
+      other_party_name: null, other_party_email: null, ticket_id: null, contact_id: null, contact: null }
+  ]));
+  const { threads } = await data.mailThreads(['inbox'], ['box-1']);
+  const byId = Object.fromEntries(threads.map(t => [t.id, t]));
+  assert.equal(byId.t1.sender, 'Ana Lima', 'answered or not, a known name is shown');
+  assert.equal(byId.t2.sender, 'prospect@newbiz.example',
+    'a thread we started, nobody has answered yet: the address we wrote to, not our own name nor "Unknown sender"');
+  assert.equal(byId.t2.email, 'prospect@newbiz.example');
+  assert.equal(byId.t3.sender, 'Real Contact', 'a matched CRM contact outranks the other-party columns');
+  assert.equal(byId.t3.email, 'real@x.example');
+  assert.equal(byId.t4.sender, 'Unknown sender', 'nothing known about either party at all');
+});
+
+test('a message carries its importance, Bcc and its attachments\' metadata', async () => {
+  const { data, queries } = loadTables(table => (table !== 'mail_messages' ? [] : [
+    { id: 'm1', external_id: 'x1', direction: 'inbound', from_name: 'Ana Lima', from_email: 'ana@northline.example',
+      to_emails: ['hello@veyago.cloud'], cc_emails: [], bcc_emails: [], subject: 'Re: Kickoff',
+      body_text: 'See attached', body_html: '', sent_at: '2026-09-10T09:00:00Z', importance: 'high',
+      mail_attachments: [
+        { id: 'a1', name: 'brief.pdf', content_type: 'application/pdf', size: 4096, is_inline: false, content_id: null },
+        { id: 'a2', name: 'logo.png', content_type: 'image/png', size: 512, is_inline: true, content_id: 'logo1' }
+      ] }
+  ]));
+  const [m] = await data.mailMessages('t1');
+  const select = queries[0].calls.find(([method]) => method === 'select')[1];
+  for (const part of ['bcc_emails', 'importance', 'mail_attachments']) {
+    assert.ok(select.includes(part), `the query asks for ${part}`);
+  }
+  assert.equal(m.importance, 'high');
+  assert.deepEqual([...m.bcc], []);
+  assert.equal(m.attachments.length, 2);
+  /* Spread first: these objects were built inside the vm sandbox, a different
+     realm whose Object is not this file's — deepEqual (this file imports the
+     strict assert, whose deepEqual is deepStrictEqual) tells them apart by
+     that alone otherwise, however identical their own fields are. */
+  assert.deepEqual({ ...m.attachments[0] },
+    { id: 'a1', name: 'brief.pdf', size: 4096, contentType: 'application/pdf', isInline: false, contentId: null });
+  assert.equal(m.attachments[1].isInline, true);
+  assert.equal(m.attachments[1].contentId, 'logo1');
+});
+
+test('no importance reads as normal, and no attachments is an empty list, not missing', async () => {
+  const { data } = loadTables(table => (table !== 'mail_messages' ? [] : [
+    { id: 'm1', external_id: 'x1', direction: 'outbound', from_name: '', from_email: 'hello@veyago.cloud',
+      to_emails: [], cc_emails: [], bcc_emails: null, subject: '', body_text: '', body_html: '',
+      sent_at: '2026-09-10T09:00:00Z', importance: null, mail_attachments: null }
+  ]));
+  const [m] = await data.mailMessages('t1');
+  assert.equal(m.importance, 'normal');
+  assert.deepEqual([...m.bcc], []);
+  assert.deepEqual([...m.attachments], []);
+});
+
+test('mailUnreadCounts asks the database, and shapes it as a plain map by mailbox', async () => {
+  const q = load(() => ({
+    data: [{ connection_id: 'box-1', unread_count: 3 }, { connection_id: 'box-2', unread_count: 0 }],
+    error: null
+  }));
+  const counts = await q.data.mailUnreadCounts();
+  assert.deepEqual({ ...counts }, { 'box-1': 3, 'box-2': 0 });
+  assert.equal(q.calls[0].name, 'mail_unread_counts');
+});
+
+test('mailUnreadCounts copes with a bigint answered as a string', async () => {
+  const q = load(() => ({ data: [{ connection_id: 'box-1', unread_count: '7' }], error: null }));
+  const counts = await q.data.mailUnreadCounts();
+  assert.equal(counts['box-1'], 7);
+});
+
+test('a failed unread count is a failure, said in words', async () => {
+  const q = load(() => ({ data: null, error: { message: 'permission denied for function mail_unread_counts' } }));
+  await assert.rejects(q.data.mailUnreadCounts(),
+    { message: 'Could not load the unread mail count: permission denied for function mail_unread_counts' });
+});
+
+test('searchMail reaches the database for a whole mailbox\'s words, and skips a blank query entirely', async () => {
+  const q = load((name, args) => (name === 'search_mail'
+    ? {
+      data: [{ thread_id: 't1', connection_id: 'box-1', subject: 'Kickoff', snippet: 'Looking forward to it', sent_at: '2026-01-05T09:00:00Z' }],
+      error: null
+    }
+    : { data: null, error: { message: 'unexpected rpc ' + name } }));
+
+  assert.deepEqual([...(await q.data.searchMail('   '))], [], 'blank (or whitespace-only) is not a search');
+  assert.equal(q.calls.length, 0, 'nothing was asked for it');
+
+  const [hit] = await q.data.searchMail('kickoff');
+  assert.deepEqual(q.calls[0], { name: 'search_mail', args: { p_query: 'kickoff', p_limit: 30 } });
+  assert.equal(hit.threadId, 't1');
+  assert.equal(hit.mailboxId, 'box-1');
+  assert.equal(hit.subject, 'Kickoff');
+  assert.equal(hit.preview, 'Looking forward to it');
+});
+
+test('a search failure is said in words', async () => {
+  const q = load(() => ({ data: null, error: { message: 'permission denied for function search_mail' } }));
+  await assert.rejects(q.data.searchMail('kickoff'),
+    { message: 'Could not search mail: permission denied for function search_mail' });
+});
+
+/* ── A contact's or a company's linked mail (mail_threads.contact_id/
+   company_id, read straight off the table rather than mailThreads()'s own
+   per-folder working window) ─────────────────────────────────────────── */
+
+test('a contact\'s linked mail is asked by their id, newest first, with one more asked for than shown', async () => {
+  /* A vm-sandboxed array/object has the same shape as a plain literal here but
+     is not reference-equal to it, which deepEqual (deepStrictEqual) tells
+     apart even though nothing about the two actually differs. */
+  const plain = value => JSON.parse(JSON.stringify(value));
+  const C1 = 'c1000000-0000-4000-8000-000000000001';
+  const rows = [
+    { id: 't1', subject: 'Kickoff', folder: 'inbox', is_read: false, is_starred: true,
+      last_message_at: '2026-09-10T09:00:00Z', other_party_name: 'Ana Lima', other_party_email: 'ana@northline.example',
+      contact_id: C1, company_id: null },
+    { id: 't2', subject: null, folder: 'archive', is_read: true, is_starred: false,
+      last_message_at: '2026-08-01T09:00:00Z', other_party_name: null, other_party_email: 'ana@northline.example',
+      contact_id: C1, company_id: null }
+  ];
+  const { data, queries } = loadTables(table => (table === 'mail_threads' ? rows : []));
+  const { threads, more } = await data.mailThreadsFor({ contactId: C1 });
+  assert.deepEqual(queries[0].calls.find(([method]) => method === 'or'), ['or', `contact_id.eq.${C1}`]);
+  assert.deepEqual(plain(queries[0].calls.filter(([method]) => method === 'order').map(c => c.slice(1))),
+    [['last_message_at', { ascending: false, nullsFirst: false }], ['id', { ascending: false }]]);
+  assert.equal(more, false);
+  assert.deepEqual(threads.map(t => t.id), ['t1', 't2']);
+  assert.equal(threads[0].sender, 'Ana Lima');
+  assert.equal(threads[0].folder, 'inbox');
+  assert.equal(threads[0].starred, true);
+  assert.equal(threads[0].unread, true);
+  assert.equal(threads[1].subject, '(no subject)', 'no subject on record');
+  assert.equal(threads[1].sender, 'ana@northline.example', 'no name known, the address stands in');
+});
+
+test('a company\'s linked mail is asked by its own id, and with neither id nothing is', async () => {
+  const plain = value => JSON.parse(JSON.stringify(value));
+  const CO = 'b1000000-0000-4000-8000-000000000001';
+  const { data, queries } = loadTables(() => []);
+  await data.mailThreadsFor({ companyId: CO });
+  assert.deepEqual(queries[0].calls.find(([method]) => method === 'or'), ['or', `company_id.eq.${CO}`]);
+  const none = loadTables(() => { throw new Error('nothing should be asked with no id'); });
+  assert.deepEqual(plain(await none.data.mailThreadsFor({})), { threads: [], more: false });
+  assert.equal(none.queries.length, 0, 'no id that is a uuid, no request');
+});
+
+test('linked mail says there is more past its own limit (20 unless given), and a limit given is capped at 100', async () => {
+  const C1 = 'c1000000-0000-4000-8000-000000000001';
+  const rows = Array.from({ length: 21 }, (_, i) => ({
+    id: `t${i}`, subject: `Thread ${i}`, folder: 'inbox', is_read: true, is_starred: false,
+    last_message_at: '2026-09-10T09:00:00Z', other_party_name: 'Ana Lima', other_party_email: 'ana@northline.example',
+    contact_id: C1, company_id: null
+  }));
+  const { data, queries } = loadTables(table => (table === 'mail_threads' ? rows : []));
+  const { threads, more } = await data.mailThreadsFor({ contactId: C1 });
+  assert.equal(threads.length, 20);
+  assert.equal(more, true);
+  assert.deepEqual(queries[0].calls.find(([method]) => method === 'limit'), ['limit', 21], 'one more than shown, to know');
+  await data.mailThreadsFor({ contactId: C1, limit: 500 });
+  assert.deepEqual(queries[1].calls.find(([method]) => method === 'limit'), ['limit', 101], 'at most 100 shown, and one more asked for');
+});
+
+/* ── Agenda search (0064) ─────────────────────────────────────────────── */
+
+test('searchEvents reaches the database for a past meeting or a far-off event, and skips a blank query entirely', async () => {
+  const q = load((name, args) => (name === 'search_events'
+    ? {
+      data: [{
+        id: 'e9', title: 'Northline retro', detail: null, location: 'Lisbon',
+        starts_at: '2026-06-01T14:00:00Z', ends_at: '2026-06-01T14:30:00Z', all_day: false, kind: 'client'
+      }],
+      error: null
+    }
+    : { data: null, error: { message: 'unexpected rpc ' + name } }));
+
+  assert.deepEqual([...(await q.data.searchEvents('   '))], [], 'blank (or whitespace-only) is not a search');
+  assert.equal(q.calls.length, 0, 'nothing was asked for it');
+
+  const [hit] = await q.data.searchEvents('retro');
+  assert.deepEqual(q.calls[0], { name: 'search_events', args: { p_query: 'retro', p_limit: 20 } });
+  assert.equal(hit.id, 'e9');
+  assert.equal(hit.title, 'Northline retro');
+  assert.equal(hit.detail, 'Lisbon', 'falls back to the location the same way every other agenda event does');
+  assert.match(hit.when, / · \d\d:\d\d$/, 'shaped by agendaEvent, the same as any other event this file returns');
+});
+
+test('a search failure is said in words', async () => {
+  const q = load(() => ({ data: null, error: { message: 'permission denied for function search_events' } }));
+  await assert.rejects(q.data.searchEvents('retro'),
+    { message: 'Could not search events: permission denied for function search_events' });
+});
+
 /* ── Tickets ──────────────────────────────────────────────────────────── */
 
-test('a ticket arrives with its owner by id, the customer\'s address, and who wrote each message', async () => {
+/* The list embeds only enough of each message to know whether the
+   conversation changed (id, direction, created_at, delivered_at,
+   delivery_error) — never its body or who wrote it, which used to come with
+   every ticket on every load (audit #12). The whole conversation, worded and
+   attributed, is a separate call (ticketMessages), asked for once a ticket's
+   page actually needs it — the same reason mail keeps a thread's body apart
+   from its list (queries.mailThreads / mailMessages). */
+test('the list asks for enough to know a ticket changed, never a message\'s words', async () => {
   const { data, queries } = loadTables(table => (table !== 'support_tickets' ? [] : [{
     id: 'u142', number: 142, subject: 'Checkout', product: null, priority: 'urgent', status: 'in_progress',
-    created_at: '2026-09-10T09:00:00Z', assignee_id: 'e-me',
+    created_at: '2026-09-10T09:00:00Z', updated_at: '2026-09-10T10:00:00Z', assignee_id: 'e-me',
+    merged_into_id: null, first_response_due_at: '2026-09-10T13:00:00Z', resolve_due_at: '2026-09-11T09:00:00Z',
     contact: { full_name: 'Ana Lima', email: 'ana@northline.example' }, company: null, assignee: { full_name: 'Sam Rivera' },
     ticket_messages: [
-      { id: 'm2', body: 'On it', direction: 'outbound', created_at: '2026-09-10T10:00:00Z',
-        delivered_at: null, delivery_error: 'refused', author: { full_name: 'Sam Rivera' }, sender: null },
-      { id: 'm1', body: 'Broken', direction: 'inbound', created_at: '2026-09-10T09:00:00Z',
-        author: null, sender: { full_name: 'Ana Lima' } }
+      { id: 'm2', direction: 'outbound', created_at: '2026-09-10T10:00:00Z', delivered_at: null, delivery_error: 'refused' },
+      { id: 'm1', direction: 'inbound', created_at: '2026-09-10T09:00:00Z', delivered_at: null, delivery_error: null }
     ]
   }]));
   const [t] = await data.tickets();
   const select = queries[0].calls.find(([method]) => method === 'select')[1];
   for (const part of ['assignee_id', 'contact:crm_contacts (full_name, email)', 'delivered_at', 'delivery_error',
-                      'author:employees (full_name)', 'sender:crm_contacts (full_name)', 'first_response_at']) {
+                      'first_response_at', 'updated_at', 'merged_into_id', 'first_response_due_at', 'resolve_due_at']) {
     assert.ok(select.includes(part), `the query asks for ${part}`);
   }
+  assert.doesNotMatch(select, /\bbody\b/, 'a message\'s words are not in the list query');
+  assert.doesNotMatch(select, /author:employees|sender:crm_contacts/, 'nor who wrote it — that comes with ticketMessages');
   assert.equal(t.assigneeId, 'e-me');
   assert.equal(t.assigneeName, 'Sam Rivera');
   assert.equal(t.contactEmail, 'ana@northline.example');
   assert.equal(t.status, 'In progress');
-  assert.deepEqual([...t.thread.map(m => `${m.id}:${m.who}`)], ['m1:Ana Lima', 'm2:Sam Rivera'], 'oldest first, with who wrote it');
-  assert.equal(t.body, 'Broken');
+  assert.equal(t.thread, null, 'not loaded with the list; store.js asks for it lazily');
+  assert.equal(t.messageCount, 2);
+  assert.equal(t.lastMessageAt, '2026-09-10T10:00:00Z');
+  assert.equal(t.deliveryFailed, true, 'the latest outbound message never delivered');
+  assert.equal(t.mergedIntoId, null);
+});
+
+test('a ticket carries its company\'s client number, when it is filed under one that has reached that stage', async () => {
+  const { data, queries } = loadTables(table => (table !== 'support_tickets' ? [] : [{
+    id: 'u144', number: 144, subject: 'Renewal', product: null, priority: 'normal', status: 'open',
+    created_at: '2026-09-10T09:00:00Z', contact: null, company: { name: 'Northline', client_number: 42 }, assignee: null, ticket_messages: []
+  }, {
+    id: 'u145', number: 145, subject: 'A lead\'s question', product: null, priority: 'normal', status: 'open',
+    created_at: '2026-09-10T09:00:00Z', contact: null, company: { name: 'Early Talks', client_number: null }, assignee: null, ticket_messages: []
+  }]));
+  const [numbered, unnumbered] = await data.tickets();
+  const select = queries[0].calls.find(([method]) => method === 'select')[1];
+  assert.ok(select.includes('client_number'), 'the query asks for it on the same embed');
+  assert.equal(numbered.row.company.client_number, 42);
+  assert.equal(unnumbered.row.company.client_number, null, 'a company not yet a client has none');
+});
+
+test('a fallback address stands in for the client and the reply-to address when there is no CRM contact', async () => {
+  const { data } = loadTables(table => (table !== 'support_tickets' ? [] : [{
+    id: 'u143', number: 143, subject: 'A question', product: null, priority: 'normal', status: 'open',
+    created_at: '2026-09-10T09:00:00Z', requester_email: 'guest@example.invalid', requester_name: 'A Guest',
+    contact: null, company: null, assignee: null, ticket_messages: []
+  }]));
+  const [t] = await data.tickets();
+  assert.equal(t.client, 'A Guest', 'the raw sender name, when the CRM has no contact for them');
+  assert.equal(t.contactEmail, 'guest@example.invalid', 'so a reply still has somewhere to go (audit #1)');
+});
+
+test('a delivered reply, or one with nothing sent yet, is not flagged as failed', async () => {
+  const sent = (over) => loadTables(table => (table !== 'support_tickets' ? [] : [Object.assign({
+    id: 'u1', number: 1, subject: 'x', product: null, priority: 'normal', status: 'open',
+    created_at: '2026-09-10T09:00:00Z', contact: null, company: null, assignee: null
+  }, over)]));
+  const delivered = await sent({ ticket_messages: [{ id: 'm1', direction: 'outbound', created_at: '2026-09-10T10:00:00Z', delivered_at: '2026-09-10T10:00:02Z', delivery_error: null }] }).data.tickets();
+  assert.equal(delivered[0].deliveryFailed, false);
+  const none = await sent({ ticket_messages: [] }).data.tickets();
+  assert.equal(none[0].deliveryFailed, false);
+});
+
+test('a ticket\'s whole conversation, oldest first, with who wrote each message', async () => {
+  const { data, queries } = loadTables(table => (table !== 'ticket_messages' ? [] : [
+    { id: 'm2', body: 'On it', direction: 'outbound', created_at: '2026-09-10T10:00:00Z',
+      delivered_at: null, delivery_error: 'refused', author: { full_name: 'Sam Rivera' }, sender: null },
+    { id: 'm1', body: 'Broken', direction: 'inbound', created_at: '2026-09-10T09:00:00Z',
+      author: null, sender: { full_name: 'Ana Lima' } }
+  ]));
+  const thread = await data.ticketMessages('u142');
+  const call = queries.find(q => q.table === 'ticket_messages');
+  const select = call.calls.find(([method]) => method === 'select')[1];
+  for (const part of ['body', 'delivered_at', 'delivery_error', 'author:employees (full_name)', 'sender:crm_contacts (full_name)']) {
+    assert.ok(select.includes(part), `asks for ${part}`);
+  }
+  assert.deepEqual(call.calls.find(([method]) => method === 'eq'), ['eq', 'ticket_id', 'u142']);
+  assert.deepEqual([...thread.map(m => `${m.id}:${m.who}`)], ['m1:Ana Lima', 'm2:Sam Rivera'], 'oldest first, with who wrote it');
+});
+
+test('a ticket\'s attachments, newest first', async () => {
+  const { data, queries } = loadTables(table => (table !== 'ticket_attachments' ? [] : [
+    { id: 'a1', name: 'screenshot.png', size_bytes: 2048, content_type: 'image/png', storage_path: 'u142/a1/screenshot.png', created_at: '2026-09-10T09:00:00Z' }
+  ]));
+  const files = await data.ticketAttachments('u142');
+  const call = queries.find(q => q.table === 'ticket_attachments');
+  assert.deepEqual(call.calls.find(([method]) => method === 'eq'), ['eq', 'ticket_id', 'u142']);
+  assert.equal(files[0].name, 'screenshot.png');
+  assert.equal(files[0].sizeBytes, 2048);
+});
+
+test('every ticket loads, past the thousand rows the API hands back at once', async () => {
+  let served = 0;
+  const ticket = i => ({ id: `t${i}`, number: i, subject: `Ticket ${i}`, status: 'open', priority: 'normal', ticket_messages: [] });
+  const { data, queries } = loadTables(table => {
+    if (table !== 'support_tickets') return [];
+    served += 1;
+    return served === 1 ? Array.from({ length: 1000 }, (_, i) => ticket(i)) : [ticket(1000)];
+  });
+  const list = await data.tickets();
+  assert.equal(list.length, 1001);
+  assert.deepEqual(queries.map(q => q.calls.filter(([method]) => method === 'range').map(call => call.slice(1).join('-'))), [['0-999'], ['1000-1999']]);
+  assert.ok(queries[0].calls.some(call => call.join(' ') === 'order id'), 'pages in a fixed order do not overlap');
 });
 
 /* ── Agenda and tasks ─────────────────────────────────────────────────── */
@@ -239,7 +557,7 @@ test('a client\'s past meetings: before the day given, filed under the company, 
   assert.deepEqual(call('neq'), ['neq', 'status', 'cancelled']);
   assert.deepEqual(call('order'), ['order', 'starts_at', { ascending: false }]);
   assert.deepEqual(call('limit'), ['limit', 3], 'one more than are shown, to know whether there are more');
-  assert.match(call('select')[1], /connection_id, created_by/, 'the columns that say who may change one');
+  assert.match(call('select')[1], /connection_id, calendar_id, created_by/, 'the columns that say who may change one, and which calendar it is in (0057)');
   assert.doesNotMatch(call('select')[1], /attendees/, 'who is invited is asked for by the page of the one opened');
   assert.deepEqual(result.meetings.map(m => m.id), ['e3', 'e2']);
   assert.equal(result.more, true);
@@ -306,7 +624,7 @@ test('one event is asked for by its id — a uuid, and nothing else — and none
   assert.equal(found.id, EV);
   assert.equal(found.title, 'Pitch');
   assert.deepEqual(plain(queries[0].calls.find(([method]) => method === 'eq')), ['eq', 'id', EV]);
-  assert.match(queries[0].calls.find(([method]) => method === 'select')[1], /connection_id, created_by, attendees/, 'every column its page reads');
+  assert.match(queries[0].calls.find(([method]) => method === 'select')[1], /connection_id, calendar_id, created_by, organizer_name, organizer_email, meeting_url, time_zone, attendees/, 'every column its page reads');
   assert.match(queries[0].calls.find(([method]) => method === 'select')[1], /\bupdated_at\b/, 'and when it last changed, which an edit is made against');
   assert.equal(await loadTables(() => []).data.event(EV), null);
   const crafted = loadTables(() => []);
@@ -333,6 +651,80 @@ test('a note whose author\'s row is gone is a former team member\'s, never the s
   assert.equal(notes[0].who, 'Former team member');
   assert.equal(notes[0].authorId, null);
   assert.doesNotMatch(notes.map(n => n.who).join(' '), /Veyago/);
+});
+
+/* ── Projects ─────────────────────────────────────────────────────────── */
+
+test('projects order by sort_order, then by name and id so a reload never reshuffles them', async () => {
+  const { data, queries } = loadTables(table => (table !== 'client_project_progress' ? [] : [
+    { id: 'p1', name: 'Northline site' }, { id: 'p2', name: 'Kept · Autumn release' }
+  ]));
+  await data.projects();
+  assert.deepEqual(queries[0].calls.filter(([method]) => method === 'order'),
+    [['order', 'sort_order'], ['order', 'name'], ['order', 'id']],
+    'sort_order is the same 0 for every project, so name then id is what actually settles the order');
+});
+
+test('archived projects are read past the view, which leaves them out, ordered newest-archived first', async () => {
+  const plain = value => JSON.parse(JSON.stringify(value));
+  const { data, queries } = loadTables(table => (table !== 'client_projects' ? [] : [
+    { id: 'p1', name: 'Old brief', code: null, accent: 'default', status: 'cancelled', description: null,
+      company_id: null, owner_id: null, due_on: null, deleted_at: '2026-08-01T09:00:00Z', company: null }
+  ]));
+  const [p] = await data.archivedProjects();
+  assert.equal(p.id, 'p1');
+  assert.equal(p.name, 'Old brief');
+  assert.equal(p.archivedAt, '2026-08-01T09:00:00Z');
+  assert.deepEqual(plain(queries[0].calls.filter(([method]) => method === 'not')), [['not', 'deleted_at', 'is', null]]);
+  assert.deepEqual(plain(queries[0].calls.filter(([method]) => method === 'order')),
+    [['order', 'deleted_at', { ascending: false }], ['order', 'id']]);
+});
+
+test('archived projects are named by their company, or "Internal product" with none', async () => {
+  const { data } = loadTables(table => (table !== 'client_projects' ? [] : [
+    { id: 'p1', name: 'Client work', code: null, accent: 'client', status: 'on_hold', description: null,
+      company_id: 'co1', owner_id: null, due_on: null, deleted_at: '2026-08-01T09:00:00Z', company: { name: 'Northline' } },
+    { id: 'p2', name: 'Side project', code: null, accent: 'default', status: 'discovery', description: null,
+      company_id: null, owner_id: null, due_on: null, deleted_at: '2026-08-02T09:00:00Z', company: null }
+  ]));
+  const [client, internal] = await data.archivedProjects();
+  assert.equal(client.client, 'Northline');
+  assert.equal(internal.client, 'Internal product');
+});
+
+test('a project\'s own activity is asked for by its id, past the studio-wide feed\'s window, and shaped the same way', async () => {
+  const plain = value => JSON.parse(JSON.stringify(value));
+  const PROJECT = 'a1000000-0000-4000-8000-000000000001';
+  const { data, queries } = loadTables(table => (table !== 'workspace_activity' ? [] : [{
+    id: 'a1', verb: 'created', entity_type: 'task', entity_id: 't1', summary: 'New task · Draft copy',
+    created_at: '2026-09-14T09:00:00Z', actor: { full_name: 'Sam Rivera' }
+  }]));
+  const [entry] = await data.projectActivity(PROJECT);
+  assert.equal(entry.who, 'Sam Rivera');
+  assert.equal(entry.text, 'New task · Draft copy');
+  assert.deepEqual(plain(queries[0].calls.filter(([method]) => method === 'eq')), [['eq', 'project_id', PROJECT]]);
+  assert.deepEqual(plain(queries[0].calls.find(([method]) => method === 'order')), ['order', 'created_at', { ascending: false }]);
+});
+
+test('a project\'s activity asks for nothing without a real id', async () => {
+  const { data, queries } = loadTables(() => []);
+  assert.deepEqual([...(await data.projectActivity('drop table projects;'))], []);
+  assert.deepEqual([...(await data.projectActivity(''))], []);
+  assert.equal(queries.length, 0);
+});
+
+test('every note loads, past the thousand rows the API hands back at once', async () => {
+  let served = 0;
+  const note = i => ({ id: `n${i}`, entity_type: 'project', entity_id: 'p1', body: `Note ${i}`, created_at: '2026-09-01T09:00:00Z', author_id: null, author: null });
+  const { data, queries } = loadTables(table => {
+    if (table !== 'workspace_notes') return [];
+    served += 1;
+    return served === 1 ? Array.from({ length: 1000 }, (_, i) => note(i)) : [note(1000)];
+  });
+  const list = await data.notes();
+  assert.equal(list.length, 1001);
+  assert.deepEqual(queries.map(q => q.calls.filter(([method]) => method === 'range').map(call => call.slice(1).join('-'))), [['0-999'], ['1000-1999']]);
+  assert.ok(queries[0].calls.some(call => call.join(' ') === 'order id'), 'pages in a fixed order do not overlap');
 });
 
 test('a task arrives with its details, who made it, and when it was made and finished', async () => {
@@ -387,6 +779,18 @@ test('every contact loads, past the thousand rows the API hands back at once, wi
   assert.ok(queries[0].calls.some(call => call.join(' ') === 'order id'), 'pages in a fixed order do not overlap');
 });
 
+test('a contact carries whether they are primary and which enquiry introduced them, on its raw row', async () => {
+  const { data, queries } = loadTables(table => (table !== 'crm_contacts' ? [] : [{
+    id: 'c1', full_name: 'Ana Lima', email: 'ana@northline.example', is_primary: true, enquiry_id: 'enq-1', company: null
+  }]));
+  const [ana] = await data.contacts();
+  assert.equal(ana.row.is_primary, true);
+  assert.equal(ana.row.enquiry_id, 'enq-1');
+  const select = queries[0].calls.find(([method]) => method === 'select')[1];
+  assert.ok(select.split(/,\s*/).includes('is_primary'));
+  assert.ok(select.split(/,\s*/).includes('enquiry_id'));
+});
+
 test('a contact pushed into the next page while the list is read is listed once', async () => {
   let served = 0;
   const person = i => ({ id: `c${i}`, full_name: `Person ${i}`, email: null, company: null });
@@ -435,6 +839,179 @@ test('a company arrives with its owner', async () => {
   const [co] = await data.companies();
   assert.ok(queries[0].calls.find(([method]) => method === 'select')[1].split(/,\s*/).includes('owner_id'));
   assert.equal(co.row.owner_id, 'e-sam');
+});
+
+test('a client carries its number; a company not yet one has none', async () => {
+  const { data, queries } = loadTables(table => (table !== 'crm_companies' ? [] : [
+    { id: 'co1', name: 'Northline', domain: null, kind: 'client', stage: 'client', value: 1, currency: 'EUR', owner_id: null, notes: null, client_number: 42 },
+    { id: 'co2', name: 'Harbor & Co', domain: null, kind: 'client', stage: 'lead', value: 0, currency: 'USD', owner_id: null, notes: null, client_number: null }
+  ]));
+  const [client, lead] = await data.companies();
+  assert.ok(queries[0].calls.find(([method]) => method === 'select')[1].split(/,\s*/).includes('client_number'));
+  assert.equal(client.clientNumber, 42);
+  assert.equal(lead.clientNumber, null);
+});
+
+test('enquiries arrive newest first, with what the promote button and the list need', async () => {
+  const { data, queries } = loadTables(table => (table !== 'website_enquiries' ? [] : [{
+    id: 'enq-1', kind: 'website', name: 'Bo Ahn', email: 'bo@example.com', business: 'Ahn Studio',
+    website: null, message: 'Looking for a rebuild.', status: 'new', created_at: '2026-09-10T09:00:00Z'
+  }]));
+  const [enquiry] = await data.enquiries();
+  assert.equal(enquiry.id, 'enq-1');
+  assert.equal(enquiry.name, 'Bo Ahn');
+  assert.equal(enquiry.business, 'Ahn Studio');
+  assert.equal(enquiry.status, 'New');
+  assert.equal(enquiry.row.email, 'bo@example.com');
+  const order = queries[0].calls.find(([method]) => method === 'order');
+  assert.equal(order[1], 'created_at');
+  assert.equal(order[2].ascending, false, 'newest first');
+});
+
+test('a blank enquiry field reads as empty text, never null in the page', async () => {
+  const { data } = loadTables(table => (table !== 'website_enquiries' ? [] : [{
+    id: 'enq-2', kind: 'product', name: 'Cy Ide', email: 'cy@example.com', business: null,
+    website: null, message: null, status: 'spam', created_at: '2026-09-11T09:00:00Z'
+  }]));
+  const [enquiry] = await data.enquiries();
+  assert.equal(enquiry.business, '');
+  assert.equal(enquiry.message, '');
+  assert.equal(enquiry.status, 'Spam');
+});
+
+/* ── Finance ──────────────────────────────────────────────────────────── */
+
+test('an invoice arrives with when it last changed, its tax and its lines, oldest line first', async () => {
+  const { data, queries } = loadTables(table => (table !== 'finance_invoices' ? [] : [{
+    id: 'inv-1', number: 'INV-1042', client: 'Northline', amount: 1200, currency: 'USD', status: 'sent',
+    updated_at: '2026-09-10T12:00:00Z', tax_rate: 8.875, tax_amount: 106.5,
+    finance_invoice_lines: [
+      { id: 'line-2', description: 'Development', quantity: 10, unit_amount: 100, amount: 1000, sort_order: 1 },
+      { id: 'line-1', description: 'Design', quantity: 2, unit_amount: 100, amount: 200, sort_order: 0 }
+    ]
+  }]));
+  const [invoice] = await data.invoices();
+  assert.equal(invoice.row.updated_at, '2026-09-10T12:00:00Z');
+  assert.equal(invoice.row.tax_rate, 8.875);
+  assert.equal(invoice.row.tax_amount, 106.5);
+  assert.equal(invoice.row.finance_invoice_lines.length, 2, 'the row carries the lines exactly as fetched');
+  const select = queries[0].calls.find(([method]) => method === 'select')[1];
+  ['updated_at', 'tax_rate', 'tax_amount'].forEach(column =>
+    assert.ok(select.includes(column), `${column} is asked for`));
+  assert.ok(select.includes('finance_invoice_lines'), 'the lines are embedded, not fetched separately');
+  assert.ok(queries[0].calls.some(call => call[0] === 'order' && call[1] === 'sort_order'
+    && call[2] && call[2].foreignTable === 'finance_invoice_lines' && call[2].ascending === true),
+    'lines come back in the order the invoice lists them, not however finance_invoice_lines happens to be stored');
+});
+
+test('an invoice carries its company\'s client number, when finance_invoices.company_id (0051) leads to one', async () => {
+  const { data, queries } = loadTables(table => (table !== 'finance_invoices' ? [] : [{
+    id: 'inv-3', number: 'INV-1044', client: 'Northline', amount: 400, currency: 'USD', status: 'sent',
+    company_id: 'co1', company: { client_number: 7 }
+  }, {
+    id: 'inv-4', number: 'INV-1045', client: 'Nobody in particular', amount: 40, currency: 'USD', status: 'draft',
+    company_id: null, company: null
+  }]));
+  const [linked, unlinked] = await data.invoices();
+  const select = queries[0].calls.find(([method]) => method === 'select')[1];
+  assert.ok(select.includes('company_id'), 'the query asks for company_id');
+  assert.ok(select.includes('client_number'), 'and the company it leads to');
+  assert.equal(linked.row.company.client_number, 7);
+  assert.equal(unlinked.row.company, null, 'no company linked, nothing to quote');
+});
+
+test('every invoice loads, past the thousand rows the API hands back at once', async () => {
+  let served = 0;
+  const invoice = i => ({ id: `inv${i}`, number: `INV-${i}`, client: 'Northline', amount: 100, currency: 'USD', status: 'sent' });
+  const { data, queries } = loadTables(table => {
+    if (table !== 'finance_invoices') return [];
+    served += 1;
+    return served === 1 ? Array.from({ length: 1000 }, (_, i) => invoice(i)) : [invoice(1000)];
+  });
+  const list = await data.invoices();
+  assert.equal(list.length, 1001);
+  assert.deepEqual(queries.map(q => q.calls.filter(([method]) => method === 'range').map(call => call.slice(1).join('-'))), [['0-999'], ['1000-1999']]);
+  assert.ok(queries[0].calls.some(call => call.join(' ') === 'order id'), 'pages in a fixed order do not overlap');
+});
+
+test('an invoice with no lines yet — every one made before 0060 has at least one, but a test row need not — is not asked to have any', async () => {
+  const { data } = loadTables(table => (table !== 'finance_invoices' ? [] : [{
+    id: 'inv-2', number: 'INV-1043', client: 'Acme', amount: 500, currency: 'USD', status: 'draft',
+    updated_at: null, tax_rate: null, tax_amount: null, finance_invoice_lines: []
+  }]));
+  const [invoice] = await data.invoices();
+  assert.deepEqual(invoice.row.finance_invoice_lines, []);
+  assert.equal(invoice.row.tax_rate, null);
+});
+
+test('every transaction in the window loads, past the thousand rows the API hands back at once, in a fixed order', async () => {
+  let served = 0;
+  const { data, queries } = loadTables(table => {
+    if (table !== 'finance_transactions') return [];
+    served += 1;
+    return served === 1
+      ? Array.from({ length: 1000 }, (_, i) => ({ id: `tx${i}`, posted_at: '2026-09-01', amount: 10, currency: 'USD' }))
+      : [{ id: 'tx-last', posted_at: '2026-08-01', amount: -5, currency: 'USD' }];
+  });
+  const rows = await data.transactions('2026-01-01');
+  assert.equal(rows.length, 1001);
+  assert.equal(rows[1000].id, 'tx-last');
+  assert.deepEqual(queries.map(q => q.calls.filter(([method]) => method === 'range').map(call => call.slice(1).join('-'))), [['0-999'], ['1000-1999']]);
+  assert.ok(queries[0].calls.some(call => call.join(' ') === 'gte posted_at 2026-01-01'), 'the window given is the one asked for');
+  assert.ok(queries[0].calls.some(call => call[0] === 'order' && call[1] === 'id'), 'pages in a fixed order do not overlap');
+});
+
+test('with no window given, transactions default to the last 180 days', async () => {
+  const { data, queries } = loadTables(() => []);
+  await data.transactions();
+  const since = queries[0].calls.find(([method]) => method === 'gte')[2];
+  const expected = new Date(Date.now() - 180 * 86400000).toISOString().slice(0, 10);
+  assert.equal(since, expected);
+});
+
+/* ── Company ──────────────────────────────────────────────────────────── */
+
+test('the team is ordered by name, not by the spelling of the role, and carries what a person\'s page needs', async () => {
+  const { data, queries } = loadTables(table => (table !== 'employees' ? [] : [{
+    id: 'e1', user_id: 'u1', full_name: 'Ana Lima', email: 'ana@veyago.cloud', role: 'owner',
+    title: null, status: 'active', start_date: '2026-01-05', created_at: '2026-01-05T09:00:00Z', updated_at: '2026-01-05T09:00:00Z'
+  }]));
+  const [member] = await data.team();
+  const select = queries[0].calls.find(([method]) => method === 'select')[1].split(/,\s*/).map(s => s.trim());
+  for (const column of ['user_id', 'email', 'start_date', 'created_at', 'updated_at']) {
+    assert.ok(select.includes(column), `the query asks for ${column}`);
+  }
+  assert.ok(!select.includes('phone') && !select.includes('notes'), 'phone and notes stay behind employee_private()');
+  assert.deepEqual(queries[0].calls.filter(([method]) => method === 'order'), [['order', 'full_name'], ['order', 'id']]);
+  assert.equal(member.row.user_id, 'u1', 'the row travels whole, for companyModel to read');
+  assert.equal(member.name, 'Ana Lima');
+});
+
+test('a person\'s phone and notes are asked for by their id, and nobody such is null', async () => {
+  const q = load((name, args) => (name === 'employee_private' && args.p_employee_id === 'e1'
+    ? { data: [{ phone: '+1 555 0100', notes: 'Founder' }], error: null }
+    : { data: [], error: null }));
+  assert.deepEqual(await q.data.employeePrivate('e1'), { phone: '+1 555 0100', notes: 'Founder' });
+  assert.equal(await q.data.employeePrivate('gone'), null);
+});
+
+test('the studio\'s profile comes from studio_profile(), empty for anyone it does not answer', async () => {
+  const q = load(() => ({ data: [{ key: 'studio_name', value: 'Northline' }, { key: 'base_currency', value: 'eur' }], error: null }));
+  const rows = await q.data.studioProfile();
+  assert.equal(q.calls[0].name, 'studio_profile');
+  assert.deepEqual(rows.map(r => r.key), ['studio_name', 'base_currency']);
+
+  const empty = load(() => ({ data: [], error: null }));
+  assert.deepEqual(await empty.data.studioProfile(), []);
+});
+
+/* ── Notifications ────────────────────────────────────────────────────── */
+
+test('dismissed notifications come back as their bare keys, RLS already limiting them to this person\'s own', async () => {
+  const { data, queries } = loadTables(table => (table === 'notification_dismissals'
+    ? [{ notif_key: 'ticket:t1' }, { notif_key: 'events:today' }] : []));
+  assert.deepEqual(await data.notificationDismissals(), ['ticket:t1', 'events:today']);
+  assert.deepEqual(queries[0].calls.find(([method]) => method === 'select'), ['select', 'notif_key']);
 });
 
 test('an amount is written in its currency, and a code Intl cannot format goes beside it rather than throwing', () => {

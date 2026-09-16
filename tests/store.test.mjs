@@ -31,7 +31,10 @@ const CAL = { loadFrom: '2026-09-14T00:00:00.000Z', loadTo: '2026-09-21T00:00:00
               onChange() {}, contains() { return true; } };
 `;
 
-const ticket = (over = {}) => ({ id: 1, uuid: 't1', title: 'Broken login', status: 'Open', priority: 'High', ...over });
+const ticket = (over = {}) => ({
+  id: 1, uuid: 't1', title: 'Broken login', status: 'Open', priority: 'High',
+  messageCount: 0, lastMessageAt: null, thread: null, ...over
+});
 const projectRow = () => ({
   id: 'a1000000-0000-4000-8000-000000000001', name: 'Northline site', client: 'Northline', initial: 'N',
   style: 'client', progress: 0, due: '', status: 'In progress', description: '',
@@ -56,7 +59,10 @@ function answers(over = {}) {
     activity: async () => [],
     mailboxes: async () => [],
     mailThreads: async () => ({ threads: [], truncated: [] }),
+    mailUnreadCounts: async () => ({}),
     mailMessages: async () => [{ body: 'hello', bodyHtml: '' }],
+    ticketMessages: async () => [],
+    ticketAttachments: async () => [],
     overview: async () => ({ tickets_open: 1 }),
     revenueSeries: async () => [],
     revenueMix: async () => [],
@@ -67,6 +73,11 @@ function answers(over = {}) {
     projectFiles: async () => [],
     projectBudgets: async () => [],
     notes: async () => [],
+    calendars: async () => [],
+    employeePrivate: async () => null,
+    integrations: async () => [],
+    studioProfile: async () => [],
+    notificationDismissals: async () => [],
     ...over
   };
 }
@@ -196,6 +207,220 @@ test('who is invited that did not load says so until a load works, then is asked
   s.store.askInvitees(INVITED_EVENT);
   await tick();
   assert.equal(s.store.askInvitees(INVITED_EVENT).state, 'ready');
+  assert.equal(asked, 2);
+});
+
+/* ── A project's own activity ─────────────────────────────────────────── */
+
+test('a project\'s activity loads when its page asks, once however often it is drawn, is drawn again when it lands, and is asked again after a write', async () => {
+  const asked = [];
+  let answer = [{ id: 'a1', text: 'New task · Draft copy' }];
+  const s = start(answers({ projectActivity: async id => { asked.push(id); return answer; } }));
+  assert.equal(s.store.projectActivity('p1').state, 'loading', 'nothing is asked before the workspace has loaded');
+  assert.deepEqual(asked, []);
+  await s.store.load();
+  assert.equal(s.store.projectActivity('p1').state, 'loading');
+  s.store.projectActivity('p1');
+  const drawn = s.read('renders') + s.read('idleRepaints');
+  await tick();
+  assert.deepEqual(asked, ['p1'], 'asked once, drawn or not');
+  const ready = s.store.projectActivity('p1');
+  assert.equal(ready.state, 'ready');
+  assert.equal(ready.activity[0].id, 'a1');
+  assert.ok(s.read('renders') + s.read('idleRepaints') > drawn, 'the page is drawn again once it lands');
+  answer = [];
+  await s.store.after(Promise.resolve());
+  assert.equal(s.store.projectActivity('p1').state, 'loading', 'a write may have added to it: asked again');
+  await tick();
+  assert.deepEqual(s.store.projectActivity('p1').activity, []);
+});
+
+test('a project\'s activity that did not load says so until a load works, then is asked for again', async () => {
+  let fail = true;
+  let asked = 0;
+  const s = start(answers({ projectActivity: async () => {
+    asked += 1;
+    if (fail) throw new Error('Could not load this project’s activity: Failed to fetch');
+    return [];
+  } }));
+  await s.store.load();
+  s.store.projectActivity('p1');
+  await tick();
+  assert.equal(s.store.projectActivity('p1').state, 'failed');
+  await tick();
+  assert.equal(asked, 1, 'a page drawn again does not ask again by itself');
+  fail = false;
+  await s.store.load();
+  s.store.projectActivity('p1');
+  await tick();
+  assert.equal(s.store.projectActivity('p1').state, 'ready');
+  assert.equal(asked, 2);
+});
+
+/* ── A person's phone and notes ───────────────────────────────────────── */
+
+const PRIVATE_EMPLOYEE = 'e9000000-0000-4000-8000-000000000002';
+
+test('a person\'s phone and notes load when their page asks, once however often it is drawn, and land on a redraw', async () => {
+  const asked = [];
+  let answer = { phone: '+1 555 0100', notes: 'Founder' };
+  const s = start(answers({ employeePrivate: async id => { asked.push(id); return answer; } }));
+  assert.equal(s.store.askEmployeePrivate(PRIVATE_EMPLOYEE), null, 'nothing is asked before the workspace has loaded');
+  assert.deepEqual(asked, []);
+  await s.store.load();
+  assert.equal(s.store.askEmployeePrivate(PRIVATE_EMPLOYEE), null, 'not yet: the request has only just gone out');
+  s.store.askEmployeePrivate(PRIVATE_EMPLOYEE.toUpperCase());
+  const drawn = s.read('renders') + s.read('idleRepaints');
+  await tick();
+  assert.deepEqual(asked, [PRIVATE_EMPLOYEE], 'asked once, whatever case their id is in');
+  const details = s.store.askEmployeePrivate(PRIVATE_EMPLOYEE);
+  assert.equal(details.phone, '+1 555 0100');
+  assert.ok(s.read('renders') + s.read('idleRepaints') > drawn, 'the page is drawn again once it lands');
+  assert.equal(s.store.askEmployeePrivate('not-an-id'), null, 'only an employee\'s id is asked for');
+  answer = null;
+  await s.store.after(Promise.resolve());
+  assert.equal(s.store.askEmployeePrivate(PRIVATE_EMPLOYEE), null, 'a write may have changed who may see it: asked again');
+  await tick();
+  assert.equal(s.store.askEmployeePrivate(PRIVATE_EMPLOYEE), null, 'nothing this person may see, once it lands — never "none on file"');
+});
+
+test('a failed ask for phone and notes reads as nothing to show, and is tried again once a load works', async () => {
+  let fail = true;
+  let asked = 0;
+  const s = start(answers({ employeePrivate: async () => {
+    asked += 1;
+    if (fail) throw new Error('Could not load their phone and notes: Failed to fetch');
+    return { phone: '+1 555 0100', notes: null };
+  } }));
+  await s.store.load();
+  s.store.askEmployeePrivate(PRIVATE_EMPLOYEE);
+  await tick();
+  assert.equal(s.store.askEmployeePrivate(PRIVATE_EMPLOYEE), null);
+  await tick();
+  assert.equal(asked, 1, 'a page drawn again does not ask again by itself');
+  fail = false;
+  await s.store.load();
+  s.store.askEmployeePrivate(PRIVATE_EMPLOYEE);
+  await tick();
+  assert.equal(s.store.askEmployeePrivate(PRIVATE_EMPLOYEE).phone, '+1 555 0100');
+  assert.equal(asked, 2);
+});
+
+test('asking again for a project\'s activity that did not load clears only that failure', async () => {
+  const s = start(answers({ projectActivity: async () => { throw new Error('Could not load this project’s activity: Failed to fetch'); } }));
+  await s.store.load();
+  s.store.projectActivity('p1');
+  s.store.projectActivity('p2');
+  await tick();
+  assert.equal(s.store.projectActivity('p1').state, 'failed');
+  assert.equal(s.store.projectActivity('p2').state, 'failed');
+  s.store.retryProjectActivity('p1');
+  assert.equal(s.store.projectActivity('p1').state, 'loading', 'cleared, so asked again');
+  assert.equal(s.store.projectActivity('p2').state, 'failed', 'the other project\'s failure is untouched');
+});
+
+/* ── Archived projects ────────────────────────────────────────────────── */
+
+test('archived projects load when the Archived view first asks, once however often it is drawn, and are asked again after a write', async () => {
+  let asked = 0;
+  let answer = [{ id: 'p1', name: 'Old brief' }];
+  const s = start(answers({ archivedProjects: async () => { asked += 1; return answer; } }));
+  assert.equal(s.store.archivedProjects().state, 'loading', 'nothing is asked before the workspace has loaded');
+  await s.store.load();
+  assert.equal(s.store.archivedProjects().state, 'loading');
+  s.store.archivedProjects();
+  await tick();
+  assert.equal(asked, 1, 'asked once, drawn or not');
+  const ready = s.store.archivedProjects();
+  assert.equal(ready.state, 'ready');
+  assert.equal(ready.projects[0].name, 'Old brief');
+  answer = [];
+  await s.store.after(Promise.resolve());
+  assert.equal(s.store.archivedProjects().state, 'loading', 'restoring or archiving one changes this list: asked again');
+  await tick();
+  assert.deepEqual(s.store.archivedProjects().projects, []);
+});
+
+test('archived projects that did not load say so until asked again, or until a load works', async () => {
+  let fail = true;
+  let asked = 0;
+  const s = start(answers({ archivedProjects: async () => {
+    asked += 1;
+    if (fail) throw new Error('Could not load archived projects: Failed to fetch');
+    return [];
+  } }));
+  await s.store.load();
+  s.store.archivedProjects();
+  await tick();
+  assert.equal(s.store.archivedProjects().state, 'failed');
+  s.store.retryArchivedProjects();
+  assert.equal(s.store.archivedProjects().state, 'loading', 'cleared by the retry, so asked again');
+  await tick();
+  assert.equal(asked, 2);
+  fail = false;
+  await s.store.load();
+  s.store.archivedProjects();
+  await tick();
+  assert.equal(s.store.archivedProjects().state, 'ready');
+});
+
+/* ── Transactions (0060) ──────────────────────────────────────────────── */
+
+test('transactions load for a window when Finance\'s own page asks, once however often it is drawn, and it is drawn again when they land', async () => {
+  const asked = [];
+  const s = start(answers({ transactions: async since => { asked.push(since); return [{ id: 'tx1', amount: -20 }]; } }));
+  assert.equal(s.store.transactions('2026-01-01').state, 'loading', 'nothing is asked before the workspace has loaded');
+  assert.deepEqual(asked, []);
+  await s.store.load();
+  const repaintsBefore = s.read('idleRepaints');
+  assert.equal(s.store.transactions('2026-01-01').state, 'loading');
+  s.store.transactions('2026-01-01');
+  await tick();
+  assert.deepEqual(asked, ['2026-01-01'], 'asked once');
+  const ready = s.store.transactions('2026-01-01');
+  assert.equal(ready.state, 'ready');
+  assert.deepEqual(ready.rows.map(r => r.id), ['tx1']);
+  assert.ok(s.read('idleRepaints') > repaintsBefore, 'the page is drawn again once they land, as a background repaint that keeps what is being typed');
+  s.store.transactions('2026-06-01');
+  await tick();
+  assert.equal(asked.length, 2, 'a different window asks again');
+});
+
+test('transactions that did not load say so until asked again, and a write asks for them afresh', async () => {
+  let fail = true;
+  let asked = 0;
+  const s = start(answers({ transactions: async () => {
+    asked += 1;
+    if (fail) throw new Error('Could not load transactions: Failed to fetch');
+    return [];
+  } }));
+  await s.store.load();
+  s.store.transactions('2026-01-01');
+  await tick();
+  assert.equal(s.store.transactions('2026-01-01').state, 'failed');
+  await tick();
+  assert.equal(asked, 1, 'a failure is not asked again by every draw of the page');
+  fail = false;
+  s.store.retryTransactions('2026-01-01');
+  s.store.transactions('2026-01-01');
+  await tick();
+  assert.equal(s.store.transactions('2026-01-01').state, 'ready');
+  assert.equal(asked, 2);
+  await s.store.after(Promise.resolve({}));
+  s.store.transactions('2026-01-01');
+  await tick();
+  assert.equal(asked, 3, 'after a write they are asked for again: what was written may be among them');
+});
+
+test('a write that failed clears transactions too: it may still have changed something', async () => {
+  let asked = 0;
+  const s = start(answers({ transactions: async () => { asked += 1; return []; } }));
+  await s.store.load();
+  s.store.transactions('2026-01-01');
+  await tick();
+  await assert.rejects(s.store.after(Promise.reject(new Error('That was not saved.'))));
+  s.store.transactions('2026-01-01');
+  await tick();
   assert.equal(asked, 2);
 });
 
@@ -404,6 +629,71 @@ test('a week not loaded asks for its events, not for the whole workspace again',
   assert.equal(s.store.weekLoaded(s.read(LATER_WEEK).key), true);
 });
 
+/* ── The agenda's month view ──────────────────────────────────────────── */
+
+const MONTH_RANGE = Object.freeze({ key: '2026-10', since: '2026-09-27T00:00:00.000Z', to: '2026-11-09T00:00:00.000Z' });
+
+test('a month shown for the first time asks for its events, not for the whole workspace again', async () => {
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  const before = { ...s.calls };
+  await s.store.showMonth(MONTH_RANGE);
+  assert.deepEqual(Object.keys(s.calls).filter(name => s.calls[name] !== before[name]), ['eventsOverlapping']);
+  assert.equal(s.store.monthLoaded(MONTH_RANGE.key), true);
+});
+
+test('a month already loaded is shown without asking again', async () => {
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  await s.store.showMonth(MONTH_RANGE);
+  const before = s.calls.eventsOverlapping;
+  await s.store.showMonth(MONTH_RANGE);
+  assert.equal(s.calls.eventsOverlapping, before);
+  assert.equal(s.store.monthLoaded('2026-11'), false, 'a month never shown is not loaded');
+});
+
+test('the month\'s own range is asked for, and what comes back joins the events the weeks already loaded', async () => {
+  const asked = [];
+  const s = start(answers({
+    eventsOverlapping: async range => {
+      asked.push(range.to);
+      return range.to === MONTH_RANGE.to
+        ? [{ id: 'm1', title: 'Offsite', row: { id: 'm1', starts_at: '2026-10-05T09:00:00Z' } }]
+        : [];
+    }
+  }));
+  await s.store.load();
+  await s.store.showMonth(MONTH_RANGE);
+  assert.ok(asked.includes(MONTH_RANGE.to));
+  assert.ok(s.read('events').some(e => e.id === 'm1'), 'the month\'s own event lands in the shared events array');
+});
+
+test('leaving the month view stops asking for it in the background; shown again, it asks afresh', async () => {
+  const asked = [];
+  const s = start(answers({ eventsOverlapping: async range => { asked.push(range.to); return []; } }));
+  await s.store.load();
+  await s.store.showMonth(MONTH_RANGE);
+  assert.ok(asked.includes(MONTH_RANGE.to));
+  asked.length = 0;
+  await s.store.showMonth(null);
+  await s.store.load({ quiet: true });
+  assert.ok(!asked.includes(MONTH_RANGE.to), 'nobody is looking at the month any more');
+  assert.equal(s.store.monthLoaded(MONTH_RANGE.key), false, 'a load that did not ask for it does not still call it loaded');
+  asked.length = 0;
+  await s.store.showMonth(MONTH_RANGE);
+  assert.ok(asked.includes(MONTH_RANGE.to), 'shown again, it is loaded again');
+});
+
+test('a month asked for before the workspace has loaded rides along with the first load, not a second request', async () => {
+  const asked = [];
+  const s = start(answers({ eventsOverlapping: async range => { asked.push(range.to); return []; } }));
+  const shown = s.store.showMonth(MONTH_RANGE);
+  await s.store.load();
+  await shown;
+  assert.equal(asked.filter(to => to === MONTH_RANGE.to).length, 1);
+  assert.equal(s.store.monthLoaded(MONTH_RANGE.key), true);
+});
+
 test('a week whose events fail says so, and leaves the rest of the workspace as it was', async () => {
   const s = start(answers({ eventsOverlapping: async () => [] }));
   await s.store.load();
@@ -471,6 +761,111 @@ test('a week\'s retry that loads starts the delays again from the first', async 
   assert.equal(s.pending(15000).length, 1, 'the first delay, not the second');
 });
 
+/* ── Which week's own failure it was ─────────────────────────────────── */
+
+test('weekFailed names the week whose own load failed, not a week never asked for', async () => {
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  const todayKey = s.read(TODAY_WEEK).key, laterKey = s.read(LATER_WEEK).key;
+  assert.equal(s.store.weekFailed(todayKey), false, 'nothing has failed yet');
+  assert.equal(s.store.weekFailed(laterKey), false, 'a week never asked for is not failed either');
+  s.answer(answers({ eventsOverlapping: async () => { throw new Error('Could not load the agenda: Failed to fetch'); } }));
+  await s.store.showWeek(s.read(LATER_WEEK));
+  assert.equal(s.store.weekFailed(laterKey), true, 'the week that failed');
+  assert.equal(s.store.weekFailed(todayKey), true, 'today\'s week was asked for in the same failing request');
+  assert.equal(s.store.weekFailed('2099-01-01'), false, 'a week nobody asked for stays untouched');
+});
+
+test('a week that failed is not stuck failed: once it loads, weekFailed says so no longer', async () => {
+  const noAgenda = async () => { throw new Error('Could not load the agenda: Failed to fetch'); };
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  const laterKey = s.read(LATER_WEEK).key;
+  s.answer(answers({ eventsOverlapping: noAgenda }));
+  await s.store.showWeek(s.read(LATER_WEEK));
+  assert.equal(s.store.weekFailed(laterKey), true);
+  s.answer(answers({ eventsOverlapping: async () => [] }));
+  s.fire(15000);
+  await tick();
+  assert.equal(s.store.weekFailed(laterKey), false, 'the stale failure is cleared once that week loads');
+  assert.equal(s.store.weekLoaded(laterKey), true);
+});
+
+test('a background refresh that fails leaves a week already showing its events alone: still loaded, and now also failed', async () => {
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  const todayKey = s.read(TODAY_WEEK).key;
+  const renders = s.read('renders'), idle = s.read('idleRepaints');
+  s.answer(answers({ eventsOverlapping: async () => { throw new Error('Could not load the agenda: Failed to fetch'); } }));
+  await s.store.load({ quiet: true });
+  assert.equal(s.store.weekLoaded(todayKey), true, 'a background failure does not undo a week already shown');
+  assert.equal(s.store.weekFailed(todayKey), true, 'but its own last try is recorded as failed');
+  assert.equal(s.read('renders'), renders, 'a quiet refresh that failed changes nothing on screen: the week still shows its events');
+  assert.equal(s.read('idleRepaints'), idle);
+});
+
+test('asking again for a week clears its last failure before the answer is even in: loading, not a stale "did not load"', async () => {
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  const laterKey = s.read(LATER_WEEK).key;
+  s.answer(answers({ eventsOverlapping: async () => { throw new Error('Could not load the agenda: Failed to fetch'); } }));
+  await s.store.showWeek(s.read(LATER_WEEK));
+  assert.equal(s.store.weekFailed(laterKey), true, 'failed on its first try');
+  await s.store.showWeek(s.read(TODAY_WEEK));
+  assert.equal(s.store.weekFailed(laterKey), true, 'left on screen, still its last known state');
+  const gate = deferred();
+  s.answer(answers({ eventsOverlapping: async () => { await gate.promise; return []; } }));
+  const asking = s.store.showWeek(s.read(LATER_WEEK));
+  assert.equal(s.store.weekFailed(laterKey), false, 'asked for again: not failed while this try is still on its way');
+  assert.equal(s.store.weekLoaded(laterKey), false, 'and not yet loaded either — the agenda says loading, not failed');
+  gate.resolve();
+  await asking;
+  assert.equal(s.store.weekLoaded(laterKey), true);
+});
+
+test('a whole load, not only showWeek, clears a week\'s stale failure the moment it asks again', async () => {
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  const laterKey = s.read(LATER_WEEK).key;
+  s.answer(answers({ eventsOverlapping: async () => { throw new Error('Could not load the agenda: Failed to fetch'); } }));
+  await s.store.showWeek(s.read(LATER_WEEK));
+  assert.equal(s.store.weekFailed(laterKey), true);
+  const gate = deferred();
+  s.answer(answers({ eventsOverlapping: async () => { await gate.promise; return []; }, tickets: async () => { await gate.promise; return [ticket()]; } }));
+  const whole = s.store.load({ quiet: true });
+  assert.equal(s.store.weekFailed(laterKey), false, 'the later week is still shown, so the whole load asks about it too');
+  gate.resolve();
+  await whole;
+  assert.equal(s.store.weekLoaded(laterKey), true);
+});
+
+test('a load for other parts does not clear a week\'s real failure — it never asked about it', async () => {
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  const laterKey = s.read(LATER_WEEK).key;
+  s.answer(answers({ eventsOverlapping: async () => { throw new Error('Could not load the agenda: Failed to fetch'); } }));
+  await s.store.showWeek(s.read(LATER_WEEK));
+  assert.equal(s.store.weekFailed(laterKey), true);
+  s.answer(answers({ eventsOverlapping: async () => { throw new Error('Could not load the agenda: Failed to fetch'); }, tickets: async () => [ticket()] }));
+  await s.store.load({ quiet: true, only: ['tickets'] });
+  assert.equal(s.store.weekFailed(laterKey), true, 'a load that never asked about the agenda leaves its failure as it was');
+});
+
+test('a quiet retry that answers exactly as before still clears the failure it is standing in for', async () => {
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  const todayKey = s.read(TODAY_WEEK).key;
+  s.answer(answers({ eventsOverlapping: async () => { throw new Error('Could not load the agenda: Failed to fetch'); } }));
+  await s.store.load({ quiet: true, only: ['events'] });
+  assert.equal(s.store.weekFailed(todayKey), true);
+  /* Back to the very answer the first, successful load already applied: the
+     signature is unchanged, so this quiet retry takes the "keep" path
+     (markWeeks again), never "apply". */
+  s.answer(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load({ quiet: true, only: ['events'] });
+  assert.equal(s.store.weekFailed(todayKey), false, 'an unchanged-answer retry is still a load that worked');
+});
+
 test('a note on a project meeting outside the weeks loaded is shown on its page', async () => {
   const review = { id: 'pe1', title: 'Design review', row: { id: 'pe1' } };
   const s = start(answers({
@@ -494,6 +889,22 @@ test('a note on a company is shown on its page, and a note written there finds t
   assert.equal(notes && notes[0].body, 'Met at the fair');
   assert.deepEqual({ ...s.store.noteTarget('companies', 'CO1') }, { type: 'company', id: 'co1' });
   assert.equal(s.store.noteTarget('companies', 'gone'), null);
+});
+
+/* ── Connected calendars ──────────────────────────────────────────────── */
+
+test('every connected calendar loads into state.calendars, for the agenda\'s connections panel and its event pages', async () => {
+  const boxes = [{ id: 'cal1', label: 'hello@veyago.cloud', employeeId: null, live: true, status: 'connected', lastSyncedAt: '2026-09-15T08:00:00Z' }];
+  const s = start(answers({ calendars: async () => boxes }));
+  await s.store.load();
+  assert.deepEqual(s.store.state.calendars, boxes);
+});
+
+test('calendars that did not load leave the rest of the workspace open, as any other part does', async () => {
+  const s = start(answers({ calendars: async () => { throw new Error('Could not load calendars: Failed to fetch'); } }));
+  await s.store.load();
+  assert.equal(s.store.state.loaded, true, 'calendars is not one of the CORE parts');
+  assert.deepEqual([...s.store.state.failed], ['connected calendars']);
 });
 
 test('a week that loads after one failed calls off that retry, and the next failure starts from the first delay', async () => {
@@ -750,6 +1161,95 @@ test('a refusal the page says itself, on a dialog, is not said again in a toast;
   assert.ok(!s.context.toasts.includes('The note was not changed.'));
 });
 
+/* ── A write that only touches a few parts (after's `only`) ──────────────
+   Every write used to reload all eighteen parts of the store — an event
+   saved asked for tickets, invoices, mail and the rest again too. `only`
+   scopes the reload the same way showWeek() already scopes a week's own:
+   fewer requests, the same repaint. */
+
+test('a write that names `only` reloads just those parts, not the whole workspace', async () => {
+  const s = start(answers({ eventsOverlapping: async () => [] }));
+  await s.store.load();
+  const before = { ...s.calls };
+  await s.store.after(Promise.resolve('saved'), { only: ['events'] });
+  assert.deepEqual(Object.keys(s.calls).filter(name => s.calls[name] !== before[name]), ['eventsOverlapping'],
+    'an event save asks only for events, not for tickets, invoices, mail and the rest again');
+});
+
+test('a write that changes an event\'s row still shows the change once `only` reloads', async () => {
+  let title = 'Kickoff';
+  const s = start(answers({ eventsOverlapping: async () => [{ id: 'ev1', title, row: { id: 'ev1', starts_at: '2026-09-15T09:00:00Z' } }] }));
+  await s.store.load();
+  title = 'Kickoff, moved';
+  await s.store.after(Promise.resolve('saved'), { only: ['events'] });
+  assert.equal(s.read('events').find(e => e.id === 'ev1').title, 'Kickoff, moved');
+});
+
+test('with no `only` given, a write still reloads everything, exactly as before', async () => {
+  const s = start(answers());
+  await s.store.load();
+  const before = s.calls.tickets;
+  await s.store.after(Promise.resolve('saved'));
+  assert.equal(s.calls.tickets, before + 1, 'a note or a task save still refreshes the whole workspace');
+});
+
+test('a write that fails reloads everything regardless of `only` — a refusal may still have changed something else', async () => {
+  const s = start(answers());
+  await s.store.load();
+  const before = { ...s.calls };
+  await assert.rejects(s.store.after(Promise.reject(new Error('Could not save: refused')), { only: ['events'] }));
+  await tick();
+  assert.ok(s.calls.tickets > before.tickets, 'the safety net is not narrowed just because the write named a part');
+});
+
+test('the scoped reload\'s own part failing is not the write failing — after() still resolves with what the write returned', async () => {
+  const s = start(answers({ eventsOverlapping: async () => { throw new Error('Could not load the agenda: Failed to fetch'); } }));
+  await s.store.load();
+  const result = await s.store.after(Promise.resolve('saved'), { only: ['events'], toast: false });
+  assert.equal(result, 'saved');
+  assert.deepEqual([...s.store.state.failed], ['the agenda']);
+});
+
+test('after() narrowed by `only` reloads just those parts, not the whole workspace (0060)', async () => {
+  const s = start(answers());
+  await s.store.load();
+  const before = { ...s.calls };
+  await s.store.after(Promise.resolve('saved'), { only: ['invoices'] });
+  await tick();
+  assert.equal(s.calls.invoices, before.invoices + 1, 'the part named is reloaded');
+  assert.equal(s.calls.tickets, before.tickets, 'an unrelated part is not');
+  assert.equal(s.calls.revenueSeries, before.revenueSeries, 'nor a finance part that was not named either');
+  assert.equal(s.calls.revenueMix, before.revenueMix);
+});
+
+test('after() with `only` still draws the page, even where the one part it named came back unchanged', async () => {
+  const s = start(answers());
+  await s.store.load();
+  const painted = s.context.renders + s.context.idleRepaints;
+  await s.store.after(Promise.resolve('saved'), { only: ['tickets'] });
+  await tick();
+  assert.ok(s.context.renders + s.context.idleRepaints > painted,
+    'a write closed its dialog on the strength of this landing: the page must not stay as it was before it');
+});
+
+test('after() with no `only` still reloads everything, exactly as it always has', async () => {
+  const s = start(answers());
+  await s.store.load();
+  const before = { ...s.calls };
+  await s.store.after(Promise.resolve('saved'));
+  await tick();
+  for (const name of Object.keys(before)) assert.equal(s.calls[name], before[name] + 1, name + ' reloads too');
+});
+
+test('after() ignores an empty or malformed `only` and reloads everything, the same as none at all', async () => {
+  const s = start(answers());
+  await s.store.load();
+  const before = { ...s.calls };
+  await s.store.after(Promise.resolve('saved'), { only: [] });
+  await tick();
+  assert.equal(s.calls.tickets, before.tickets + 1, 'an empty list is not "nothing": it falls back to the whole workspace');
+});
+
 test('a part loaded since a mark arrived from a load begun after it — not from one begun before, even one ending after, nor from one that did not bring it back', async () => {
   const s = start(answers());
   await s.store.load();
@@ -843,6 +1343,233 @@ test('a conversation fetched while a new message arrived is fetched again, not k
   assert.equal(s.store.threadBody('th1').length, 3, 'two messages were never kept for a thread of three');
 });
 
+test('the true unread count lands in state, from a database that has it', async () => {
+  const s = start(answers({ mailUnreadCounts: async () => ({ mb1: 3, mb2: 0 }) }));
+  await s.store.load();
+  assert.deepEqual({ ...s.store.state.mailUnreadCounts }, { mb1: 3, mb2: 0 });
+});
+
+test('a database from before 0062 leaves the true unread count null, and mail still loads', async () => {
+  const s = start(answers({
+    mailUnreadCounts: async () => { throw new Error('Could not load the unread mail count: function does not exist'); }
+  }));
+  await s.store.load();
+  assert.equal(s.store.state.mailUnreadCounts, null,
+    'unknown, not zero — mail-model.js\'s own floor guess is used only for null');
+  assert.equal(s.store.has('mail'), true, 'the mail part still "arrives": threads and mailboxes answered fine');
+});
+
+test('a background refresh with an unchanged true count does not repaint, and one that changed does', async () => {
+  let counts = { mb1: 1 };
+  const s = start(answers({ mailUnreadCounts: async () => counts }));
+  await s.store.load();
+  await s.store.load({ quiet: true });
+  assert.equal(s.context.idleRepaints, 0, 'unchanged: no repaint from a background tick');
+  counts = { mb1: 2 };
+  await s.store.load({ quiet: true });
+  assert.equal(s.context.idleRepaints, 1, 'the count moved, even though no thread or mailbox itself did');
+  assert.deepEqual({ ...s.store.state.mailUnreadCounts }, { mb1: 2 });
+});
+
+/* ── "Load more": older mail, appended rather than replacing what shows ──
+   mailThreads()'s own 200-per-folder window is what the workspace opens on;
+   asking further back is a page someone chose, kept apart from `mails`
+   itself so a background refresh's own swap(mails, …) (applyMail) can never
+   silently lose it — that refresh always answers the newest window again,
+   never the older pages "Load more" already reached. */
+
+test('"Load more" asks for the page after the oldest thread already shown, and appends rather than replaces', async () => {
+  const oldest = '2026-09-10T09:00:00Z';
+  const s = start(answers({
+    mailThreads: async () => ({ threads: [thread(2)], truncated: [] })
+  }));
+  await s.store.load();
+  let asked = null;
+  s.answer({ ...answers(), mailThreads: async (folders, ids, before) => { asked = { folders, ids, before }; return { threads: [{ ...thread(2), id: 'older1', row: { id: 'older1', last_message_at: oldest, message_count: 1 } }], truncated: [] }; } });
+  const entry = s.store.loadMoreMail('all', 'inbox');
+  assert.equal(entry.state, 'loading');
+  await tick();
+  assert.deepEqual([...asked.folders], ['inbox']);
+  assert.deepEqual(asked.before, '2026-09-14T09:00:00Z', 'the oldest thread already on screen (thread()\'s own last_message_at)');
+  const after = s.store.moreMail('all', 'inbox');
+  assert.equal(after.state, 'ready');
+  assert.deepEqual([...after.threads.map(t => t.id)], ['older1']);
+});
+
+test('a second "Load more" continues past what the first page already reached', async () => {
+  const s = start(answers({ mailThreads: async () => ({ threads: [thread(2)], truncated: [] }) }));
+  await s.store.load();
+  const asked = [];
+  s.answer({
+    ...answers(),
+    mailThreads: async (folders, ids, before) => {
+      asked.push(before);
+      const id = 'page' + asked.length;
+      return { threads: [{ ...thread(2), id, row: { id, last_message_at: `2026-09-${String(10 - asked.length).padStart(2, '0')}T09:00:00Z`, message_count: 1 } }], truncated: [] };
+    }
+  });
+  s.store.loadMoreMail('all', 'inbox');
+  await tick();
+  s.store.loadMoreMail('all', 'inbox');
+  await tick();
+  assert.deepEqual(asked, ['2026-09-14T09:00:00Z', '2026-09-09T09:00:00Z'], 'the second page asks before the first page\'s own oldest, not the original window\'s');
+  assert.deepEqual([...s.store.moreMail('all', 'inbox').threads.map(t => t.id)], ['page1', 'page2']);
+});
+
+test('"Load more" says there is nothing further back once a page comes back short of the cap', async () => {
+  const s = start(answers({ mailThreads: async () => ({ threads: [thread(2)], truncated: [] }) }));
+  await s.store.load();
+  s.answer({ ...answers(), mailThreads: async () => ({ threads: [{ ...thread(2), id: 'older1' }], truncated: [] }) });
+  s.store.loadMoreMail('all', 'inbox');
+  await tick();
+  assert.equal(s.store.moreMail('all', 'inbox').more, false);
+});
+
+test('"Load more" that fails says so, and a fresh mail load clears it rather than leaving a stale cursor', async () => {
+  const s = start(answers({ mailThreads: async () => ({ threads: [thread(2)], truncated: [] }) }));
+  await s.store.load();
+  s.answer({ ...answers(), mailThreads: async () => { throw new Error('offline'); } });
+  s.store.loadMoreMail('all', 'inbox');
+  await tick();
+  assert.equal(s.store.moreMail('all', 'inbox').state, 'failed');
+  s.answer(answers());
+  await s.store.load({ quiet: true });
+  const cleared = s.store.moreMail('all', 'inbox');
+  assert.equal(cleared.state, 'idle',
+    'a fresh mail load may shift the loaded window\'s own boundary, so the old cursor is not trusted further');
+  assert.equal(cleared.more, true);
+  assert.deepEqual([...cleared.threads], []);
+});
+
+/* ── A word search across every mailbox, not the loaded window ──────────── */
+
+test('a mail search is asked for once per exact query, and kept while nothing changed', async () => {
+  let asked = 0;
+  const s = start(answers({ searchMail: async q => { asked++; return [{ threadId: 't1', subject: q }]; } }));
+  await s.store.load();
+  assert.equal(s.store.searchMail('kickoff').state, 'loading');
+  await tick();
+  assert.equal(s.store.searchMail('kickoff').state, 'ready');
+  assert.equal(s.store.searchMail('kickoff').results[0].subject, 'kickoff');
+  assert.equal(asked, 1, 'the same query again is answered from the cache');
+  s.store.searchMail('kickoff');
+  assert.equal(asked, 1);
+});
+
+test('a blank search is never asked for: it answers ready and empty at once', async () => {
+  let asked = 0;
+  const s = start(answers({ searchMail: async () => { asked++; return []; } }));
+  await s.store.load();
+  const blank = s.store.searchMail('   ');
+  assert.equal(blank.state, 'ready');
+  assert.deepEqual([...blank.results], []);
+  assert.equal(asked, 0);
+});
+
+test('a failed mail search can be retried, and a write forgets every cached search', async () => {
+  let fail = true;
+  const s = start(answers({ searchMail: async () => { if (fail) throw new Error('offline'); return [{ threadId: 't1' }]; } }));
+  await s.store.load();
+  s.store.searchMail('kickoff');
+  await tick();
+  assert.equal(s.store.searchMail('kickoff').state, 'failed');
+  fail = false;
+  s.store.retrySearchMail('kickoff');
+  assert.equal(s.store.searchMail('kickoff').state, 'loading');
+  await tick();
+  assert.equal(s.store.searchMail('kickoff').state, 'ready');
+
+  await s.store.after(Promise.resolve());
+  assert.equal(s.store.searchMail('kickoff').state, 'loading', 'a write may have changed what matches — asked afresh, not kept stale');
+});
+
+/* ── A ticket's conversation and attachments (audit #12) ─────────────────
+   The list embeds only a message count and the last one's time (queries.js),
+   never every message's words — so a ticket's whole conversation is asked for
+   apart, kept while the count and the last message's time say nothing has
+   changed, and asked again the moment they do. */
+
+test('a ticket\'s conversation is fetched once it is asked for, and kept through a refresh that did not touch it', async () => {
+  let count = 2, last = '2026-09-14T09:00:00Z', fetches = 0;
+  const s = start(answers({
+    tickets: async () => [ticket({ messageCount: count, lastMessageAt: last })],
+    ticketMessages: async () => { fetches++; return [{ id: 'm1', body: 'Broken', direction: 'inbound', who: 'Ana Lima' }]; }
+  }));
+  await s.store.load();
+  assert.equal(s.store.askTicketThread(s.read('tickets')[0]).state, 'loading', 'not there yet');
+  await tick();
+  assert.equal(fetches, 1);
+  assert.equal(s.store.askTicketThread(s.read('tickets')[0]).state, 'ready');
+  assert.equal(s.store.askTicketThread(s.read('tickets')[0]).messages[0].body, 'Broken');
+
+  await s.store.load({ quiet: true });
+  assert.equal(s.store.askTicketThread(s.read('tickets')[0]).state, 'ready', 'still there after a refresh that changed nothing');
+  await tick();
+  assert.equal(fetches, 1, 'not asked again');
+
+  count = 3; last = '2026-09-14T10:00:00Z';
+  await s.store.load({ quiet: true });
+  assert.equal(s.store.askTicketThread(s.read('tickets')[0]).state, 'loading', 'a new message means the cached copy no longer answers for it');
+  await tick();
+  assert.equal(fetches, 2, 'asked again because the count and the last message moved on');
+});
+
+test('a ticket\'s conversation that did not load says so, and is tried again once asked or once a load works', async () => {
+  let fail = true;
+  const s = start(answers({ ticketMessages: async () => { if (fail) throw new Error('offline'); return []; } }));
+  await s.store.load();
+  const t = s.read('tickets')[0];
+  s.store.askTicketThread(t);
+  await tick();
+  assert.equal(s.store.askTicketThread(t).state, 'failed');
+
+  s.store.retryTicketThread(t.uuid);
+  assert.equal(s.store.askTicketThread(t).state, 'loading', 'asked again as soon as someone asks');
+  await tick();
+  assert.equal(s.store.askTicketThread(t).state, 'failed', 'still offline');
+
+  fail = false;
+  await s.store.load({ quiet: true });
+  assert.equal(s.store.askTicketThread(t).state, 'loading', 'a working load gives it a fresh try by itself');
+  await tick();
+  assert.equal(s.store.askTicketThread(t).state, 'ready');
+});
+
+test('every save anywhere does not reload an open ticket\'s conversation — only its own change does', async () => {
+  let fetches = 0;
+  const s = start(answers({ ticketMessages: async () => { fetches++; return []; } }));
+  await s.store.load();
+  const t = s.read('tickets')[0];
+  s.store.askTicketThread(t);
+  await tick();
+  assert.equal(fetches, 1);
+  /* after() is what every write in the workspace calls once it has landed —
+     a project's status, a note, anything — not only a change to this ticket. */
+  await s.store.after(Promise.resolve());
+  assert.equal(s.store.askTicketThread(s.read('tickets')[0]).state, 'ready', 'kept: nothing about this ticket changed');
+  await tick();
+  assert.equal(fetches, 1, 'the conversation is not pulled again for a save that has nothing to do with it');
+});
+
+test('a ticket\'s attachments load once its page asks, and are asked again after a write', async () => {
+  let files = [{ id: 'a1', name: 'shot.png' }];
+  let fetches = 0;
+  const s = start(answers({ ticketAttachments: async () => { fetches++; return files; } }));
+  await s.store.load();
+  const t = s.read('tickets')[0];
+  assert.equal(s.store.askTicketAttachments(t.uuid).state, 'loading');
+  await tick();
+  assert.equal(fetches, 1);
+  assert.deepEqual(s.store.askTicketAttachments(t.uuid).files.map(f => f.id), ['a1']);
+
+  files = [{ id: 'a1', name: 'shot.png' }, { id: 'a2', name: 'log.txt' }];
+  await s.store.after(Promise.resolve());
+  assert.equal(s.store.askTicketAttachments(t.uuid).state, 'loading', 'a write anywhere may have added or removed one');
+  await tick();
+  assert.equal(fetches, 2);
+  assert.deepEqual(s.store.askTicketAttachments(t.uuid).files.map(f => f.id), ['a1', 'a2']);
+});
+
 test('activity entries keep who, when and what they are about — thirty of them', async () => {
   let asked = null;
   const s = start(answers({
@@ -859,4 +1586,38 @@ test('activity entries keep who, when and what they are about — thirty of them
   assert.equal(entry.entityType, 'ticket');
   assert.equal(entry.entityId, 't1');
   assert.equal(asked, 30);
+});
+
+/* ── Company: connections, the studio profile, dismissed notifications ──── */
+
+test('the Company page\'s own parts land in state, and a database from before 0061 leaves them empty rather than failing', async () => {
+  const s = start(answers({
+    integrations: async () => [{ id: 'c1', provider: 'microsoft_mail', status: 'connected' }],
+    studioProfile: async () => [{ key: 'studio_name', value: 'Northline Studio' }],
+    notificationDismissals: async () => ['ticket:t1']
+  }));
+  await s.store.load();
+  assert.deepEqual([...s.store.state.integrations.map(c => c.id)], ['c1']);
+  assert.deepEqual([...s.store.state.studioProfile.map(r => r.key)], ['studio_name']);
+  assert.deepEqual([...s.store.state.dismissedNotifications], ['ticket:t1']);
+
+  /* A database that predates 0061 answers PGRST205/42P01 for the table and
+     function alike; queries.js turns that into a thrown error the same way
+     any other missing-table failure already is, so these three parts fail
+     quietly (state.failed) rather than blocking the workspace, which does not
+     wait on them — they are outside CORE, unlike tickets, projects, contacts
+     and companies. */
+  const missing = start(answers({
+    integrations: async () => { throw new Error('Could not load integrations: relation does not exist'); },
+    studioProfile: async () => { throw new Error('Could not load the studio profile: function does not exist'); },
+    notificationDismissals: async () => { throw new Error('Could not load dismissed notifications: relation does not exist'); }
+  }));
+  await missing.store.load();
+  assert.equal(missing.store.state.loaded, true, 'CORE still loaded; these three are not among it');
+  assert.deepEqual([...missing.store.state.integrations], []);
+  assert.deepEqual([...missing.store.state.studioProfile], []);
+  assert.deepEqual([...missing.store.state.dismissedNotifications], []);
+  assert.ok(missing.store.state.failed.includes('integrations'));
+  assert.ok(missing.store.state.failed.includes('the studio profile'));
+  assert.ok(missing.store.state.failed.includes('dismissed notifications'));
 });

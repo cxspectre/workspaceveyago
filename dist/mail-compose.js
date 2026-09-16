@@ -37,6 +37,7 @@ const mailComposer = (function () {
   let signatures = null;            // the person's signatures, once they have loaded
   let appliedSignature = '';        // what was last put in the signature block
   let lastSelection = null;         // the editor's selection, as nodes and offsets
+  let dragSourceRange = null;       // a selection being dragged FROM the editor's own text, if any
   let focusBefore = null;           // what had focus when a render began
   let fieldSelection = null;        // and, for a text field, where its caret was
   let scrollBefore = 0;
@@ -60,8 +61,20 @@ const mailComposer = (function () {
     const fragment = window.DOMPurify.sanitize(String(html || ''), { ...M.PURIFY_CONFIG, RETURN_DOM_FRAGMENT: true });
     fragment.querySelectorAll('[style]').forEach(node => {
       const kept = window.mailHtml ? window.mailHtml.cleanStyle(node.getAttribute('style'), { showImages: false }) : '';
-      if (kept) node.setAttribute('style', kept);
-      else node.removeAttribute('style');
+      if (!kept) { node.removeAttribute('style'); return; }
+      node.setAttribute('style', kept);
+      /* display:none and visibility:hidden are both on cleanStyle's own
+         allowlist — useful for ordinary layout, and also exactly how text is
+         kept out of the composer's own view while still riding along in
+         what actually gets sent. DOMPurify does not read CSS at all, so
+         nothing before this catches it. Dropped outright here, judged on the
+         node's OWN surviving style only — an ancestor hiding itself already
+         hides everything under it, with nothing further to check there — by
+         letting the browser parse it, the same way cleanStyle itself judges
+         a style, rather than pattern-matching the string by hand. */
+      const probe = document.createElement('div');
+      probe.style.cssText = kept;
+      if (probe.style.display === 'none' || probe.style.visibility === 'hidden') node.remove();
     });
     const holder = document.createElement('div');
     holder.appendChild(fragment);
@@ -466,10 +479,28 @@ const mailComposer = (function () {
     if (problem) { status(problem, 'error'); return; }
 
     /* The last attempt may have left a copy behind, and sending again makes
-       another: said before, not after. */
-    if (retryRisk && !window.confirm(retryRisk === 'draft'
-      ? 'The last attempt left this message in Drafts in Outlook. Send a new copy anyway? Delete the one in Drafts afterwards.'
-      : 'The last attempt may already have been sent. Look in Sent in Outlook first. Send it again anyway?')) return;
+       another: said before, not after. If the browser will not show the
+       confirmation at all — repeated dialogs suppressed, or a context that
+       disallows them outright — window.confirm can either throw or simply
+       return false with nothing ever shown; either way this used to look
+       exactly like someone quietly declining, and Send a new copy did
+       nothing with no word why. Both are said now, and "declined" gets a
+       word too: silence was the actual bug, not which of the three happened
+       (this file's own tests cannot tell a real dialog from a suppressed
+       one — window.confirm's return value is the same either way — so the
+       thrown case is what a real browser was checked against). */
+    if (retryRisk) {
+      let proceed;
+      try {
+        proceed = window.confirm(retryRisk === 'draft'
+          ? 'The last attempt left this message in Drafts in Outlook. Send a new copy anyway? Delete the one in Drafts afterwards.'
+          : 'The last attempt may already have been sent. Look in Sent in Outlook first. Send it again anyway?');
+      } catch (blocked) {
+        status('Your browser would not show the confirmation. Try again in a moment.', 'error');
+        return;
+      }
+      if (!proceed) { status('Not sent.'); return; }
+    }
 
     sending = true;
     const sentDraft = draft;
@@ -569,6 +600,30 @@ const mailComposer = (function () {
       || draft.connectionId !== draft.initial.connectionId
       || Boolean(importance && importance.value !== 'normal')
       || typing;
+  }
+
+  /* The draft as plain data — to/cc/bcc, subject, and its words as plain
+     text — for whatever needs to outlive this page: today, carrying an
+     unfinished draft across a sign-out and back in again for the same
+     person (mail.js). null with nothing open. Formatting (bold, lists,
+     colour, an inline image) is not carried — restoring it goes back through
+     open()'s own bodyText, exactly as a saved signature or a plain-text
+     paste already turn into paragraphs — a smaller loss than the words
+     themselves going missing, which is what this exists to stop. Every
+     field is committed first, the same way send() commits every field
+     before reading it, so a chip not yet turned into one (still sitting in
+     the field, half-typed) is not silently dropped. */
+  function draftSnapshot() {
+    if (!draft || !el) return null;
+    ['to', 'cc', 'bcc'].forEach(commitInput);
+    const subject = find('[data-c="subject"]');
+    return {
+      mode: draft.mode, connectionId: draft.connectionId,
+      threadId: draft.threadId, messageId: draft.messageId,
+      to: [...draft.to], cc: [...draft.cc], bcc: [...draft.bcc],
+      subject: subject ? subject.value : draft.subject,
+      bodyText: editor().innerText || ''
+    };
   }
 
   /* ── Events, bound once per draft ──────────────────────────────────── */
@@ -697,6 +752,17 @@ const mailComposer = (function () {
       if (input && e.inputType === 'insertReplacementText' && M.isAddress(input.value)) commitInput(input.dataset.chipInput);
       if (discardArmedUntil) disarmDiscard();
     });
+    /* Remembered so a drag that starts on a selection within the editor's own
+       text can be turned into a move once it lands, below — a Range object
+       itself would not survive to then (see snapshot/rangeFrom above, kept
+       for the same reason selections do not survive a render). */
+    el.addEventListener('dragstart', e => {
+      const box = editor();
+      const selection = window.getSelection();
+      dragSourceRange = (box && box.contains(e.target) && selection.rangeCount && !selection.isCollapsed)
+        ? snapshot(selection.getRangeAt(0)) : null;
+    });
+    el.addEventListener('dragend', () => { dragSourceRange = null; });
     el.addEventListener('dragover', e => {
       if (!hasFiles(e)) return;
       e.preventDefault();
@@ -712,17 +778,33 @@ const mailComposer = (function () {
       }
       /* Dropped HTML goes the way pasted HTML does, through the same cleaning. */
       const html = e.dataTransfer && e.dataTransfer.getData('text/html');
+      const moved = dragSourceRange;
+      dragSourceRange = null;
       if (!html || !(e.target.closest && e.target.closest('[data-c="editor"]'))) return;
       e.preventDefault();
       placeCaretAt(e.clientX, e.clientY);
       document.execCommand('insertHTML', false, cleanHtml(html));
+      /* Dragging a selection to another spot in the SAME editor copied it
+         instead of moving it: preventDefault() above is needed so this
+         insert runs instead of the browser's own, but it also cancels the
+         browser's own "remove the source, this was a move" half of the same
+         gesture — done by hand instead, now that the copy has safely landed
+         elsewhere first. Left alone (a paste, or a drag from outside the
+         editor, including from a message being read) there is no source in
+         this editor to remove anything from. */
+      const source = moved && rangeFrom(moved, editor());
+      if (source) source.deleteContents();
     });
   }
 
   /* ── What mail.js calls ────────────────────────────────────────────── */
 
-  /* init: { mode, connectionId, threadId, messageId, to, cc, subject, about, bodyText }
-     with: { boxes, book, canReconnect, onSent(result, sent), onClose() }
+  /* init: { mode, connectionId, threadId, messageId, to, cc, bcc, subject,
+     about, bodyText } with: { boxes, book, canReconnect, onSent(result,
+     sent), onClose() }. bcc seeds the draft the same way to/cc already do —
+     used when mail.js restores a draft snapshot() (below) saved across a
+     sign-out; nothing else has ever passed one in, since a fresh new/reply/
+     forward always starts with an empty Bcc a person adds themselves.
      Refused while a message is being sent: that send finishes into its own draft. */
   function open(init, withContext) {
     if (sending) return false;
@@ -735,6 +817,7 @@ const mailComposer = (function () {
       : '<p><br></p>';
     const to = Object.freeze([...(init.to || [])]);
     const cc = Object.freeze([...(init.cc || [])]);
+    const bcc = Object.freeze([...(init.bcc || [])]);
     const subject = String(init.subject || '');
     const connectionId = init.connectionId || null;
     draft = Object.freeze({
@@ -743,7 +826,7 @@ const mailComposer = (function () {
       connectionId,
       threadId: init.threadId || null,
       messageId: init.messageId || null,
-      to, cc, bcc: Object.freeze([]),
+      to, cc, bcc,
       subject,
       about: String(init.about || ''),
       bodyHtml: `${paragraphs}<p><br></p><div class="composer-signature" data-signature></div>`,
@@ -766,6 +849,22 @@ const mailComposer = (function () {
     fieldSelection = focusBefore && typeof focusBefore.selectionStart === 'number'
       ? [focusBefore.selectionStart, focusBefore.selectionEnd] : null;
     const box = editor();
+    /* selectionchange (below) is what keeps lastSelection current, and it
+       fires asynchronously — after the browser's own keystroke handling, not
+       as part of it. A render triggered by something else entirely (a
+       background reload landing while someone is mid-sentence) can land in
+       that gap, before the event for the keystroke just typed has been
+       dispatched: restoreSelection would then put the caret back where it
+       was ONE KEYSTROKE AGO, not where it actually is. The selection itself
+       is never stale, only the event announcing it changed — so it is read
+       fresh here, synchronously, rather than trusted to have caught up. */
+    if (focusBefore === box && box) {
+      const selection = window.getSelection();
+      if (selection && selection.rangeCount) {
+        const range = selection.getRangeAt(0);
+        if (box.contains(range.commonAncestorContainer)) lastSelection = snapshot(range);
+      }
+    }
     scrollBefore = box ? box.scrollTop : 0;
   }
 
@@ -818,6 +917,7 @@ const mailComposer = (function () {
 
   return Object.freeze({
     open, close, beforeRender, afterRender, focus, hasContent, openSignatures,
+    snapshot: draftSnapshot,
     isOpen: () => Boolean(draft),
     isSending: () => sending,
     mode: () => (draft ? draft.mode : null),

@@ -1,11 +1,17 @@
 /* project-panels.js — the parts of a project page that 0039 made possible: its
- * team, its client's people, its files and, for owners and admins, its budget.
+ * team, its client's people, its files, its own activity (0052) and, for
+ * owners and admins, its budget.
  *
  * projectDetail() in workspace.js draws the page and asks this file for them
- * (teamPanel, peoplePanel, filesPanel, budgetRows). Who may do what is decided
- * in projects-model.js the way the database decides it, so a button is only
- * offered to someone the database would let through. The database still has
- * the last word, and every write reloads the store.
+ * (teamPanel, peoplePanel, filesPanel, activityPanel, budgetRows). Who may do
+ * what is decided in projects-model.js the way the database decides it, so a
+ * button is only offered to someone the database would let through. The
+ * database still has the last word, and every write reloads the store.
+ *
+ * Leaving the team, taking someone off it, and taking a client contact off a
+ * project are all confirmed first (confirmLeaveTeam, confirmRemovePerson) —
+ * as removing a file already was — since a person re-added starts fresh, and
+ * a contact re-added has to be picked again.
  */
 const projectPanels = (function () {
   'use strict';
@@ -79,11 +85,33 @@ const projectPanels = (function () {
       + '</section>';
   }
 
-  function takeOffTeam(p, employeeId) {
+  /* Leaving and taking someone off are both one click away on the team list,
+     and both permanent enough — someone re-added starts fresh, with no memory
+     of what they had open — to ask first, the way removing a file already
+     does (confirmRemoveFile, below). */
+  function confirmLeaveTeam(p, employeeId) {
     const person = personNamed(employeeId);
     const self = employeeId === meId();
-    save(`team:${p.uuid}`, () => workspaceActions.removeProjectMember(p.uuid, employeeId),
-      () => toast(self ? `You left ${p.name}.` : `${person ? person.name : 'They'} left ${p.name}'s team.`));
+    const heading = self ? `Leave ${p.name}?` : `Take ${person ? person.name : 'them'} off ${p.name}'s team?`;
+    const note = self
+      ? 'The project’s owner, or an owner or admin, can add you back.'
+      : 'They can be added back at any time; their tasks and files on the project are not affected.';
+    showModal('PROJECT · TEAM', `<h2>${esc(heading)}</h2><p class="form-note">${esc(note)}</p>`
+      + '<form id="project-team-remove-form" method="dialog"><div class="dialog-actions">'
+      + '<button type="button" class="btn" data-action="close">Cancel</button>'
+      + `<button type="submit" class="btn btn-primary">${self ? 'Leave' : 'Remove'}</button></div></form>`);
+    const form = document.getElementById('project-team-remove-form');
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      const button = form.querySelector('[type="submit"]');
+      button.disabled = true;
+      save(`team:${p.uuid}`, () => workspaceActions.removeProjectMember(p.uuid, employeeId).then(result => {
+        const modal = document.getElementById('modal');
+        if (form.isConnected && modal && modal.open) modal.close();
+        return result;
+      }), () => toast(self ? `You left ${p.name}.` : `${person ? person.name : 'They'} left ${p.name}'s team.`))
+        .then(() => { button.disabled = false; });
+    });
   }
 
   /* ── The client's people ───────────────────────────────────────────── */
@@ -112,10 +140,26 @@ const projectPanels = (function () {
     return `<section class="panel content-panel project-people"><h2>Client people</h2>${body}</section>`;
   }
 
-  function takeOffProject(p, contactId) {
+  function confirmRemovePerson(p, contactId) {
     const person = contacts.find(c => c.id === contactId);
-    save(`people:${p.uuid}`, () => workspaceActions.removeProjectContact(p.uuid, contactId),
-      () => toast(`${person ? person.name : 'The contact'} is off ${p.name}.`));
+    const name = person ? person.name : 'them';
+    showModal('PROJECT · CLIENT PEOPLE', `<h2>Take ${esc(name)} off ${esc(p.name)}?</h2>`
+      + '<p class="form-note">They stay in the CRM; only their link to this project is removed.</p>'
+      + '<form id="project-people-remove-form" method="dialog"><div class="dialog-actions">'
+      + '<button type="button" class="btn" data-action="close">Cancel</button>'
+      + '<button type="submit" class="btn btn-primary">Remove</button></div></form>');
+    const form = document.getElementById('project-people-remove-form');
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      const button = form.querySelector('[type="submit"]');
+      button.disabled = true;
+      save(`people:${p.uuid}`, () => workspaceActions.removeProjectContact(p.uuid, contactId).then(result => {
+        const modal = document.getElementById('modal');
+        if (form.isConnected && modal && modal.open) modal.close();
+        return result;
+      }), () => toast(`${name} is off ${p.name}.`))
+        .then(() => { button.disabled = false; });
+    });
   }
 
   /* Each person's role saves on its own, and the latest choice wins. Every
@@ -163,7 +207,8 @@ const projectPanels = (function () {
        hidden file input. A label round a hidden input could only be clicked. */
     return '<section class="panel content-panel project-files">'
       + `<div class="section-title"><h2>Files</h2><span class="quiet-text">${files.length} ${files.length === 1 ? 'file' : 'files'}</span></div>`
-      + `<button type="button" class="btn file-pick" data-files-pick="${esc(p.id)}">${icon('plus')}Add files</button>`
+      + `<div class="file-pick-row"><button type="button" class="btn file-pick" data-files-pick="${esc(p.id)}">${icon('plus')}Add files</button>`
+      + `<span class="quiet-text file-upload-status" data-files-status="${esc(p.id)}" role="status"></span></div>`
       + `<input type="file" multiple hidden data-files-input="${esc(p.id)}">`
       + `<p class="quiet-text">Up to ${M.fileSize(M.FILE_LIMIT_BYTES)} each. Only the project's team, its owner and owners or admins can open them.</p>`
       + (files.length ? `<ul class="plain-list">${files.map(row).join('')}</ul>` : '<p class="quiet-text">No files yet.</p>')
@@ -171,7 +216,13 @@ const projectPanels = (function () {
   }
 
   /* One after another, so a failure is about one file; the page reloads once
-     at the end, with whatever made it. */
+     at the end, with whatever made it. Progress used to be a toast() per
+     file — a message that replaces itself and resets its own four-second
+     clock on every call, so a quick run of small files flashed by "Uploading
+     1 of 5…", "2 of 5…" and so on too fast to read any of them, ending on
+     whichever one happened to still be showing when the toast timer next
+     fired. A status line beside the button holds still instead: it only ever
+     says the one thing happening right now, for as long as it is true. */
   function upload(input) {
     const p = projectFor(input.dataset.filesInput);
     const files = [...(input.files || [])];
@@ -183,11 +234,12 @@ const projectPanels = (function () {
     /* Files picked while an upload ran used to be dropped; the button now
        waits for it. */
     const pick = [...document.querySelectorAll('[data-files-pick]')].find(b => b.dataset.filesPick === input.dataset.filesInput);
+    const status = [...document.querySelectorAll('[data-files-status]')].find(s => s.dataset.filesStatus === input.dataset.filesInput);
     if (pick) { pick.disabled = true; pick.setAttribute('aria-busy', 'true'); }
     save(`files:${p.uuid}`, async () => {
       const failed = [];
       for (const [i, file] of files.entries()) {
-        toast(`Uploading ${files.length > 1 ? `${i + 1} of ${files.length}: ` : ''}${file.name}…`);
+        if (status) status.textContent = `Uploading ${files.length > 1 ? `${i + 1} of ${files.length}: ` : ''}${file.name}…`;
         try {
           await workspaceActions.uploadProjectFile(p.uuid, file);
         } catch (err) {
@@ -198,15 +250,23 @@ const projectPanels = (function () {
     }, ({ added, failed }) => toast(failed.length
       ? `${added} of ${files.length} added. ${failed[0]}`
       : (added === 1 ? `${files[0].name} is on the project.` : `${added} files are on the project.`)))
-      .then(() => { if (pick && pick.isConnected) { pick.disabled = false; pick.removeAttribute('aria-busy'); } });
+      .then(() => {
+        if (status && status.isConnected) status.textContent = '';
+        if (pick && pick.isConnected) { pick.disabled = false; pick.removeAttribute('aria-busy'); }
+      });
   }
 
+  /* target="_blank": without it, a signed URL that has expired, or a network
+     hiccup partway through the download, navigates this tab away to the
+     storage host's own error page — replacing the workspace with it — rather
+     than failing quietly in a tab nobody was looking at. */
   function download(file, button) {
     button.disabled = true;
     workspaceActions.projectFileLink(file.path, file.name)
       .then(url => {
         const link = document.createElement('a');
         link.href = url;
+        link.target = '_blank';
         link.rel = 'noopener';
         document.body.appendChild(link);
         link.click();
@@ -243,6 +303,53 @@ const projectPanels = (function () {
     const budget = M.budgetOf(p, state().projectBudgets);
     return [['Budget', budget ? esc(money(budget.amount, budget.currency)) : '<span class="quiet-text">Not set</span>']];
   }
+
+  /* ── Activity (0052) ──────────────────────────────────────────────── */
+  /* A project had a Notes tab and nothing else: no record of who did what,
+     or when — a task ticked off, a note added, a file uploaded, all left no
+     trace on the project itself once the moment passed. workspace_activity
+     (0027) has logged every one of those under its project since 0052; this
+     is the first thing on the page to read it. Asked for by the store the
+     way a client's past meetings are (workspaceStore.projectActivity), since
+     a project's own history can reach further back than the studio-wide feed
+     kept on the Overview. */
+  function activityPanel(p) {
+    const store = window.workspaceStore;
+    const entry = store && typeof store.projectActivity === 'function'
+      ? store.projectActivity(p.uuid) : { state: 'failed', activity: [] };
+    const heading = `<h2 id="${esc(`project-activity-${p.id}`)}" tabindex="-1">Activity</h2>`;
+    let body;
+    if (entry.state === 'loading') {
+      body = '<p class="quiet-text" role="status">Loading this project’s activity…</p>';
+    } else if (entry.state === 'failed') {
+      body = '<p class="quiet-text" role="status">This project’s activity did not load. '
+        + `<button type="button" class="text-btn" data-project-activity-retry="${esc(p.id)}">Try again</button></p>`;
+    } else if (!entry.activity.length) {
+      body = '<p class="quiet-text">Nothing yet. Its tasks, notes and files show here as they change.</p>';
+    } else {
+      const items = entry.activity.map(a => overviewModel.activityItem(a,
+        { tickets, projects, contacts, companies: state().companies || [], invoices }));
+      body = `<div class="activity-list">${items.map(activityRow).join('')}</div>`;
+    }
+    return `<section class="panel content-panel">${heading}${body}</section>`;
+  }
+
+  /* Activity that did not load, asked for again. The page is drawn again
+     without the button, so the keyboard goes to the panel's own heading —
+     the way a client's past meetings already do this (crm-ui.js). */
+  document.addEventListener('click', e => {
+    const retry = e.target.closest && e.target.closest('[data-project-activity-retry]');
+    if (!retry) return;
+    e.preventDefault();
+    const p = projectFor(retry.dataset.projectActivityRetry);
+    if (!p) return;
+    if (window.workspaceStore && typeof workspaceStore.retryProjectActivity === 'function') {
+      workspaceStore.retryProjectActivity(p.uuid);
+    }
+    if (typeof render === 'function') render();
+    const heading = document.getElementById(`project-activity-${p.id}`);
+    if (heading && heading.focus) heading.focus();
+  });
 
   /* ── Events ────────────────────────────────────────────────────────── */
 
@@ -296,13 +403,13 @@ const projectPanels = (function () {
     const d = target.dataset;
     const p = withProject(d.teamRemove || d.peopleRemove || d.project);
     if (!p) return;
-    if (d.teamRemove) { takeOffTeam(p, d.employee); return; }
-    if (d.peopleRemove) { takeOffProject(p, d.contact); return; }
+    if (d.teamRemove) { confirmLeaveTeam(p, d.employee); return; }
+    if (d.peopleRemove) { confirmRemovePerson(p, d.contact); return; }
     const file = M.projectFiles(p, state().projectFiles).find(f => f.id === (d.fileOpen || d.fileRemove));
     if (!file) { toast('That file is not loaded any more. Reload the page.'); return; }
     if (d.fileOpen) download(file, target);
     else confirmRemoveFile(p, file);
   });
 
-  return Object.freeze({ teamPanel, peoplePanel, filesPanel, budgetRows });
+  return Object.freeze({ teamPanel, peoplePanel, filesPanel, budgetRows, activityPanel });
 })();

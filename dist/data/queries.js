@@ -190,12 +190,14 @@
      meanwhile is refused rather than overwritten (actions.updateEvent). */
   var EVENT_COLUMNS = 'id, title, detail, location, starts_at, ends_at, all_day, kind, status, project_id, company_id, contact_id, updated_at';
   /* What a list of events brings for each one's page: who may change it
-     (connection_id, created_by). Who is invited (attendees, 0026: [{name,
-     email, response}]) is the largest column an event has and only its page
-     reads it, so it comes with one event asked for by its id (event,
-     eventInvitees) rather than with every week, project meeting and past
-     meeting, which are loaded again every two minutes. */
-  var EVENT_LIST_COLUMNS = EVENT_COLUMNS + ', connection_id, created_by';
+     (connection_id, created_by), and — for a synced one (0057) — who
+     organised it, its video-call link and the zone it was booked in.
+     Who is invited (attendees, 0026: [{name, email, response}]) is the
+     largest column an event has and only its page reads it, so it comes
+     with one event asked for by its id (event, eventInvitees) rather than
+     with every week, project meeting and past meeting, which are loaded
+     again every two minutes. */
+  var EVENT_LIST_COLUMNS = EVENT_COLUMNS + ', connection_id, calendar_id, created_by, organizer_name, organizer_email, meeting_url, time_zone';
   var EVENT_PAGE_COLUMNS = EVENT_LIST_COLUMNS + ', attendees';
 
   function agendaEvent(r) {
@@ -209,6 +211,17 @@
       /* When, in words: what a project's or a company's page lists it by. */
       when: meetingDay(r.starts_at, r.all_day) + (r.all_day ? '' : ' · ' + clockTime(r.starts_at)),
       row: r
+    };
+  }
+
+  /* An activity row (workspace_activity, 0027/0052) the way a feed shows it,
+     whether it came from the studio-wide feed or one project's own. */
+  function shapeActivity(r) {
+    var who = r.actor ? r.actor.full_name : 'Veyago';
+    return {
+      id: r.id, who: who, initial: initials(who), text: r.summary,
+      when: shortDate(r.created_at), createdAt: r.created_at, verb: r.verb,
+      entityType: r.entity_type, entityId: r.entity_id, row: r
     };
   }
 
@@ -238,14 +251,7 @@
         .select('id, verb, entity_type, entity_id, summary, created_at, actor:employees (full_name)')
         .order('created_at', { ascending: false })
         .limit(limit || 8), 'activity');
-      return rows.map(function (r) {
-        var who = r.actor ? r.actor.full_name : 'Veyago';
-        return {
-          id: r.id, who: who, initial: initials(who), text: r.summary,
-          when: shortDate(r.created_at), createdAt: r.created_at, verb: r.verb,
-          entityType: r.entity_type, entityId: r.entity_id, row: r
-        };
-      });
+      return rows.map(shapeActivity);
     },
 
     /* ── Agenda ──────────────────────────────────────────────────────── */
@@ -398,32 +404,52 @@
     },
 
     /* ── Tickets ─────────────────────────────────────────────────────── */
+    /* Every open and closed ticket, a page at a time (everyRow): the API's own
+       row cap used to cut this off in silence past a thousand, and a studio
+       with more tickets than that would have quietly stopped seeing its
+       oldest ones. */
     async tickets() {
-      var rows = unwrap(await sb()
-        .from('support_tickets')
-        .select('id, number, subject, product, priority, status, source, created_at, first_response_at, resolved_at, ' +
-                'project_id, company_id, contact_id, assignee_id, ' +
-                'contact:crm_contacts (full_name, email), company:crm_companies (name), ' +
-                'assignee:employees (full_name), ' +
-                /* The queue view shows the opening message under each row, and
-                   the detail view the whole thread: who wrote each message, and
-                   whether a reply reached the customer (0033). Both come from
-                   this one embed rather than a second round trip per ticket. */
-                'ticket_messages (id, body, direction, created_at, delivered_at, delivery_error, ' +
-                'author:employees (full_name), sender:crm_contacts (full_name))')
-        .is('deleted_at', null)
-        .order('created_at', { ascending: false }), 'tickets');
+      var rows = await everyRow(function (from, to) {
+        return sb()
+          .from('support_tickets')
+          .select('id, number, subject, product, priority, status, source, created_at, updated_at, ' +
+                  'first_response_at, resolved_at, first_response_due_at, resolve_due_at, ' +
+                  'project_id, company_id, contact_id, assignee_id, merged_into_id, ' +
+                  'requester_name, requester_email, ' +
+                  /* client_number (0053) rides along on the same embed the
+                     ticket already carries, so its page can quote it beside
+                     whichever company it is filed under — read straight off
+                     the row (tickets-ui.js's clientNumberOf), never through
+                     tickets-model.js, which knows nothing of it. */
+                  'contact:crm_contacts (full_name, email), company:crm_companies (name, client_number), ' +
+                  'assignee:employees (full_name), ' +
+                  /* Enough of each message to know whether the conversation
+                     changed since it was last read — its id, direction and
+                     delivery — never its words or who wrote it: that used to
+                     come with every ticket on every load (audit #12), the
+                     heaviest part of a row that mostly goes unread. The whole
+                     conversation is a separate call (ticketMessages), asked for
+                     once a ticket's page actually needs it, the same way a mail
+                     thread's body is kept apart from its list. */
+                  'ticket_messages (id, direction, created_at, delivered_at, delivery_error)')
+          .is('deleted_at', null)
+          .order('created_at', { ascending: false })
+          .order('id')
+          .range(from, to);
+      }, 'tickets');
       return rows.map(function (r) {
-        var client = (r.contact && r.contact.full_name)
-                  || (r.company && r.company.name) || 'Unknown';
-        var thread = (r.ticket_messages || []).map(function (m) {
-          return Object.assign({}, m, {
-            who: (m.author && m.author.full_name) || (m.sender && m.sender.full_name) || ''
-          });
-        }).sort(function (a, b) {
+        var messages = (r.ticket_messages || []).slice().sort(function (a, b) {
           return String(a.created_at).localeCompare(String(b.created_at));
         });
-        var opening = thread.filter(function (m) { return m.direction === 'inbound'; })[0];
+        var lastOutbound = messages.filter(function (m) { return m.direction === 'outbound'; }).pop();
+        var client = (r.contact && r.contact.full_name)
+                  || (r.company && r.company.name)
+                  /* A sender no CRM contact matched (audit #1) is still someone
+                     to answer: routing (route_mail_to_ticket) and manual
+                     creation both keep the raw name and address they arrived
+                     with, so the ticket is never just "Unknown" with nowhere
+                     for a reply to go. */
+                  || r.requester_name || r.requester_email || 'Unknown';
         return {
           id: r.number, uuid: r.id, title: r.subject, client: client,
           product: r.product || '—',
@@ -432,52 +458,77 @@
           /* "Assigned to me" is this id — it was a set of initials. */
           assigneeId: r.assignee_id || null,
           assigneeName: r.assignee ? r.assignee.full_name : '',
-          contactEmail: (r.contact && r.contact.email) || '',
+          contactEmail: (r.contact && r.contact.email) || r.requester_email || '',
           date: shortDate(r.created_at),
-          body: opening ? opening.body : '',
-          thread: thread, row: r
+          /* How many messages the conversation has, and when the last one
+             arrived: what tells the store's cached copy of the whole
+             conversation (data/store.js askTicketThread) from one worth
+             asking for again, without carrying every message's words here to
+             find out. */
+          messageCount: messages.length,
+          lastMessageAt: messages.length ? messages[messages.length - 1].created_at : null,
+          /* Whether the most recent reply reached the customer — shown in the
+             queue so a failed send is found without opening the ticket. */
+          deliveryFailed: Boolean(lastOutbound && lastOutbound.delivery_error && !lastOutbound.delivered_at),
+          mergedIntoId: r.merged_into_id || null,
+          /* Not loaded with the list (see the embed's comment above); asked
+             for by the ticket's page through workspaceStore.askTicketThread. */
+          thread: null, row: r
         };
       });
     },
 
-    /* A ticket with its whole thread, oldest first — the order you read it in. */
-    async ticket(uuid) {
-      var head = await sb()
-        .from('support_tickets')
-        .select('*, contact:crm_contacts (full_name, email), company:crm_companies (name), ' +
-                'assignee:employees (full_name), project:client_projects (name)')
-        .eq('id', uuid).maybeSingle();
-      if (head.error) throw new Error('Could not load the ticket: ' + head.error.message);
-      if (!head.data) return null;
-
-      var messages = unwrap(await sb()
+    /* A ticket's whole conversation, oldest first, with who wrote each
+       message — asked for once a ticket's page is open (data/store.js), not
+       with every ticket on every load (audit #12). */
+    async ticketMessages(ticketId) {
+      var rows = unwrap(await sb()
         .from('ticket_messages')
-        .select('id, direction, body, created_at, author_employee:employees (full_name), ' +
-                'author_contact:crm_contacts (full_name)')
-        .eq('ticket_id', uuid)
-        .order('created_at'), 'the ticket thread');
+        .select('id, body, direction, created_at, delivered_at, delivery_error, ' +
+                'author:employees (full_name), sender:crm_contacts (full_name)')
+        .eq('ticket_id', ticketId)
+        .order('created_at'), 'the ticket\'s conversation');
+      return rows.slice().sort(function (a, b) {
+        return String(a.created_at).localeCompare(String(b.created_at));
+      }).map(function (m) {
+        return Object.assign({}, m, {
+          who: (m.author && m.author.full_name) || (m.sender && m.sender.full_name) || ''
+        });
+      });
+    },
 
-      return {
-        ticket: head.data,
-        messages: messages.map(function (m) {
-          var who = (m.author_employee && m.author_employee.full_name)
-                 || (m.author_contact && m.author_contact.full_name)
-                 || (m.direction === 'inbound' ? 'Customer' : 'Veyago');
-          return {
-            id: m.id, who: who, initial: initials(who), body: m.body,
-            direction: m.direction, internal: m.direction === 'internal',
-            when: shortDate(m.created_at), row: m
-          };
-        })
-      };
+    /* A ticket's attachments, newest first — audit #11. Most come with a
+       message (message_id set, from an incoming email); one added straight to
+       the ticket has none. */
+    async ticketAttachments(ticketId) {
+      var rows = unwrap(await sb()
+        .from('ticket_attachments')
+        .select('id, message_id, storage_path, name, size_bytes, content_type, uploaded_by, created_at, ' +
+                'uploader:employees (full_name)')
+        .eq('ticket_id', ticketId)
+        .order('created_at', { ascending: false }), 'the ticket\'s attachments');
+      return rows.map(function (r) {
+        return {
+          id: r.id, name: r.name, sizeBytes: r.size_bytes, contentType: r.content_type,
+          storagePath: r.storage_path, messageId: r.message_id,
+          uploadedBy: r.uploaded_by || null, uploaderName: r.uploader ? r.uploader.full_name : '',
+          createdAt: r.created_at
+        };
+      });
     },
 
     /* ── Projects ────────────────────────────────────────────────────── */
+    /* sort_order is 0 for every project alike — nothing in the workspace ever
+       sets it to anything else — so ordering by it first settled nothing, and
+       whatever order Postgres happened to hand rows back in (not guaranteed
+       to be the same twice) decided the rest: a reload could reshuffle the
+       whole list. Ordered by name then, tie-broken by id, the way contacts
+       and companies already are (everyRow, above) — every reload the same. */
     async projects() {
       var rows = unwrap(await sb()
         .from('client_project_progress')
         .select('*')
-        .order('sort_order'), 'projects');
+        .order('sort_order').order('name').order('id'), 'projects');
       return rows.map(function (r) {
         return {
           id: r.id, name: r.name, client: r.company_name || 'Internal product',
@@ -488,6 +539,47 @@
           taskCount: r.task_count, tasksDone: r.tasks_done, row: r
         };
       });
+    },
+
+    /* Archived projects (deleted_at set): left out of client_project_progress
+       entirely (0022's view), so a project once archived could not be found
+       again anywhere in the workspace. Read straight off client_projects —
+       RLS lets any staff member see it, archived or not (0022's own select
+       policy carries no deleted_at condition; only the view added one) — with
+       just enough to list and restore one, none of the task rollups a live
+       board needs. Newest-archived first, tie-broken by id. */
+    async archivedProjects() {
+      var rows = unwrap(await sb()
+        .from('client_projects')
+        .select('id, name, code, accent, status, description, company_id, owner_id, due_on, deleted_at, ' +
+                'company:crm_companies (name)')
+        .not('deleted_at', 'is', null)
+        .order('deleted_at', { ascending: false })
+        .order('id'), 'archived projects');
+      return rows.map(function (r) {
+        return {
+          id: r.id, name: r.name, client: (r.company && r.company.name) || 'Internal product',
+          initial: r.code || initials(r.name), style: r.accent === 'default' ? '' : r.accent,
+          status: label(r.status), description: r.description || '',
+          archivedAt: r.deleted_at, archived: shortDate(r.deleted_at), row: r
+        };
+      });
+    },
+
+    /* A project's own history (0052): the tasks, notes and files logged under
+       it, which can reach further back than the studio-wide feed's most
+       recent window keeps (that one is loaded with the workspace and capped;
+       this is asked for by a project's page, the way a client's past
+       meetings are). Only a uuid is asked for. */
+    async projectActivity(projectId, limit) {
+      if (!uuids([projectId], 1).length) return [];
+      var rows = unwrap(await sb()
+        .from('workspace_activity')
+        .select('id, verb, entity_type, entity_id, summary, created_at, actor:employees (full_name)')
+        .eq('project_id', projectId)
+        .order('created_at', { ascending: false })
+        .limit(Math.min(Math.max(Math.floor(Number(limit)) || 50, 1), 200)), 'this project’s activity');
+      return rows.map(shapeActivity);
     },
 
     async projectTasks(projectId) {
@@ -521,7 +613,11 @@
       var rows = await everyRow(function (from, to) {
         return sb()
           .from('crm_contacts')
-          .select('id, full_name, email, phone, title, notes, ' +
+          /* is_primary and enquiry_id ride along on the raw row (crm-ui.js
+             reads them from .row) rather than in the shape below, which
+             crm-model.js's shapeContact() already builds from these same
+             columns and is not this file's to change. */
+          .select('id, full_name, email, phone, title, notes, is_primary, enquiry_id, ' +
                   'company:crm_companies (id, name, stage, value, currency)')
           .is('deleted_at', null)
           .order('full_name')
@@ -540,12 +636,14 @@
       });
     },
 
-    /* Every company, a page at a time (everyRow), as contacts are. */
+    /* Every company, a page at a time (everyRow), as contacts are. A client
+       number (0053) is given once, when a company first reaches the client
+       stage — a lead has none yet. */
     async companies() {
       var rows = await everyRow(function (from, to) {
         return sb()
           .from('crm_companies')
-          .select('id, name, domain, kind, stage, value, currency, owner_id, notes')
+          .select('id, name, domain, kind, stage, value, currency, owner_id, notes, client_number')
           .is('deleted_at', null)
           .order('name')
           .order('id')
@@ -554,18 +652,61 @@
       return rows.map(function (r) {
         return {
           id: r.id, name: r.name, domain: r.domain || '',
-          stage: label(r.stage), kind: label(r.kind),
+          stage: label(r.stage), kind: label(r.kind), clientNumber: r.client_number == null ? null : r.client_number,
           value: money(r.value, r.currency) || '—', notes: r.notes || '', row: r
         };
       });
     },
 
-    /* ── Finance (managers only — RLS returns [] for everyone else) ──── */
-    async invoices() {
+    /* Leads from the public "Get a quote" form (managers only — RLS returns []
+       for anyone else, 0019). The site admin already lists these; this is the
+       same table, read for the workspace's own Promote button. */
+    async enquiries() {
       var rows = unwrap(await sb()
-        .from('finance_invoices')
-        .select('id, number, client, client_email, amount, currency, status, issued_on, due_on, paid_on, notes')
-        .order('issued_on', { ascending: false, nullsFirst: false }), 'invoices');
+        .from('website_enquiries')
+        .select('id, kind, name, email, business, website, message, status, created_at')
+        .order('created_at', { ascending: false }), 'enquiries');
+      return rows.map(function (r) {
+        return {
+          id: r.id, name: r.name || '', email: r.email || '',
+          business: r.business || '', website: r.website || '',
+          message: r.message || '', status: label(r.status),
+          kind: label(r.kind), when: shortDate(r.created_at), row: r
+        };
+      });
+    },
+
+    /* ── Finance (managers only — RLS returns [] for everyone else) ──── */
+    /* updated_at, tax_rate and tax_amount, and each invoice's line items
+       (0060): finance-model.js's shapeInvoice() does not know any of these —
+       it is a peer file, tested and not touched here — but every shaped
+       invoice keeps the full row under `row`, which is where finance-ui.js
+       reads them from. Lines come back oldest-sort-order first, the way an
+       invoice reads down the page; an invoice with none (every one made
+       before 0060 was backfilled with the one line invoice-pdf.ts prints for
+       it, so this is really "not yet re-read", not "blank"). A page at a
+       time (everyRow), as tickets and contacts are: a studio with more than
+       a thousand invoices was silently missing its oldest. Ties on issued_on
+       (same day, or both unissued) break on id, so a page ends the same way
+       every time it is asked for. */
+    async invoices() {
+      var rows = await everyRow(function (from, to) {
+        return sb()
+          .from('finance_invoices')
+          .select('id, number, client, client_email, amount, currency, status, issued_on, due_on, paid_on, notes, ' +
+                  'updated_at, tax_rate, tax_amount, ' +
+                  /* company_id (0051, filled by a trigger from the client name
+                     or the invoice's project) and the client_number it leads
+                     to (0053) ride along on the row for finance-ui.js to read
+                     straight off .row.company — a company with no number yet,
+                     or no company at all, embeds as null and quotes nothing. */
+                  'company_id, company:crm_companies (client_number), ' +
+                  'finance_invoice_lines (id, description, quantity, unit_amount, amount, sort_order)')
+          .order('issued_on', { ascending: false, nullsFirst: false })
+          .order('sort_order', { foreignTable: 'finance_invoice_lines', ascending: true })
+          .order('id')
+          .range(from, to);
+      }, 'invoices');
       return rows.map(function (r) {
         return {
           id: r.number, uuid: r.id, client: r.client,
@@ -575,30 +716,67 @@
       });
     },
 
+    /* Every transaction in the window, a page at a time (everyRow): the plain
+       .limit()-less query this replaced stopped at Supabase's 1000-row cap
+       without a word once an account had more than that many in range. */
     async transactions(sinceISODate) {
       var since = sinceISODate ||
         new Date(Date.now() - 180 * 86400000).toISOString().slice(0, 10);
-      return unwrap(await sb()
-        .from('finance_transactions')
-        .select('id, posted_at, description, counterparty, amount, currency, status, source')
-        .gte('posted_at', since)
-        .order('posted_at', { ascending: false }), 'transactions');
+      return everyRow(function (from, to) {
+        return sb()
+          .from('finance_transactions')
+          .select('id, posted_at, description, counterparty, amount, currency, status, source, kind')
+          .gte('posted_at', since)
+          .order('posted_at', { ascending: false })
+          .order('id')
+          .range(from, to);
+      }, 'transactions');
     },
 
     /* ── Company ─────────────────────────────────────────────────────── */
+    /* Ordered by name, not by the spelling of the role — that put the owner
+       last, alphabetically after admin and assistant (companyModel.teamCards
+       re-sorts anyway: owners, then admins, then the rest, each group by
+       name). user_id, email, start_date and the two timestamps are what
+       companyModel needs for a person's page and the invite/role rules
+       (0043's own grant); every column it is not manager-only for. Still only
+       active and invited members: the deactivated are excluded here, as
+       before, because this one array is also the picker every other page
+       assigns work from (project teams, task assignees, ticket owners), and
+       none of those wants a former employee offered back. */
     async team() {
       var rows = unwrap(await sb()
         .from('employees')
-        .select('id, full_name, role, title, status')
+        .select('id, user_id, full_name, email, role, title, status, start_date, created_at, updated_at')
         .neq('status', 'inactive')
-        .order('role'), 'the team');
+        .order('full_name')
+        .order('id'), 'the team');
       return rows.map(function (r) {
         return {
           id: r.id, name: r.full_name, initial: initials(r.full_name),
-          role: r.title || label(r.role), focus: '',
+          role: r.title || label(r.role),
           tag: label(r.role), row: r
         };
       });
+    },
+
+    /* A person's phone (owners, admins and themself) and notes (owners and
+       admins only), by their id (employee_private(), 0043). null for nobody
+       such, or nothing this viewer may see — companyModel.personDetails()
+       reads that as "not shown", never as "none on file". */
+    async employeePrivate(id) {
+      var rows = unwrap(await sb().rpc('employee_private', { p_employee_id: id }), 'their phone and notes');
+      return rows[0] || null;
+    },
+
+    /* The studio's own profile — name, tagline, location, contact address,
+       website, base currency — for any signed-in member of staff
+       (studio_profile(), 0061). [] for anyone else, and for the rest of
+       workspace_settings (bank details among them), which stays behind
+       "managers read settings" (0016); companyModel.studioProfile() reads an
+       empty answer as the studio's own public defaults. */
+    async studioProfile() {
+      return unwrap(await sb().rpc('studio_profile'), 'the studio profile');
     },
 
     /* ── Mail ────────────────────────────────────────────────────────── */
@@ -609,7 +787,10 @@
        across whatever RLS lets this person see.
        Returns { threads, truncated } — truncated names the "mailbox|folder"
        lists that hit the limit, so the view can say it is not everything. */
-    async mailThreads(folders, mailboxIds) {
+    /* `before` (an ISO timestamp): a page older than that cursor, for "Load
+       more" (store.js loadMoreMail) — the ordinary load leaves it out
+       entirely, asking for the newest PER_FOLDER exactly as it always has. */
+    async mailThreads(folders, mailboxIds, before) {
       var PER_FOLDER = 200;   // a working inbox, not an archive
       var wanted = [].concat(folders || 'inbox').map(function (f) { return String(f).toLowerCase(); });
       var boxes = mailboxIds && mailboxIds.length ? mailboxIds : [null];
@@ -622,7 +803,7 @@
         var q = sb()
           .from('mail_threads')
           .select('id, connection_id, subject, snippet, folder, is_read, is_starred, message_count, ' +
-                  'last_message_at, last_from_name, last_from_email, ticket_id, contact_id, ' +
+                  'last_message_at, other_party_name, other_party_email, ticket_id, contact_id, ' +
                   'contact:crm_contacts (full_name, email)');
         /* Starred reaches past the folders listed: a conversation filed away in
            Outlook (0045) with a flag on it is still one you marked to come back
@@ -631,6 +812,7 @@
           ? q.eq('is_starred', true).not('folder', 'in', '(inbox,sent)')
           : q.eq('folder', folder);
         if (box) q = q.eq('connection_id', box);
+        if (before) q = q.lt('last_message_at', before);
         return q
           .order('last_message_at', { ascending: false, nullsFirst: false })
           .limit(PER_FOLDER)
@@ -648,17 +830,19 @@
         .sort(function (a, b) { return String(b.last_message_at || '').localeCompare(String(a.last_message_at || '')); });
 
       var threads = rows.map(function (r) {
-        /* Who wrote, in decreasing order of how much we know about them. The
-           subject is NOT a fallback here — it was, and the list showed a
-           column of subject lines under a heading meant for names. */
+        /* Who the OTHER party is, in decreasing order of how much we know
+           about them — never whoever sent the newest message (0055: that was
+           "last_from_name", and showed our own name on a thread we replied
+           to). The subject is NOT a fallback here — it was, and the list
+           showed a column of subject lines under a heading meant for names. */
         var who = (r.contact && r.contact.full_name)
-               || r.last_from_name
-               || r.last_from_email
+               || r.other_party_name
+               || r.other_party_email
                || 'Unknown sender';
         var day = shortDate(r.last_message_at);
         return {
           id: r.id, sender: who, initial: initials(who),
-          email: (r.contact && r.contact.email) || r.last_from_email || '',
+          email: (r.contact && r.contact.email) || r.other_party_email || '',
           subject: r.subject || '(no subject)', preview: r.snippet || '',
           /* A clock time only for today's mail. "09:14" on a thread from last
              week reads as this morning. */
@@ -679,8 +863,15 @@
     async mailMessages(threadId) {
       var rows = unwrap(await sb()
         .from('mail_messages')
-        .select('id, external_id, direction, from_name, from_email, to_emails, cc_emails, ' +
-                'subject, body_text, body_html, sent_at')
+        .select('id, external_id, direction, from_name, from_email, to_emails, cc_emails, bcc_emails, ' +
+                'subject, body_text, body_html, sent_at, importance, ' +
+                /* One embed rather than a second round trip per message
+                   (0055) — mail_attachments is metadata only: name, kind,
+                   size and, for an inline image, its cid. There is nowhere to
+                   fetch the bytes from yet, so an inline <img src="cid:…">
+                   still will not render; a named, sized attachment list is
+                   what this makes possible today. */
+                'mail_attachments (id, name, content_type, size, is_inline, content_id)')
         .eq('thread_id', threadId)
         .order('sent_at'), 'the conversation');
       /* body_html rides along, but ONLY data/mail-html.js may render it — it is
@@ -692,10 +883,58 @@
           email: r.from_email || '', subject: r.subject || '',
           body: r.body_text || '', bodyHtml: r.body_html || '',
           time: clockTime(r.sent_at), date: shortDate(r.sent_at),
-          to: r.to_emails || [], cc: r.cc_emails || [],
+          to: r.to_emails || [], cc: r.cc_emails || [], bcc: r.bcc_emails || [],
+          importance: r.importance || 'normal',
+          attachments: (r.mail_attachments || []).map(function (a) {
+            return {
+              id: a.id, name: a.name || 'attachment', size: a.size || 0,
+              contentType: a.content_type || 'application/octet-stream',
+              isInline: Boolean(a.is_inline), contentId: a.content_id || null
+            };
+          }),
           outbound: r.direction === 'outbound', row: r
         };
       });
+    },
+
+    /* A contact's or a company's linked conversations, straight off
+       mail_threads.contact_id/company_id (0025's own best-effort match on an
+       address; 0059 widens the company side to a sender's domain for inbound
+       mail no contact claims) — read here, not through mailThreads() above,
+       whose per-folder window (queries.js's own PER_FOLDER cap) only ever
+       holds a working set for the Mail view, so an older conversation, or one
+       filed away (0045), can be linked and still never show up there. This is
+       the only place that asks for it, so there is nothing here for
+       data/store.js to share — crm-ui.js keeps its own small cache, by key,
+       the way it already asks for a client's past meetings.
+       Newest first; one more asked for than `limit`, to say whether there are
+       more. Only a uuid goes into either filter; with neither, nothing is. */
+    async mailThreadsFor(filter) {
+      var f = filter || {};
+      var conditions = [];
+      if (uuids([f.contactId], 1).length) conditions.push('contact_id.eq.' + f.contactId);
+      if (uuids([f.companyId], 1).length) conditions.push('company_id.eq.' + f.companyId);
+      if (!conditions.length) return { threads: [], more: false };
+      var limit = Math.min(Math.max(Math.floor(Number(f.limit)) || 20, 1), 100);
+      var rows = unwrap(await sb()
+        .from('mail_threads')
+        .select('id, subject, folder, is_read, is_starred, last_message_at, other_party_name, other_party_email, contact_id, company_id')
+        .or(conditions.join(','))
+        .order('last_message_at', { ascending: false, nullsFirst: false })
+        .order('id', { ascending: false })
+        .limit(limit + 1), 'their mail');
+      return {
+        threads: rows.slice(0, limit).map(function (r) {
+          return {
+            id: r.id, subject: r.subject || '(no subject)',
+            sender: r.other_party_name || r.other_party_email || 'Unknown sender',
+            time: shortDate(r.last_message_at),
+            folder: r.folder, starred: r.is_starred, unread: !r.is_read,
+            contactId: r.contact_id, companyId: r.company_id, row: r
+          };
+        }),
+        more: rows.length > limit
+      };
     },
 
     /* What the mail switcher offers: the studio's mailboxes and this person's
@@ -714,6 +953,89 @@
         ? query.or('employee_id.is.null,employee_id.eq.' + me.id)
         : query.is('employee_id', null);
       return unwrap(await query.order('account_label'), 'mailboxes');
+    },
+
+    /* The true unread count for every mailbox this session may read
+       (mail_unread_counts(), 0062) — a real count(), not the 200-per-folder
+       window mailThreads() loads. security invoker on the database side, so
+       it answers under mail_threads' own RLS, the same rule mailThreads()
+       itself reads under; a colleague's personal mailbox is never in it.
+       Shaped as a plain {connectionId: count} map, which is what
+       mailModel.unreadCountInfo()/trueUnreadTotal() already expect — and
+       Number()'d, since a bigint count can come back from PostgREST as a
+       string rather than a number. */
+    async mailUnreadCounts() {
+      var res = await sb().rpc('mail_unread_counts');
+      if (res.error) throw new Error('Could not load the unread mail count: ' + res.error.message);
+      var out = {};
+      (res.data || []).forEach(function (r) { out[r.connection_id] = Number(r.unread_count) || 0; });
+      return out;
+    },
+
+    /* Every message this person could already open, not only the folders and
+       200-per-page loaded on screen (mailThreads above) — a word search_mail
+       (0055) finds in a subject, a sender, or a message body. A blank query
+       is not asked at all: the database already answers nothing for one, and
+       skipping the round trip is one less place a slow network shows. */
+    async searchMail(q) {
+      var query = String(q || '').trim();
+      if (!query) return [];
+      var res = await sb().rpc('search_mail', { p_query: query, p_limit: 30 });
+      if (res.error) throw new Error('Could not search mail: ' + res.error.message);
+      return (res.data || []).map(function (r) {
+        var day = shortDate(r.sent_at);
+        return {
+          threadId: r.thread_id, mailboxId: r.connection_id,
+          subject: r.subject || '(no subject)', preview: r.snippet || '',
+          time: day === 'Today' ? clockTime(r.sent_at) : day, row: r
+        };
+      });
+    },
+
+    /* A past meeting, or a plain event weeks outside the weeks loaded, found
+       by a word in its title, detail or location — a word search_events
+       (0064) finds, the same way search_mail (0055) already finds one in
+       mail. A blank query is not asked at all, the same guard searchMail
+       uses. Shaped by agendaEvent, same as every other event this file
+       returns, so shell-model.js's search can treat it exactly like one from
+       the weeks loaded or from upcomingProjectEvents. */
+    async searchEvents(q) {
+      var query = String(q || '').trim();
+      if (!query) return [];
+      var res = await sb().rpc('search_events', { p_query: query, p_limit: 20 });
+      if (res.error) throw new Error('Could not search events: ' + res.error.message);
+      return (res.data || []).map(agendaEvent);
+    },
+
+    /* Every calendar connection the agenda may show or act on: the studio's
+       and this person's own (0044's rule, the same integration_status view
+       mailboxes() reads, filtered to the other provider). What the agenda
+       says a synced event came from, and what a connections panel offers to
+       reconnect or sync (0057, "No way to connect a calendar or see its last
+       sync"). */
+    async calendars() {
+      var me = window.workspaceSession.employee;
+      var query = sb()
+        .from('integration_status')
+        .select('id, provider, account_label, employee_id, employee_name, status, ' +
+                'is_live, last_synced_at, last_error')
+        .eq('provider', 'microsoft_calendar');
+      query = me && me.id
+        ? query.or('employee_id.is.null,employee_id.eq.' + me.id)
+        : query.is('employee_id', null);
+      var rows = unwrap(await query.order('account_label'), 'calendars');
+      return rows.map(function (r) {
+        return {
+          id: r.id, label: r.account_label,
+          /* null = the studio's, shared calendar; otherwise this person's own
+             (integration_status only ever returns one of the two — 0044). */
+          employeeId: r.employee_id || null,
+          ownerName: r.employee_id ? r.employee_name : 'Studio',
+          live: Boolean(r.is_live), status: r.status,
+          lastSyncedAt: r.last_synced_at, lastError: r.last_error || '',
+          row: r
+        };
+      });
     },
 
     /* The signed-in person's own signatures: one per mailbox, and at most one
@@ -736,14 +1058,20 @@
       return (await rpcInZone('revenue_mix', { p_months: months || 1 }, 'the revenue mix')) || [];
     },
 
-    /* Every note in one query. The panels are keyed by record, but fetching
-       per record would be one round trip per open detail view; there are never
-       many notes, so the store groups them once. */
+    /* Every note, a page at a time (everyRow). The panels are keyed by
+       record, but fetching per record would be one round trip per open
+       detail view, so the store groups them once instead — which used to mean
+       a studio with more than a thousand notes silently lost its oldest ones
+       from every panel at once. Ties on created_at break on id. */
     async notes() {
-      var rows = unwrap(await sb()
-        .from('workspace_notes')
-        .select('id, entity_type, entity_id, body, created_at, author_id, author:employees (full_name)')
-        .order('created_at'), 'notes');
+      var rows = await everyRow(function (from, to) {
+        return sb()
+          .from('workspace_notes')
+          .select('id, entity_type, entity_id, body, created_at, author_id, author:employees (full_name)')
+          .order('created_at')
+          .order('id')
+          .range(from, to);
+      }, 'notes');
       return rows.map(function (r) {
         /* Only the employee signed in writes a note (0032's insert policy),
            and a note keeps no author once theirs is deleted (on delete set
@@ -766,6 +1094,17 @@
         .from('integration_status')
         .select('*')
         .order('provider'), 'integrations');
+    },
+
+    /* ── Notifications (the bell) ────────────────────────────────────── */
+    /* Which attention items (shellModel.attention() keys, e.g. "ticket:<uuid>")
+       this person has already dismissed (notification_dismissals, 0061). RLS
+       hands back only their own rows. */
+    async notificationDismissals() {
+      var rows = unwrap(await sb()
+        .from('notification_dismissals')
+        .select('notif_key'), 'dismissed notifications');
+      return rows.map(function (r) { return r.notif_key; });
     }
   };
 })();

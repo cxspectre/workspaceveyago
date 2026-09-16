@@ -37,6 +37,17 @@
   .mail-workspace > .conversation-list,
   .mail-workspace > .reader { overflow: visible; }
   .conversation-list .mail-list-heading { position: static; }
+
+  /* Stacked in DOM order, an opened conversation sat below the mailbox
+     picker, the folders, Connections AND the whole list — several screens
+     down on a phone. `order` alone moves it without touching the markup:
+     the reader first (open or being written), the list next, the folders
+     and Connections last, since picking a different mailbox or folder is
+     the least of what someone does once something is already open. Nothing
+     changes when the reader is empty — there is nothing worth promoting yet,
+     and the list stays exactly where it already was. */
+  .mail-workspace:has(> .reader[data-thread-id], > .reader-compose) > .reader { order: -1; }
+  .mail-workspace:has(> .reader[data-thread-id], > .reader-compose) > .mail-folders { order: 1; }
 }
 
 /* Mini month: the spill from the months either side fills out whole weeks,
@@ -66,8 +77,17 @@
 .mailbox-name small.mailbox-warning, .mail-folder-foot small.mailbox-warning { color: #b45309; }
 .mailbox-connection + .mailbox-connection { margin-top: 12px; }
 .mailbox-connection small { display: block; }
-.mail-folder-foot .mailbox-reconnect { margin-top: 7px; padding: 5px 11px; font-size: .75rem; }
-.mail-folder-foot .mailbox-reconnect:disabled { opacity: .55; cursor: progress; }
+.mailbox-connection-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 7px; }
+.mail-folder-foot .mailbox-reconnect, .mail-folder-foot .mailbox-disconnect { padding: 5px 11px; font-size: .75rem; }
+.mail-folder-foot .mailbox-reconnect:disabled, .mail-folder-foot .mailbox-disconnect:disabled { opacity: .55; cursor: progress; }
+.mailbox-disconnect { color: #96693a; border-color: #e7d6c2; background: #fdf8f2; }
+.mailbox-disconnect:hover { background: #faf0e2; }
+.mail-folder-foot .mailbox-connect { margin-top: 10px; width: 100%; }
+
+/* ── Mark all as read, and loading an older page of mail ─────────────── */
+.mail-list-heading .mail-mark-all-read { flex-shrink: 0; white-space: nowrap; }
+.mail-load-more { display: block; width: calc(100% - 32px); margin: 14px 16px; text-align: center; justify-content: center; }
+.mail-load-more:disabled { opacity: .6; cursor: progress; }
 
 /* ── Compose, in the reading pane ─────────────────────────────────────── */
 .reader-compose .reader-content { padding-top: 16px; }
@@ -183,8 +203,8 @@ button.mail-message-head:hover { background: #f7faff; }
   .mailbox-select { display: block; margin-right: 6px; }
   .mail-folder-list { display: flex; flex-wrap: wrap; gap: 6px; }
   /* The foot is hidden here to save room — but not when it is the only place
-     a manager can reconnect a mailbox. */
-  .mail-folder-foot:has(.mailbox-reconnect) { display: block; }
+     a manager can reconnect, or connect, a mailbox. */
+  .mail-folder-foot:has(.mailbox-reconnect, .mailbox-connect) { display: block; }
 }
 @media (max-width: 760px) { .mail-workspace { grid-template-columns: 1fr; } }
 
@@ -236,7 +256,35 @@ body.mail-mode .reader-compose .composer-editor { flex: 1; min-height: 240px; ma
 /* The CRM pipeline: a column for each of the six stages a company can be at,
    with what the column is worth in each currency under its heading. */
 .project-board.stage-board.crm-board { grid-template-columns: repeat(6, minmax(220px, 1fr)); }
+/* A laptop (1250–1440px) sits between the two .project-board breakpoints
+   above and below: wide enough that neither one's plain .project-board rule
+   ever wins against this compound selector's higher specificity, narrow
+   enough that five columns — six for the CRM pipeline — at 230/220px do not
+   fit the content area next to the sidebar. The board still scrolled, but
+   most of a laptop's width showed one card mostly cut off at the right
+   edge with nothing to suggest more sat past it. Narrower cards fit what a
+   laptop actually has without losing the wider ones' breathing room. */
+@media (max-width: 1440px) {
+  .project-board.stage-board { grid-template-columns: repeat(5, minmax(170px, 1fr)); }
+  .project-board.stage-board.crm-board { grid-template-columns: repeat(6, minmax(160px, 1fr)); }
+}
 .crm-board .board-total { margin: 0 2px 10px; color: #66758a; font-size: .8125rem; font-variant-numeric: tabular-nums; }
+/* Six columns at 220px need at least 1,320px to show without scrolling. The
+   plain .project-board above narrows for a phone at both breakpoints below;
+   .crm-board (three classes) is more specific than that lone-class rule, so
+   without its own override here it would keep 220px at any width, and a
+   phone would show barely half of one column before the next has to be
+   scrolled to. Narrower still at 520px, so a column stays clear of a small
+   phone's own edges rather than running right up against them. */
+@media (max-width: 760px) { .project-board.stage-board.crm-board { grid-template-columns: repeat(6, minmax(190px, 1fr)); } }
+@media (max-width: 520px) { .project-board.stage-board.crm-board { grid-template-columns: repeat(6, minmax(165px, 1fr)); } }
+/* The filter and sort controls above the pipeline and the companies table,
+   on their own row under the search box (view-toolbar): small controls, so
+   they wrap onto more than one line before either crowds the other. */
+.filter-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin: -4px 0 15px; }
+.filter-field { display: flex; align-items: center; gap: 7px; font-size: .8125rem; font-weight: 500; color: #66758a; }
+.filter-field select { padding: 6px 10px; border: 1px solid #dce0e6; border-radius: 10px; background: #fff; color: var(--ink); font-size: .8125rem; font-weight: 400; }
+@media (max-width: 520px) { .filter-field select { max-width: 40vw; } }
 /* The role chip is painted in once someone has signed in. */
 .demo-label:empty { display: none; }
 
@@ -250,18 +298,24 @@ body.mail-mode .reader-compose .composer-editor { flex: 1; min-height: 240px; ma
 
 /* ── A project's team, client people and files (0039) ─────────────────── */
 .plain-list { list-style: none; margin: 10px 0 0; padding: 0; }
-.team-person, .client-person, .file-row { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: .875rem; }
-.team-person:last-child, .client-person:last-child, .file-row:last-child { border-bottom: 0; }
+.team-person, .client-person, .file-row, .archived-project-row { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: .875rem; }
+.team-person:last-child, .client-person:last-child, .file-row:last-child, .archived-project-row:last-child { border-bottom: 0; }
 .team-name { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; }
 .team-name small { color: #7a828e; font-size: .75rem; }
-.client-person-name, .file-name { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-.client-person-name small, .file-name small, .file-name strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.client-person-name small, .file-name small { color: #7a828e; font-size: .75rem; }
+.client-person-name, .file-name, .archived-project-name { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.client-person-name small, .file-name small, .file-name strong, .archived-project-name small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.client-person-name small, .file-name small, .archived-project-name small { color: #7a828e; font-size: .75rem; }
 .client-person select, .inline-add select { min-width: 0; border: 1px solid #e0e7f0; border-radius: 10px; background: #f8fafc; padding: 7px 9px; font-size: .8125rem; }
 .client-person select { max-width: 9.5rem; }
 .inline-add { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .inline-add select { flex: 1 1 8rem; }
-.file-pick { cursor: pointer; margin: 6px 0 0; }
+.file-pick { cursor: pointer; margin: 0; }
+/* The status line beside "Add files" (project-panels.js) replaced a run of
+   toast() calls that outran each other on a quick multi-file upload — see
+   its own comment there. Reserving its line height keeps the row from
+   jumping as the text comes and goes. */
+.file-pick-row { display: flex; align-items: center; gap: 12px; margin: 6px 0 0; flex-wrap: wrap; }
+.file-upload-status { min-height: 1.2em; }
 @media (max-width: 520px) { .form-row, .form-row.form-row-two { grid-template-columns: 1fr; gap: 0; } }
 
 /* ── Compose, after review ─────────────────────────────────────────────── */
@@ -307,9 +361,13 @@ body.mail-mode .reader-compose .composer-editor { flex: 1; min-height: 240px; ma
   border-radius: 8px; background: #0071e3; color: #fff; font-size: .6875rem; line-height: 16px; text-align: center;
 }
 .notification-list { display: grid; gap: 6px; margin-top: 14px; }
-.notification-item { display: grid; gap: 2px; padding: 10px 12px; border-radius: 12px; color: inherit; background: #f5f7fb; }
+/* Each item and its Dismiss button side by side, so dismissing one is never
+   the same tap target as opening it. */
+.notification-row { display: flex; align-items: center; gap: 4px; }
+.notification-item { flex: 1; min-width: 0; display: grid; gap: 2px; padding: 10px 12px; border-radius: 12px; color: inherit; background: #f5f7fb; }
 .notification-item:hover { background: #eaf3ff; }
 .notification-item span { font-size: .8125rem; color: #6e6e73; }
+.notification-row .text-btn { flex-shrink: 0; padding: 4px 10px; }
 #search-results button:focus-visible { outline-offset: -3px; background: #eaf3ff; }
 .search-more { padding: 8px 12px 4px; font-size: .75rem; color: #86868b; }
 /* The phone menu cannot be tabbed into while it is off screen, and has a
@@ -349,6 +407,31 @@ body.mail-mode .reader-compose .composer-editor { flex: 1; min-height: 240px; ma
 .conversation-entry .delivery{display:inline-block;margin-top:4px;font-size:.75rem;color:#2f6f46}
 .conversation-entry .delivery.failed{color:#b3261e}
 .ticket-link{color:inherit;text-decoration:none}.ticket-link:hover strong,.ticket-link:focus-visible strong{text-decoration:underline}
+/* A queue row whose last reply never sent (audit #3): the same red the
+   conversation's own failed deliveries use, so the colour already means one
+   thing on this page. */
+.delivery-flag{display:block;margin-top:2px;font-size:.75rem;color:#b3261e}
+/* Newest/oldest (audit #3): plain text buttons beside the search box, the
+   picked one told apart the way the composer's own toggle buttons already
+   are — aria-pressed carries the state, not a class nobody else uses. */
+.ticket-sort{display:flex;gap:4px;margin-right:auto;margin-left:14px}
+.ticket-sort .text-btn{padding:4px 9px;border-radius:8px}
+.ticket-sort .text-btn[aria-pressed="true"]{background:#e3ebf6;color:#0b4fa0;font-weight:600}
+/* Restoring a deleted ticket by its number (audit #4): the only way to reach
+   one, since a deleted ticket is not listed anywhere here to click into. */
+.restore-ticket-form{display:flex;gap:6px;padding:12px 11px 0;border-top:1px solid var(--line);margin-top:12px}
+.restore-ticket-form input{flex:1;min-width:0;font-size:.8125rem;padding:7px 9px;border:1px solid var(--line);border-radius:8px;background:#fff}
+/* On a phone the queue used to be a column of titles with the rest of the
+   table scrolled to sideways: .module-table's own min-width (680px, set
+   unconditionally further up this file) never gave way to a narrow screen.
+   Below it, the table fits without scrolling at all, at the cost of two
+   columns a tap into the ticket already answers — Product/client (whose
+   client name is already in the title cell's own subtext) and Owner. */
+@media (max-width: 520px) {
+  .queue-layout .module-table { min-width: 0; }
+  .queue-layout .module-table th:nth-child(2), .queue-layout .module-table td:nth-child(2),
+  .queue-layout .module-table th:nth-child(5), .queue-layout .module-table td:nth-child(5) { display: none; }
+}
 .mailbox-connection small.mailbox-note{color:#b45309;margin-top:2px;overflow-wrap:anywhere}
 .record-link{color:inherit;text-decoration:none}.record-link:hover strong,.record-link:focus-visible strong{text-decoration:underline}
 
@@ -465,6 +548,57 @@ a.agenda-item:focus-visible{outline:2px solid #0071e3;outline-offset:2px;border-
 @media (max-width: 760px) {
   .agenda-kinds .calendar-key,.agenda-kinds-all{min-height:36px}
 }
+
+/* Month view (0057, "No way to change weeks, and no month view"): a whole
+   month at a glance, spill from either side included as the mini month
+   already draws it. Each day's events are compact chips, the same kind
+   colours and clash marking .calendar-event uses — .month-event carries its
+   own copy of them rather than the .calendar-event class itself, which is
+   sized for a week or day column, not a cell this small. */
+.month-view{padding:0}
+.month-weekdays{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));text-align:center;font-size:.75rem;color:#66758a;padding:10px 0;border-bottom:1px solid var(--line)}
+.month-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr))}
+.month-cell{min-width:0;min-height:104px;display:flex;flex-direction:column;gap:3px;padding:6px;border-right:1px solid var(--line);border-bottom:1px solid var(--line)}
+.month-grid>.month-cell:nth-child(7n){border-right:0}
+.month-cell.outside{background:#fafbfd}
+.month-cell.outside .month-day-number{color:#9aa4b2}
+.month-cell.today{background:#f3f8ff}
+.month-cell.selected{box-shadow:inset 0 0 0 2px #0071e333}
+.month-day-number{align-self:flex-start;border:0;background:transparent;font:inherit;font-size:.8125rem;color:#4f5a6a;padding:2px 7px;border-radius:999px;cursor:pointer}
+.month-cell.today .month-day-number{background:#0071e3;color:#fff;font-weight:600}
+.month-day-number:focus-visible{outline:2px solid #0071e3;outline-offset:2px}
+.month-events{display:flex;flex-direction:column;gap:2px;min-width:0}
+.month-event{display:block;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;border-left:3px solid #0071e3;background:#eef5ff;color:#527da9;border-radius:5px;padding:2px 6px;font-size:.75rem;line-height:1.5;text-decoration:none}
+.month-event small{font-weight:500;margin-right:3px}
+.month-event:hover,.month-event:focus-visible{text-decoration:underline}
+.month-event:focus-visible{outline:2px solid #0071e3;outline-offset:1px}
+.month-event.type-client{border-color:#a187d6;background:#f5f0ff;color:#8a73ab}
+.month-event.type-internal{border-color:#3caa9b;background:#eaf6f4;color:#4f8b81}
+.month-event.type-personal{border-color:#d79a2b;background:#fff6e6;color:#8f6418}
+.month-event.type-focus{border-color:#9aa4b2;background:#f2f4f7;color:#5f6b7a}
+.month-event.clash{box-shadow:inset 0 0 0 1px #b9443855}
+.month-more{display:block;width:100%;text-align:left;border:0;background:transparent;font:inherit;font-size:.75rem;color:#66758a;padding:2px 6px;cursor:pointer}
+.month-more:hover,.month-more:focus-visible{text-decoration:underline}
+.month-cell .hidden-note{margin-top:0}
+@media (max-width: 760px) {
+  .month-cell{min-height:76px;padding:4px}
+  .month-event{font-size:.6875rem}
+}
+
+/* Connected calendars (0057, "No way to connect a calendar or see its last
+   sync"): a short panel under the mini month — mail's own reconnect card
+   (workspace.css lines 66-70) is the model, since this is the same idea for
+   the other provider. */
+.calendar-connections{padding:16px 14px}
+.calendar-connection{padding:10px 0;border-top:1px solid var(--line)}
+.calendar-connection:first-of-type{border-top:0}
+.calendar-connection>p{margin:0;font-size:.875rem;font-weight:500;overflow-wrap:anywhere}
+.calendar-connection small{display:block;color:#66758a;font-size:.75rem;margin-top:2px}
+.calendar-connection small.mailbox-warning{color:#b45309}
+.calendar-connection-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
+.calendar-connection-actions .btn{padding:5px 11px;font-size:.75rem}
+.calendar-connection-actions .btn:disabled{opacity:.55;cursor:progress}
+.agenda-calendar-connect{margin-top:12px;width:100%}
 
 /* The CRM (crm-ui.js): a company card's name is a heading under its stage's,
    drawn as the card's h2 used to be; and a long list says it shows the first rows. */
