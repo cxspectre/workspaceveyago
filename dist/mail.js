@@ -41,6 +41,16 @@
      from routeParts that might disagree with it by the time a key is
      pressed. Set once, at the top of every render (mailView). */
   let currentThreadList = Object.freeze([]);
+  /* An inline image's own bytes, once fetched: keyed by message id + Content-ID,
+     never by attachment id alone — two different messages can each carry an
+     image with the same cid, and this must not show one's logo on the other's.
+     Resolved and pending are kept apart so a slow fetch is not asked for twice
+     while it is still in flight; failed is separate again, so one Graph will
+     not serve any more (a message that has since moved or been deleted) is not
+     retried on every idle repaint until the page is reloaded. */
+  let inlineImages = Object.freeze({});
+  let inlineImagesPending = Object.freeze({});
+  let inlineImagesFailed = Object.freeze({});
 
   const live = () => Boolean(window.workspaceStore && workspaceStore.state.loaded);
   const employeeId = () => (window.workspaceSession && workspaceSession.employee && workspaceSession.employee.id) || null;
@@ -300,6 +310,114 @@
     return renderedBodies[key];
   }
 
+  const inlineImageKey = (messageId, contentId) => messageId + '|' + contentId;
+
+  /* mailBody() (app.js) already asks mail-html.js to leave a pending inline
+     image as <img data-mail-cid="…"> with no src (mail-html.js's own second
+     pass, run once per message and cached by bodyHtml above) — this fills one
+     in once it has actually been fetched, on the cached string rather than by
+     re-rendering: mailBody's own signature takes only the message, and it is
+     not this batch's file to hand it a second argument through. A cid this
+     message's own attachments never named is left exactly as "not yet found"
+     would be — nothing here can tell that apart from "still coming". */
+  function withResolvedInlineImages(html, messageId) {
+    return html.replace(/data-mail-cid="([^"]*)"/g, (whole, cid) => {
+      const url = inlineImages[inlineImageKey(messageId, cid)];
+      return url ? `src="${esc(url)}" ${whole}` : whole;
+    });
+  }
+
+  /* Graph's bytes for an inline image do not change once fetched, so each one
+     is asked for once — never again while it is in flight, and never again at
+     all once it has failed, until the page reloads (workspace:loaded, below,
+     is what that resets — the same lifetime readFailed already has). Nothing
+     here shows an error for a failed inline image: the img is simply left
+     pending, the way a still-loading one is, rather than adding a second kind
+     of broken-image state next to "images blocked" that only this one
+     function would ever produce. */
+  function resolveInlineImages(message) {
+    if (!live()) return;
+    (message.attachments || []).forEach(a => {
+      if (!a.isInline || !a.contentId) return;
+      const key = inlineImageKey(message.id, a.contentId);
+      if (inlineImages[key] || inlineImagesPending[key] || inlineImagesFailed[key]) return;
+      inlineImagesPending = Object.freeze({ ...inlineImagesPending, [key]: true });
+      workspaceActions.mailAttachmentContent(a.id)
+        .then(blob => {
+          const typed = typeof blob.slice === 'function' ? blob.slice(0, blob.size, a.contentType) : blob;
+          inlineImages = Object.freeze({ ...inlineImages, [key]: URL.createObjectURL(typed) });
+        })
+        .catch(err => {
+          console.error('[mail] could not load an inline image:', err);
+          inlineImagesFailed = Object.freeze({ ...inlineImagesFailed, [key]: true });
+        })
+        .then(() => {
+          const { [key]: _done, ...rest } = inlineImagesPending;
+          inlineImagesPending = Object.freeze(rest);
+          repaintWhenIdle();
+        });
+    });
+  }
+
+  /* A size a person reads, the same wording ticketsModel.fileSize already
+     gives a ticket's own attachments (window.-qualified: mail.js runs before
+     tickets-model.js does not matter for a classic script sharing one global
+     scope, but a test sandbox loading mail.js on its own, with nothing else
+     on the page, must not throw for want of it). */
+  function attachmentSize(bytes) {
+    return (window.ticketsModel && typeof ticketsModel.fileSize === 'function')
+      ? ticketsModel.fileSize(bytes) : `${Math.max(0, Number(bytes) || 0)} B`;
+  }
+
+  function attachmentRow(threadId, message, a) {
+    return `<li><button type="button" class="text-btn" data-mail-attachment="${esc(a.id)}" data-message-id="${esc(message.id)}" data-thread-id="${esc(threadId)}" aria-label="Download ${esc(a.name)}">`
+      + `${esc(a.name)} <small>(${esc(attachmentSize(a.size))})</small></button></li>`;
+  }
+
+  function attachmentsPanel(threadId, message) {
+    if (!message.attachments || !message.attachments.length) return '';
+    return `<ul class="plain-list mail-attachments" aria-label="Attachments">`
+      + message.attachments.map(a => attachmentRow(threadId, message, a)).join('') + '</ul>';
+  }
+
+  function findMessageAttachment(threadId, messageId, attachmentId) {
+    const messages = live() ? workspaceStore.threadBody(threadId) : null;
+    const message = messages && messages.find(m => m.id === messageId);
+    const attachment = message && (message.attachments || []).find(a => a.id === attachmentId);
+    return attachment || null;
+  }
+
+  /* The same shape tickets-ui.js's own downloadFile already uses for a
+     ticket's attachments: a real <a download>, made, clicked and thrown away,
+     rather than window.open (a pop-up blocker's to catch) or navigating the
+     tab away from Mail. Not optimistic and not re-rendered: the button is
+     disabled directly, the way toggleStar and reconnect already do it for the
+     same reason (a render mid-flight would lose the very button that has the
+     click). */
+  function downloadAttachment(button) {
+    const threadId = button.dataset.threadId;
+    const messageId = button.dataset.messageId;
+    const attachmentId = button.dataset.mailAttachment;
+    const attachment = findMessageAttachment(threadId, messageId, attachmentId);
+    if (!attachment) { toast('That attachment is not loaded any more. Reload the page.'); return; }
+    button.disabled = true;
+    workspaceActions.mailAttachmentContent(attachmentId)
+      .then(blob => {
+        const typed = typeof blob.slice === 'function' ? blob.slice(0, blob.size, attachment.contentType) : blob;
+        const url = URL.createObjectURL(typed);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = attachment.name;
+        link.rel = 'noopener';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 30000);
+      })
+      .catch(err => toast(err.message || 'Could not open that attachment.'))
+      .then(() => { button.disabled = false; });
+  }
+
   function messageCard(message, open, newest, threadId) {
     const when = (message.date === 'Today' ? '' : esc(message.date) + ' · ') + esc(message.time);
     const avatar = `<div class="avatar${message.outbound ? ' owner' : ''}">${esc(message.initial)}</div>`;
@@ -315,8 +433,14 @@
     }
     const to = M.recipientLine(message.to);
     const cc = M.recipientLine(message.cc);
-    const head = `${avatar}<span class="mail-message-meta"><span class="mail-message-line"><strong>${esc(message.sender)}</strong><small>${when}</small></span>`
-      + `<small class="mail-recipients">${esc(message.email)}${to ? ` to ${esc(to)}` : ''}${cc ? ` · cc ${esc(cc)}` : ''}</small></span>`;
+    /* Bcc is only ever present on our own sent copies (mail-model's own MailRow
+       shape) — a recipient cannot see another's Bcc, so an inbound message
+       simply never carries one here; nothing extra needs to gate this on
+       message.outbound. */
+    const bcc = M.recipientLine(message.bcc);
+    const head = `${avatar}<span class="mail-message-meta"><span class="mail-message-line"><strong>${esc(message.sender)}</strong>`
+      + `${message.importance === 'high' ? ' ' + pill('High priority', 'red') : ''}<small>${when}</small></span>`
+      + `<small class="mail-recipients">${esc(message.email)}${to ? ` to ${esc(to)}` : ''}${cc ? ` · cc ${esc(cc)}` : ''}${bcc ? ` · bcc ${esc(bcc)}` : ''}</small></span>`;
     /* The newest message is always open; an older one can be folded again. */
     const header = newest
       ? `<div class="mail-message-head">${head}</div>`
@@ -325,7 +449,8 @@
        out-of-office or a bounce. */
     const answers = [['reply', 'Reply'], ['replyAll', 'Reply all'], ['forward', 'Forward']].map(([mode, label]) =>
       `<button type="button" class="text-btn" data-mail-answer="${mode}" data-thread-id="${esc(threadId)}" data-message-id="${esc(message.id)}">${label}</button>`).join('');
-    return `<article class="mail-message">${header}<div class="mail-body">${bodyHtml(message)}</div>`
+    return `<article class="mail-message">${header}<div class="mail-body">${withResolvedInlineImages(bodyHtml(message), message.id)}</div>`
+      + attachmentsPanel(threadId, message)
       + `<div class="mail-message-actions">${answers}</div></article>`;
   }
 
@@ -341,7 +466,15 @@
     if (!messages) return '<p class="quiet-text mail-loading">Loading the conversation…</p>';
     if (!messages.length) return '<p class="quiet-text">This conversation has no messages yet.</p>';
     const newest = messages.length - 1;
-    return messages.map((m, i) => messageCard(m, i === newest || Boolean(expanded[m.id]), i === newest, thread.id)).join('');
+    return messages.map((m, i) => {
+      const open = i === newest || Boolean(expanded[m.id]);
+      /* A side effect inside the view, the same way mailView() itself already
+         calls markRead(shown) — only an open message's images are worth
+         fetching, and a folded one still shows its cid markers plainly if
+         it is ever opened before this runs again. */
+      if (open) resolveInlineImages(m);
+      return messageCard(m, open, i === newest, thread.id);
+    }).join('');
   }
 
   function related(thread) {
@@ -562,6 +695,7 @@
   document.body.addEventListener('workspace:loaded', () => {
     readFailed = Object.freeze({});
     restoreDraftIfAny();
+    inlineImagesFailed = Object.freeze({});
   });
 
   /* Mark all as read: every unread thread in what is actually on screen right
@@ -961,6 +1095,8 @@
       answer(answerButton.dataset.mailAnswer, answerButton.dataset.threadId, answerButton.dataset.messageId);
       return;
     }
+    const attachmentButton = e.target.closest('[data-mail-attachment]');
+    if (attachmentButton) { e.preventDefault(); downloadAttachment(attachmentButton); return; }
     const retry = e.target.closest('[data-mail-retry]');
     if (retry) { e.preventDefault(); workspaceStore.retryThread(retry.dataset.mailRetry); render(); return; }
     const retryRead = e.target.closest('[data-mail-retry-read]');

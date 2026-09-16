@@ -167,6 +167,37 @@ test('a conversation the function cannot find is an error, not a quiet write to 
     'writing the thread row directly would be undone by the next sync, and never reach Outlook');
 });
 
+/* ── Mail attachments ─────────────────────────────────────────────────── */
+
+test('an attachment\'s bytes come back from mail-attachment-content, as the blob supabase-js hands over', async () => {
+  const blob = new Blob(['%PDF-fake'], { type: 'application/octet-stream' });
+  const ws = workspace(async () => ({ data: blob, error: null }));
+  const result = await ws.actions.mailAttachmentContent('att-1');
+  assert.deepEqual(ws.invoked, [{ name: 'mail-attachment-content', body: { attachmentId: 'att-1' } }]);
+  assert.equal(result, blob, 'the blob itself, not a copy — mail.js is the one that re-types and wraps it');
+});
+
+test('an attachment that no longer exists, or is not this person\'s to read, is an error naming why', async () => {
+  const ws = workspace(async () => httpError(404, { error: 'No such attachment, or it is not yours to read' }));
+  await assert.rejects(ws.actions.mailAttachmentContent('att-1'), { message: 'No such attachment, or it is not yours to read' });
+});
+
+test('a mailbox needing reconnecting to open its attachments says so', async () => {
+  const ws = workspace(async () => httpError(409, { error: 'Reconnect this mailbox to open its attachments.' }));
+  await assert.rejects(ws.actions.mailAttachmentContent('att-1'), { message: 'Reconnect this mailbox to open its attachments.' });
+});
+
+test('a response that is not a blob at all (a gateway page, say) is refused rather than handed to an <img>', async () => {
+  const ws = workspace(async () => ({ data: 'not a blob', error: null }));
+  await assert.rejects(ws.actions.mailAttachmentContent('att-1'), { message: 'Could not open that attachment.' });
+});
+
+test('no id is nothing to ask for', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }));
+  await assert.rejects(ws.actions.mailAttachmentContent(''), { message: /not loaded any more/ });
+  assert.equal(ws.invoked.length, 0);
+});
+
 /* ── Events ───────────────────────────────────────────────────────────── */
 
 test('removing an event asks which rows went, and none is a refusal, said as one', async () => {

@@ -24,6 +24,7 @@ function sandbox(file, globals = {}) {
 const model = vm.runInContext('mailModel', sandbox('mail-model.js'));
 const htmlContext = sandbox('data/mail-html.js', { window: {} });
 const styleAllowed = vm.runInContext('window.mailHtml.styleAllowed', htmlContext);
+const cidFromSrc = vm.runInContext('window.mailHtml.cidFromSrc', htmlContext);
 
 const ME = '6b1f7a52-0000-4000-8000-000000000001';
 const COLLEAGUE = '6b1f7a52-0000-4000-8000-000000000002';
@@ -274,6 +275,33 @@ test('properties that can run code, or that the list does not know, are refused'
   assert.equal(styleAllowed('mask-image', 'none', blocked), false);
   assert.equal(styleAllowed('', 'red', blocked), false);
   assert.equal(styleAllowed('color', '', blocked), false);
+});
+
+/* ── Inline images (cid:) ────────────────────────────────────────────── */
+
+test('a cid: src names the Content-ID it refers to, with no angle brackets', () => {
+  assert.equal(cidFromSrc('cid:image001.png@01D8E645.CA255A20'), 'image001.png@01D8E645.CA255A20');
+  assert.equal(cidFromSrc('CID:LOGO'), 'LOGO', 'the scheme is case-insensitive, same as mailto:');
+});
+
+test('a %-escaped cid decodes the same way a mailto: address\'s query string does', () => {
+  assert.equal(cidFromSrc('cid:logo%40veyago.cloud'), 'logo@veyago.cloud');
+  /* A bad escape is read as the literal text rather than thrown away: an
+     unusual cid is still worth trying to match against an attachment list. */
+  assert.equal(cidFromSrc('cid:not%a-real-escape'), 'not%a-real-escape');
+});
+
+test('anything that is not cid: at all is not one, whatever it looks like', () => {
+  assert.equal(cidFromSrc('https://example.com/cid:not-a-scheme'), null);
+  assert.equal(cidFromSrc('data:image/png;base64,AAAA'), null);
+  assert.equal(cidFromSrc(''), null);
+  assert.equal(cidFromSrc(null), null);
+  assert.equal(cidFromSrc(undefined), null);
+});
+
+test('a cid: with nothing after it names nothing', () => {
+  assert.equal(cidFromSrc('cid:'), null);
+  assert.equal(cidFromSrc('cid: '), null);
 });
 
 /* ── Compose ─────────────────────────────────────────────────────────── */
@@ -696,6 +724,7 @@ function loadMail(options = {}) {
     reconnectMailboxResult = async () => 'https://login.microsoftonline.com/x',
     connectMailboxResult = async () => 'https://login.microsoftonline.com/x',
     disconnectMailboxResult = async () => ({}),
+    mailAttachmentContentResult = async () => new Blob(['x'], { type: 'application/octet-stream' }),
     manager = false, me = ME, meEmail = null,
     tickets = [], contacts = [], team = [],
     /* null: no store.searchMail/moreMail at all — an older store the way the
@@ -712,6 +741,7 @@ function loadMail(options = {}) {
   const navigated = [];
   const openedWith = [];
   const composerClosed = [];
+  const mailAttachmentRequests = [];
   const listeners = {};
   const on = (type, fn) => { (listeners[type] = listeners[type] || []).push(fn); };
   const timers = [];
@@ -774,10 +804,25 @@ function loadMail(options = {}) {
     }
   };
 
+  /* Every <a> created for a download (mail.js's downloadAttachment, the same
+     shape tickets-ui.js's own downloadFile already uses with no test of its
+     own — the actual click is a real browser's to make of a real anchor).
+     Tracked here so a test can see one was made and "clicked", without mail.js
+     needing to know it is running in a sandbox rather than a real DOM. */
+  const downloadLinks = [];
   const documentStub = {
     get activeElement() { return mActiveElement; },
     addEventListener: on,
-    body: { classList: { toggle() {} }, addEventListener: on, dispatchEvent: e => { (listeners[e.type] || []).forEach(fn => fn(e)); return true; } },
+    body: {
+      classList: { toggle() {} }, addEventListener: on,
+      dispatchEvent: e => { (listeners[e.type] || []).forEach(fn => fn(e)); return true; },
+      appendChild() {}, removeChild() {}
+    },
+    createElement(tag) {
+      const link = { tagName: String(tag || '').toLowerCase(), clicks: 0, click() { this.clicks++; }, remove() {} };
+      if (link.tagName === 'a') downloadLinks.push(link);
+      return link;
+    },
     querySelector(selector) {
       if (selector === '#main') return mainContainer;
       if (selector === '.conversation-list') return conversationListEl;
@@ -853,6 +898,7 @@ function loadMail(options = {}) {
   const context = vm.createContext({
     console,
     URLSearchParams,
+    URL,
     esc: escape,
     icon: name => `<svg data-icon="${name}"></svg>`,
     pill: (label, tone) => `<span class="pill ${tone}">${escape(label)}</span>`,
@@ -896,7 +942,8 @@ function loadMail(options = {}) {
       starThread: (id, starred) => starThreadResult(id, starred),
       reconnectMailbox: address => reconnectMailboxResult(address),
       connectMailbox: (address, whose) => connectMailboxResult(address, whose),
-      disconnectMailbox: id => disconnectMailboxResult(id)
+      disconnectMailbox: id => disconnectMailboxResult(id),
+      mailAttachmentContent: id => { mailAttachmentRequests.push(id); return mailAttachmentContentResult(id); }
     },
     mailComposer: {
       open(init) { openedWith.push(init); return options.refuseComposerOpen ? false : true; },
@@ -977,7 +1024,7 @@ function loadMail(options = {}) {
       const raw = storageMap.get('veyago.mail.draft');
       return raw ? JSON.parse(raw) : null;
     },
-    toasts, navigated, openedWith, composerClosed,
+    toasts, navigated, openedWith, composerClosed, mailAttachmentRequests, downloadLinks,
     compose: (...args) => vm.runInContext(`compose(${args.map(a => JSON.stringify(a)).join(',')})`, context)
   };
 }
@@ -1092,6 +1139,138 @@ test('the reading pane draws a thread\'s sender, subject and preview', () => {
   const html = page.view();
   assert.match(html, /Anna Berg/);
   assert.match(html, /Launch plan/);
+});
+
+/* ── Attachments, importance and Bcc (finding: "nothing shows or fetches
+   them; inline images vanish, importance and Bcc are never shown") ────── */
+
+const openMessage = over => ({
+  id: 'm1', sender: 'Anna Berg', email: 'anna@client.com', subject: 'Launch plan',
+  body: 'See attached', bodyHtml: '', to: ['hello@veyago.cloud'], cc: [], bcc: [],
+  date: 'Today', time: '09:00', outbound: false, importance: 'normal', attachments: [], ...over
+});
+
+test('an open message lists its own attachments, named and sized, each with a way to open it', () => {
+  const page = loadMail({
+    threads: [mthread({ id: T1 })], route: ['mail', 'all', 'inbox', T1],
+    bodies: id => id === T1 ? [openMessage({
+      attachments: [
+        { id: 'att-1', name: 'Quote.pdf', size: 204800, contentType: 'application/pdf', isInline: false, contentId: null },
+        { id: 'att-2', name: 'logo.png', size: 512, contentType: 'image/png', isInline: true, contentId: 'logo1' }
+      ]
+    })] : null
+  });
+  const html = page.view();
+  assert.match(html, /data-mail-attachment="att-1"/);
+  assert.match(html, /Quote\.pdf/);
+  assert.match(html, /data-mail-attachment="att-2"/);
+  assert.match(html, /logo\.png/);
+});
+
+test('a message with nothing attached draws no attachments list at all', () => {
+  const page = loadMail({
+    threads: [mthread({ id: T1 })], route: ['mail', 'all', 'inbox', T1],
+    bodies: id => id === T1 ? [openMessage({ attachments: [] })] : null
+  });
+  assert.doesNotMatch(page.view(), /data-mail-attachment/);
+});
+
+test('a high-priority message says so; a normal one is not flagged at all', () => {
+  const high = loadMail({
+    threads: [mthread({ id: T1 })], route: ['mail', 'all', 'inbox', T1],
+    bodies: id => id === T1 ? [openMessage({ importance: 'high' })] : null
+  }).view();
+  assert.match(high, /High priority/);
+  const normal = loadMail({
+    threads: [mthread({ id: T1 })], route: ['mail', 'all', 'inbox', T1],
+    bodies: id => id === T1 ? [openMessage({ importance: 'normal' })] : null
+  }).view();
+  assert.doesNotMatch(normal, /High priority/);
+});
+
+test('a message with Bcc names them; one with none says nothing about Bcc at all', () => {
+  const withBcc = loadMail({
+    threads: [mthread({ id: T1 })], route: ['mail', 'all', 'inbox', T1],
+    bodies: id => id === T1 ? [openMessage({ outbound: true, bcc: ['ops@northline.example'] })] : null
+  }).view();
+  assert.match(withBcc, /ops@northline\.example/);
+  const noBcc = loadMail({
+    threads: [mthread({ id: T1 })], route: ['mail', 'all', 'inbox', T1],
+    bodies: id => id === T1 ? [openMessage({ bcc: [] })] : null
+  }).view();
+  assert.doesNotMatch(noBcc, /bcc/i);
+});
+
+test('clicking an attachment fetches its bytes and hands the browser a real download', async () => {
+  const page = loadMail({
+    threads: [mthread({ id: T1 })], route: ['mail', 'all', 'inbox', T1],
+    bodies: id => id === T1 ? [openMessage({
+      attachments: [{ id: 'att-1', name: 'Quote.pdf', size: 1024, contentType: 'application/pdf', isInline: false, contentId: null }]
+    })] : null,
+    mailAttachmentContentResult: async () => new Blob(['%PDF'], { type: 'application/octet-stream' })
+  });
+  page.view();
+  const button = mtarget({ data: { 'data-mail-attachment': 'att-1', 'data-message-id': 'm1', 'data-thread-id': T1 } });
+  page.click(button);
+  assert.equal(button.disabled, true, 'disabled the instant it is clicked, before the fetch answers');
+  await new Promise(setImmediate);
+  assert.deepEqual(page.mailAttachmentRequests, ['att-1']);
+  assert.equal(page.downloadLinks.length, 1, 'a real <a download> is made, the same shape tickets-ui.js\'s own downloadFile uses');
+  assert.equal(page.downloadLinks[0].clicks, 1);
+  assert.equal(page.downloadLinks[0].download, 'Quote.pdf');
+  assert.equal(button.disabled, false, 're-enabled once the download is handed off');
+});
+
+test('an attachment that fails to fetch says so, in the function\'s own words', async () => {
+  const page = loadMail({
+    threads: [mthread({ id: T1 })], route: ['mail', 'all', 'inbox', T1],
+    bodies: id => id === T1 ? [openMessage({
+      attachments: [{ id: 'att-1', name: 'Quote.pdf', size: 1024, contentType: 'application/pdf', isInline: false, contentId: null }]
+    })] : null,
+    mailAttachmentContentResult: async () => { throw new Error('Reconnect this mailbox to open its attachments.'); }
+  });
+  page.view();
+  page.click(mtarget({ data: { 'data-mail-attachment': 'att-1', 'data-message-id': 'm1', 'data-thread-id': T1 } }));
+  await new Promise(setImmediate);
+  assert.deepEqual(page.toasts, ['Reconnect this mailbox to open its attachments.']);
+  assert.equal(page.downloadLinks.length, 0);
+});
+
+test('an inline image is asked for once — not again on a later render, and not for one already given up on', async () => {
+  let deliveries = 0;
+  const page = loadMail({
+    threads: [mthread({ id: T1 })], route: ['mail', 'all', 'inbox', T1],
+    bodies: id => id === T1 ? [openMessage({
+      attachments: [
+        { id: 'att-2', name: 'logo.png', size: 512, contentType: 'image/png', isInline: true, contentId: 'logo1' },
+        { id: 'att-3', name: 'sig.gif', size: 200, contentType: 'image/gif', isInline: true, contentId: 'sig1' }
+      ]
+    })] : null,
+    mailAttachmentContentResult: async id => {
+      deliveries++;
+      if (id === 'att-3') throw new Error('gone');
+      return new Blob(['x'], { type: 'application/octet-stream' });
+    }
+  });
+  page.view();                                  // first render: asks for both
+  await new Promise(setImmediate);
+  assert.deepEqual([...page.mailAttachmentRequests].sort(), ['att-2', 'att-3']);
+  assert.equal(deliveries, 2);
+  page.view();                                   // a second render must not ask again
+  await new Promise(setImmediate);
+  assert.equal(page.mailAttachmentRequests.length, 2, 'neither the resolved one nor the failed one is asked for twice');
+  assert.equal(deliveries, 2);
+});
+
+test('an inline image with no attachment behind it (a non-image cid the model already dropped) asks for nothing', () => {
+  const page = loadMail({
+    threads: [mthread({ id: T1 })], route: ['mail', 'all', 'inbox', T1],
+    bodies: id => id === T1 ? [openMessage({ attachments: [
+      { id: 'att-1', name: 'Quote.pdf', size: 1024, contentType: 'application/pdf', isInline: false, contentId: null }
+    ] })] : null
+  });
+  page.view();
+  assert.deepEqual(page.mailAttachmentRequests, [], 'a non-inline attachment is never auto-fetched, only asked for on its own click');
 });
 
 /* ── A failed mailbox list (finding: "A failed mailbox list says…") ────── */
