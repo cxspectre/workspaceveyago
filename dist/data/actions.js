@@ -945,6 +945,40 @@
       return url;
     },
 
+    /* Starts connecting a brand NEW mailbox — never a reconnect, which
+       reconnectMailbox above already does — the same call as connectCalendar
+       below makes for the other provider (0057's own pattern, mirrored here
+       rather than a second one invented for mail): `employeeId` says whose it
+       is, null for the studio's, left out entirely for anyone connecting
+       their own; microsoft-connect itself decides who may say so (an owner
+       or admin for the studio's, anyone their own). */
+    async connectMailbox(address, employeeId) {
+      must(address && String(address).trim(), 'Say which mailbox to connect.');
+      var body = { provider: 'microsoft_mail', accountLabel: String(address).trim() };
+      if (employeeId !== undefined) body.employeeId = employeeId;
+      var res = await sb().functions.invoke('microsoft-connect', { body: body });
+      if (res.error) throw new Error(await functionError(res, 'Connecting could not start.'));
+      var url = String(res.data && res.data.consentUrl || '');
+      must(/^https:\/\/login\.microsoftonline\.com\//.test(url), 'Microsoft did not send a sign-in page back.');
+      return url;
+    },
+
+    /* Disconnecting, unlike reconnecting or connecting, needs no Edge
+       Function: it does not touch Microsoft at all, only this row's own
+       `status` — the one column (with last_error) 0038 already grants the
+       browser, and its own trigger (integration_connections_browser_can_
+       only_disconnect) refuses anything else written from here. 0055 widened
+       who may make this exact write to match reconnecting: a plain member of
+       staff their own personal mailbox, an owner or admin the studio's — so
+       RLS itself decides who, and a refused write comes back as zero rows,
+       said as one rather than a silent success. */
+    async disconnectMailbox(connectionId) {
+      must(connectionId, 'Which mailbox to disconnect was not given.');
+      return touched(await sb().from('integration_connections').update({ status: 'disconnected' }).eq('id', connectionId).select('id'),
+        'disconnect that mailbox',
+        'That mailbox could not be disconnected: it may already be, or this is not yours to change.')[0];
+    },
+
     /* Starts connecting — or reconnecting — a calendar: the same call as
        reconnectMailbox, for the other provider (0057, "No way to connect a
        calendar or see its last sync"). `employeeId` is left out for a plain

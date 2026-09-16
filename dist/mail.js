@@ -35,6 +35,12 @@
   let markingRead = Object.freeze({});
   let readFailed = Object.freeze({});
   let renderedBodies = Object.freeze({});
+  /* Whatever the list on screen is showing right now — the loaded folder, or
+     a search's own results — for next/previous navigation and Mark all as
+     read: both act on exactly what a person sees, not a value recomputed
+     from routeParts that might disagree with it by the time a key is
+     pressed. Set once, at the top of every render (mailView). */
+  let currentThreadList = Object.freeze([]);
 
   const live = () => Boolean(window.workspaceStore && workspaceStore.state.loaded);
   const employeeId = () => (window.workspaceSession && workspaceSession.employee && workspaceSession.employee.id) || null;
@@ -90,31 +96,46 @@
     /* Every Reconnect button said only "Reconnect": fine with one on screen,
        indistinguishable read out one after another when Connections lists
        several. The visible word stays short; the name a screen reader gets
-       says which mailbox. */
-    const button = canReconnect(box)
+       says which mailbox. The same rule (studio needs a manager, a personal
+       one needs to be your own — mailboxesFor() already guarantees any
+       "personal" box reaching this is this person's own) is what 0055
+       widened disconnecting to as well, so one `eligible` check gates both
+       buttons. */
+    const eligible = canReconnect(box);
+    const reconnectButton = eligible
       ? `<button type="button" id="mail-reconnect-${esc(box.id)}" class="btn mailbox-reconnect" data-mail-reconnect="${esc(box.id)}" aria-label="Reconnect ${esc(box.address)}">Reconnect</button>`
       : '';
+    const disconnectButton = eligible
+      ? `<button type="button" id="mail-disconnect-${esc(box.id)}" class="btn mailbox-disconnect" data-mail-disconnect="${esc(box.id)}" aria-label="Disconnect ${esc(box.address)}">Disconnect</button>`
+      : '';
+    const actions = eligible ? `<div class="mailbox-connection-actions">${reconnectButton}${disconnectButton}</div>` : '';
     /* Why a mailbox is in trouble — or what a working one went on without —
        rather than "Not syncing" alone. */
     const note = M.mailboxNote(box);
     return `<div class="mailbox-connection"><p>${esc(box.address)}</p>`
       + `<small class="${box.live ? '' : 'mailbox-warning'}">${esc(syncedLabel(box))}</small>`
       + (note ? `<small class="mailbox-note" title="${esc(box.lastError)}">${esc(note)}</small>` : '')
-      + `${button}</div>`;
+      + `${actions}</div>`;
   }
 
   function mailboxColumn(route, boxes) {
     const truncated = (live() && workspaceStore.state.mailTruncated) || [];
+    /* The true count (mail_unread_counts(), 0062), once the database has
+       answered: every unreadCountInfo() call below prefers it outright over
+       the floor-based guess, so every badge here — All mailboxes, each own
+       mailbox, and the Inbox folder link further down — stops undercounting
+       the moment it lands, with nothing else here needing to change. */
+    const trueCounts = live() ? workspaceStore.state.mailUnreadCounts : null;
     const all = mailboxLink(route, M.ALL,
       `<span class="mailbox-mark all">${icon('mail')}</span>`
       + `<span class="mailbox-name"><strong>All mailboxes</strong><small>${boxes.length} connected</small></span>`
-      + unreadBadge(M.unreadCountInfo(mails, M.ALL, truncated), 'mail-count'), 'All mailboxes');
+      + unreadBadge(M.unreadCountInfo(mails, M.ALL, truncated, trueCounts), 'mail-count'), 'All mailboxes');
 
     const each = boxes.map(b => mailboxLink(route, b.id,
       `<span class="mailbox-mark ${b.kind}">${esc(b.address.charAt(0).toUpperCase())}</span>`
       + `<span class="mailbox-name"><strong>${esc(b.address)}</strong>`
       + `<small class="${b.live ? '' : 'mailbox-warning'}">${esc(b.live ? b.kindLabel : syncedLabel(b))}</small></span>`
-      + unreadBadge(M.unreadCountInfo(mails, b.id, truncated), 'mail-count'), b.address)).join('');
+      + unreadBadge(M.unreadCountInfo(mails, b.id, truncated, trueCounts), 'mail-count'), b.address)).join('');
 
     /* Below 1050px the column becomes a row, and a select fits where a list
        of addresses does not. */
@@ -124,7 +145,7 @@
       + '</select></label>';
 
     const folders = M.FOLDERS.map(folder => {
-      const info = folder === 'inbox' ? M.unreadCountInfo(mails, route.mailbox, truncated) : { count: 0, atLeast: false };
+      const info = folder === 'inbox' ? M.unreadCountInfo(mails, route.mailbox, truncated, trueCounts) : { count: 0, atLeast: false };
       const mark = folder === 'starred' ? '<span class="folder-star" aria-hidden="true">★</span>' : icon(folder === 'sent' ? 'arrow' : 'mail');
       return `<a href="#${M.mailRoute({ mailbox: route.mailbox, folder })}" class="folder-link ${route.folder === folder ? 'selected' : ''}">`
         + `${mark}<span>${FOLDER_LABELS[folder]}</span>${unreadBadge(info)}</a>`;
@@ -149,12 +170,22 @@
       : boxes.some(canReconnect)
         ? `<span class="eyebrow">CONNECTIONS</span>${boxes.filter(canReconnect).map(connectionRow).join('')}` : '';
 
+    /* Connecting a brand NEW mailbox — not reconnecting one already there —
+       is an owner or admin's to do, the same rule microsoft-connect already
+       enforces for a calendar (agenda-ui.js's own "Connect a calendar"
+       mirrors this identically): whoever it is for, the button itself is
+       manager-only, since a plain member of staff who wants their own first
+       mailbox connected still needs one to say whose it is. */
+    const canConnect = Boolean(window.workspaceSession && workspaceSession.isManager && workspaceSession.isManager());
+    const connectButton = canConnect
+      ? `<button type="button" id="mail-connect-button" class="btn mailbox-connect" data-mail-connect="">Connect a mailbox</button>` : '';
+
     const newMessage = `<button class="btn btn-primary mail-new" data-action="compose">${icon('plus')}`
       + `${mailComposer.isOpen() ? 'Continue draft' : 'New message'}</button>`;
     return `<aside class="mail-folders">${newMessage}<div class="mailbox-switcher"><span class="eyebrow">MAILBOXES</span>${all}${each}</div>`
       /* A div, not <nav>: the sidebar's `nav a` rules would stack every folder
          into an icon-over-label tile. */
-      + `${select}<div class="mail-folder-list" role="navigation" aria-label="Folders">${folders}</div><div class="mail-folder-foot">${foot}</div></aside>`;
+      + `${select}<div class="mail-folder-list" role="navigation" aria-label="Folders">${folders}</div><div class="mail-folder-foot">${foot}${connectButton}</div></aside>`;
   }
 
   /* ── The conversation list ─────────────────────────────────────────── */
@@ -178,7 +209,14 @@
       ? '<div class="mail-list-truncated">Showing the most recent conversations only.</div>' : '';
   }
 
-  function threadList(route, list, boxes, shownId) {
+  /* Every unread thread in `list` — whatever a person watching the screen
+     right now would call "all": this folder, this mailbox — never wider. */
+  function markAllReadButton(list) {
+    return list.some(t => t.unread)
+      ? '<button type="button" id="mail-mark-all-read" class="text-btn mail-mark-all-read" data-mail-mark-all-read="">Mark all as read</button>' : '';
+  }
+
+  function threadList(route, list, boxes, shownId, more) {
     const addressOf = id => (boxes.find(b => b.id === id) || {}).address || '';
     const tagMailbox = route.mailbox === M.ALL && boxes.length > 1;
     const items = list.map(t => {
@@ -194,10 +232,59 @@
         + `<p>${esc(t.preview)}</p>${tagMailbox ? `<span class="thread-mailbox">${esc(addressOf(t.mailboxId))}</span>` : ''}</a>`;
     }).join('');
     const where = route.mailbox === M.ALL ? 'All mailboxes' : addressOf(route.mailbox);
+    /* "Load more" (0062's own audit item, "No way to load older mail"): a
+       page further back than mailThreads()'s own 200-per-folder window,
+       appended by store.js's loadMoreMail — never shown while searching,
+       where every match already comes back in one answer. Hidden once a
+       page comes back short of the cap (nothing further back to ask for),
+       and its own label doubles as the retry once a page fails. */
+    const loadMoreButton = more && more.more !== false
+      ? `<button type="button" id="mail-load-more" class="btn text-btn mail-load-more" data-mail-load-more=""${more.state === 'loading' ? ' disabled aria-busy="true"' : ''}>`
+        + `${more.state === 'failed' ? 'Older mail did not load — try again' : more.state === 'loading' ? 'Loading…' : 'Load older mail'}</button>`
+      : '';
     return `<div class="conversation-list"><div class="mail-list-heading"><h2>${FOLDER_LABELS[route.folder]}</h2>`
-      + `<small class="mail-list-where">${esc(where)}</small>${queryInput('mail', 'Search mail')}</div>${loadNote()}`
-      + (items || empty('No conversations', queries.mail.trim() ? 'Nothing matches that search.' : 'This folder is empty.'))
-      + `<div class="mail-list-count">${list.length} conversation${list.length === 1 ? '' : 's'}</div>${truncatedNote(route)}</div>`;
+      + `<small class="mail-list-where">${esc(where)}</small>${queryInput('mail', 'Search mail')}${markAllReadButton(list)}</div>${loadNote()}`
+      + (items || empty('No conversations', 'This folder is empty.'))
+      + `<div class="mail-list-count">${list.length} conversation${list.length === 1 ? '' : 's'}</div>${truncatedNote(route)}${loadMoreButton}</div>`;
+  }
+
+  /* Search spans every message this person could read (search_mail, 0055),
+     not the 200-per-folder window mailThreads() keeps — so it draws its own
+     list rather than narrowing the loaded one further, which could not have
+     found an older match anyway. A hit for a thread already loaded shows
+     exactly as the ordinary list would (sender, read and starred state); one
+     reached only through search does not guess at those — search_mail's own
+     row does not carry them — and says so by leaving the row plain rather
+     than confidently marking it read or starred when it might not be. */
+  function searchPanel(route, search, boxes, shownId) {
+    const addressOf = id => (boxes.find(b => b.id === id) || {}).address || '';
+    const heading = `<div class="mail-list-heading"><h2>Search results</h2>${queryInput('mail', 'Search mail')}</div>`;
+    if (search.state === 'loading') {
+      return `<div class="conversation-list">${heading}<p class="quiet-text mail-loading" role="status" aria-busy="true">Searching…</p></div>`;
+    }
+    if (search.state === 'failed') {
+      return `<div class="conversation-list">${heading}<div class="mail-load-failed"><p>The search did not run.</p>`
+        + `<button type="button" id="mail-search-retry" class="btn" data-mail-search-retry="">Try again</button></div></div>`;
+    }
+    const hits = search.results;
+    const items = hits.map(hit => {
+      const known = threadById(hit.threadId);
+      /* A hit already loaded opens under its own folder — Starred if it was
+         starred there, exactly as the ordinary list's own links do
+         (folderForThread) — one known only through search opens under
+         wherever the person already is: there is no better guess. */
+      const openFolder = known ? M.folderForThread(known, route.folder) : route.folder;
+      const selected = hit.threadId === shownId;
+      const states = known ? [known.unread && 'Unread', known.starred && 'Starred'].filter(Boolean) : [];
+      const stateText = states.length ? `<span class="sr-only">${states.join('. ')}. </span>` : '';
+      return `<a id="mail-thread-${esc(hit.threadId)}" href="#${M.mailRoute({ mailbox: route.mailbox, folder: openFolder, threadId: hit.threadId })}" class="thread-item${selected ? ' selected' : ''}${known && known.unread ? ' unread' : ''}"${selected ? ' aria-current="true"' : ''}>`
+        + `<div class="mail-item-header"><strong>${stateText}${known && known.unread ? '<span class="unread-dot" aria-hidden="true"></span>' : ''}${esc(known ? known.sender : 'Unknown sender')}</strong><small>${esc(hit.time)}</small></div>`
+        + `<h3>${known && known.starred ? '<span class="thread-star" aria-hidden="true">★</span> ' : ''}${esc(hit.subject)}</h3>`
+        + `<p>${esc(hit.preview)}</p><span class="thread-mailbox">${esc(addressOf(hit.mailboxId))}</span></a>`;
+    }).join('');
+    return `<div class="conversation-list">${heading}`
+      + (items || empty('No matches', 'Nothing in your mail matches that search.'))
+      + `<div class="mail-list-count">${hits.length} result${hits.length === 1 ? '' : 's'}</div></div>`;
   }
 
   /* ── The reading pane ──────────────────────────────────────────────── */
@@ -305,10 +392,17 @@
     const box = boxes.find(b => b.id === thread.mailboxId);
     const hasTicket = Boolean(thread.ticketId && tickets.some(t => t.uuid === thread.ticketId));
     const starLabel = thread.starred ? 'Unstar conversation' : 'Star conversation';
+    /* A thread search found but the loaded list never did (M.threadFromSearchHit)
+       does not actually know its own read or starred state — search_mail's own
+       row carries neither — so toggling either here would flip a guess, not a
+       fact. Both controls are withheld rather than shown against a state that
+       might be wrong; the conversation itself, and answering it, need only the
+       id, so they work exactly as they do for a thread the list did load. */
+    const toggles = thread.fromSearch ? '' : `<button id="mail-unread-${esc(thread.id)}" class="icon-btn" data-mail-unread="${esc(thread.id)}" title="Mark as unread" aria-label="Mark as unread">${icon('mail')}</button>`
+      + `<button id="mail-star-${esc(thread.id)}" class="icon-btn${thread.starred ? ' starred' : ''}" data-mail-star="${esc(thread.id)}" aria-pressed="${thread.starred ? 'true' : 'false'}" title="${starLabel}" aria-label="${starLabel}">${thread.starred ? '★' : '☆'}</button>`;
     return `<div class="reader" data-thread-id="${esc(thread.id)}"><div class="reader-toolbar">`
       + `<span>${box ? pill(box.address, box.kind === 'personal' ? 'purple' : 'blue') : ''}</span><div class="reader-tools">${expandButton(expanded)}`
-      + `<button id="mail-unread-${esc(thread.id)}" class="icon-btn" data-mail-unread="${esc(thread.id)}" title="Mark as unread" aria-label="Mark as unread">${icon('mail')}</button>`
-      + `<button id="mail-star-${esc(thread.id)}" class="icon-btn${thread.starred ? ' starred' : ''}" data-mail-star="${esc(thread.id)}" aria-pressed="${thread.starred ? 'true' : 'false'}" title="${starLabel}" aria-label="${starLabel}">${thread.starred ? '★' : '☆'}</button>`
+      + `${toggles}`
       + `</div></div><div class="reader-content">${readFailedNote(thread)}<h2>${esc(thread.subject)}</h2>`
       + (thread.count > 1 ? `<small class="mail-thread-count">${thread.count} messages</small>` : '')
       /* An answer being written sits above the conversation, where it is seen. */
@@ -330,19 +424,47 @@
        to all of them rather than to an empty screen. */
     const mailbox = route.mailbox === M.ALL || boxes.some(b => b.id === route.mailbox) ? route.mailbox : M.ALL;
     const current = Object.freeze({ ...route, mailbox });
-    const list = M.visibleThreads(mails, { mailbox, folder: route.folder, query: queries.mail });
-    /* Open even when a search hides it: the link is what was asked for. */
-    const shown = route.threadId ? threadById(route.threadId) : null;
+    const q = queries.mail.trim();
+    /* A word typed searches every message this person could read (search_
+       mail, 0055), replacing the plain folder list rather than narrowing it
+       further — mailThreads() only ever loads the 200 most recent per
+       folder, so filtering just that window could not find an older match
+       anyway (the audit's own "Search is shallow"). "Load more" (below) is
+       the loaded window's own way further back, and does not apply here: a
+       search already answers from the whole mailbox in one go. */
+    const search = q && live() && typeof workspaceStore.searchMail === 'function' ? workspaceStore.searchMail(q) : null;
+    const more = !search && live() && typeof workspaceStore.moreMail === 'function' ? workspaceStore.moreMail(mailbox, current.folder) : null;
+    const list = search ? [] : M.visibleThreads(M.mergeOlder(mails, (more && more.threads) || []), { mailbox, folder: current.folder });
+    currentThreadList = search ? search.results : list;
 
-    selectedMail = shown ? mails.indexOf(shown) : 0;       // app.js's contact action still reads it
+    /* Open even when a search hides it: the link is what was asked for. A
+       thread search alone found (not in `mails`) is still opened — built
+       from just what the hit itself answered (M.threadFromSearchHit) — so a
+       result reaching further back than the loaded window is not a dead
+       click; only while that search is still on screen, exactly as an
+       ordinary link to a thread outside the loaded window already was not
+       openable once its own page moved on from it either. */
+    const shownFromList = route.threadId ? threadById(route.threadId) : null;
+    const shownFromSearch = !shownFromList && search && route.threadId
+      ? (search.results.find(hit => hit.threadId === route.threadId) || null) : null;
+    const shown = shownFromList || (shownFromSearch ? M.threadFromSearchHit(shownFromSearch) : null);
+    const listLength = search ? search.results.length : list.length;
+
+    /* A synthetic search-only thread is never in `mails`: falls back to the
+       newest rather than -1, so old positional code reading mails[selectedMail]
+       (app.js's own dead demo branches) finds a real row, not undefined. */
+    selectedMail = shown ? Math.max(mails.indexOf(shown), 0) : 0;       // app.js's contact action still reads it
     if (shown && shown.unread) markRead(shown);
 
     /* Full screen, so no page heading: the one thing it carried, writing a new
        message, is at the top of the folders. The full width is only kept while
        there is something to read or write in it. */
     const expanded = readerExpanded && Boolean(shown || draftWithoutThread());
+    const panel = search
+      ? searchPanel(current, search, boxes, shown ? shown.id : route.threadId)
+      : threadList(current, list, boxes, shown && shown.id, more);
     return `<section class="panel mail-workspace${expanded ? ' reader-expanded' : ''}">${mailboxColumn(current, boxes)}`
-      + `${threadList(current, list, boxes, shown && shown.id)}${reader(shown, boxes, list.length, expanded)}</section>`;
+      + `${panel}${reader(shown, boxes, listLength, expanded)}</section>`;
   };
 
   /* render() rebuilds #main with innerHTML, which throws away where the list
@@ -437,7 +559,22 @@
       });
   }
 
-  document.body.addEventListener('workspace:loaded', () => { readFailed = Object.freeze({}); });
+  document.body.addEventListener('workspace:loaded', () => {
+    readFailed = Object.freeze({});
+    restoreDraftIfAny();
+  });
+
+  /* Mark all as read: every unread thread in what is actually on screen right
+     now — this folder, this mailbox, the same list Mark all as read's own
+     button is drawn beside — not a sweep of the whole mailbox. Each goes
+     through markRead() one at a time: the same single write update-mail-
+     state already makes, and Outlook needs, for one thread — so a failure on
+     any one of them is said and can be retried exactly the way it already is
+     for a single thread, with no new bulk endpoint required. */
+  function markAllRead(list) {
+    if (!live()) return;
+    (list || []).filter(t => t.unread && !markingRead[t.id] && !readFailed[t.id]).forEach(markRead);
+  }
 
   /* A disabled button loses focus to <body> at once, in every browser — well
      before the write it disabled itself for has even answered — so by the
@@ -513,6 +650,52 @@
       onSent: afterSend,
       onClose: () => { if (page === 'mail') render(); }
     };
+  }
+
+  /* A draft carried across a sign-out and back in again for the same person
+     (audit: "Signing out forgets an unsent draft") — localStorage, since
+     signing out reloads the page (data/gate.js's leave()), which wipes every
+     other record of a draft, mail-compose.js's own kept-across-a-redraw one
+     (that file's own top comment) included. One shared key, not one per
+     person: the entry names whose draft it is, and is consumed — read once,
+     then removed, whichever way it turns out — the moment anyone next signs
+     in, so a browser shared with someone else never sits holding a
+     stranger's half-written words waiting for them to come back. */
+  const DRAFT_STORAGE_KEY = 'veyago.mail.draft';
+
+  function saveDraftForSignOut() {
+    if (!mailComposer.hasContent() || typeof mailComposer.snapshot !== 'function') return;
+    const snap = mailComposer.snapshot();
+    const employeeId = window.workspaceSession && workspaceSession.employee && workspaceSession.employee.id;
+    if (!snap || !employeeId) return;
+    try {
+      if (window.localStorage) window.localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify({ employeeId, draft: snap }));
+    } catch (fullOrBlocked) {
+      /* A browser that keeps nothing simply loses the draft, as it always has. */
+    }
+  }
+
+  function restoreDraftIfAny() {
+    if (mailComposer.isOpen()) return;
+    let stored = null;
+    try {
+      const raw = window.localStorage ? window.localStorage.getItem(DRAFT_STORAGE_KEY) : null;
+      stored = raw ? JSON.parse(raw) : null;
+      if (window.localStorage) window.localStorage.removeItem(DRAFT_STORAGE_KEY);
+    } catch (unreadable) {
+      return;
+    }
+    if (!stored || !stored.draft) return;
+    const employeeId = window.workspaceSession && workspaceSession.employee && workspaceSession.employee.id;
+    if (!employeeId || stored.employeeId !== employeeId) return;   // a different person signed in
+    const boxes = mailboxes();
+    if (!boxes.length) {
+      toast('A draft from before you last signed in could not be restored: no mailbox is connected.');
+      return;
+    }
+    const from = boxes.find(b => b.id === stored.draft.connectionId) || boxes[0];
+    const opened = mailComposer.open({ ...stored.draft, connectionId: from.id }, composerContext());
+    if (opened) toast('Picked up an unfinished message from before you signed out.');
   }
 
   /* Takes the person to the draft: the conversation it answers, or the reading
@@ -604,8 +787,10 @@
 
   window.addEventListener('beforeunload', e => {
     /* The session ended and the gate is reloading the page: the draft cannot be
-       sent from here any more, and the prompt would only hold a locked page open. */
-    if (window.workspaceGate && window.workspaceGate.leaving) return;
+       sent from here any more, and the prompt would only hold a locked page
+       open. Its words are not simply lost, though — saved first, for the
+       next time this same person signs in (restoreDraftIfAny, above). */
+    if (window.workspaceGate && window.workspaceGate.leaving) { saveDraftForSignOut(); return; }
     if (!mailComposer.hasContent()) return;
     e.preventDefault();
     e.returnValue = '';
@@ -637,6 +822,71 @@
         toast(err.message || 'Reconnecting could not start.');
       })
       .then(() => { button.disabled = false; });
+  }
+
+  /* Connecting a brand new mailbox — never a reconnect — asks who it is for
+     first: microsoft-connect's own rule (mirrored, not re-decided, here —
+     the function says the same thing again if this gets it wrong) is an
+     owner or admin for the studio's, and anyone their own; agenda-ui.js's
+     own "Connect a calendar" reads the identical rule for the other
+     provider, and this dialog is that one's shape carried over. A tab is
+     reserved on the click itself, the same way reconnect() above already
+     does, so the browser does not treat Microsoft's page as an unrequested
+     pop-up once the round trip to start it answers a moment later. */
+  function openConnectMailbox() {
+    const offered = (typeof team !== 'undefined' && Array.isArray(team) ? team : []).filter(m => m && m.id);
+    showModal('MAIL · CONNECT', '<h2>Connect a mailbox</h2>'
+      + dialogForms.form('mail-connect-form',
+        dialogForms.field('Address', '<input name="address" type="email" required autofocus placeholder="name@veyago.cloud">')
+        + dialogForms.field('Whose', '<select name="whose"><option value="">Studio (shared with everyone)</option>'
+          + dialogForms.options(offered.map(m => ({ value: m.id, label: m.name })), null) + '</select>'),
+        'Continue to Microsoft'));
+    const form = document.getElementById('mail-connect-form');
+    form.addEventListener('submit', submitted => {
+      submitted.preventDefault();
+      const button = form.querySelector('[type="submit"]');
+      if (button.disabled) return;
+      dialogForms.quiet(form);
+      const data = new FormData(form);
+      const address = String(data.get('address') || '').trim();
+      if (!address) { dialogForms.say(form, 'Say which address to connect.', 'address'); return; }
+      const whose = String(data.get('whose') || '');
+      button.disabled = true;
+      const tab = window.open('', '_blank');
+      if (tab) tab.document.title = 'Connecting to Microsoft…';
+      workspaceActions.connectMailbox(address, whose || null)
+        .then(url => {
+          reconnecting = true;
+          if (!tab) { window.location.assign(url); }
+          else { tab.opener = null; tab.location.href = url; }
+          dialogForms.closeDialog(form);
+          toast(`Finish in the Microsoft tab. ${address} updates when you come back.`);
+        })
+        .catch(err => {
+          if (tab) tab.close();
+          button.disabled = false;
+          dialogForms.say(form, err.message || 'Connecting could not start.');
+        });
+    });
+  }
+
+  /* Disconnecting takes effect at once — nothing to finish in another tab, no
+     round trip to come back from — so it goes through dialog-forms.js's own
+     sending() the way every other immediate write in this project does,
+     behind a confirm: it stops that mailbox syncing until it is connected
+     again, for everyone who reads it if it is the studio's shared one. */
+  function openDisconnect(box) {
+    showModal('MAIL · DISCONNECT', `<h2>Disconnect ${esc(box.address)}?</h2>`
+      + `<p class="form-note">Mail stops syncing here until it is connected again${box.kind === 'personal' ? '' : ', for everyone who reads this shared mailbox'}.</p>`
+      + dialogForms.form('mail-disconnect-form', '', 'Disconnect'));
+    const form = document.getElementById('mail-disconnect-form');
+    form.addEventListener('submit', submitted => {
+      submitted.preventDefault();
+      dialogForms.quiet(form);
+      dialogForms.sending(form, () => workspaceActions.disconnectMailbox(box.id), () => {
+        toast(`${box.address} disconnected.`);
+      }, { record: `mailbox:${box.id}`, part: ['mail'], only: ['mail'] });
+    });
   }
 
   function backFromMicrosoft() {
@@ -671,6 +921,30 @@
     if (mailto) { e.preventDefault(); mailtoClicked(mailto); return; }
     const reconnectButton = e.target.closest('[data-mail-reconnect]');
     if (reconnectButton) { e.preventDefault(); reconnect(reconnectButton); return; }
+    const disconnectButton = e.target.closest('[data-mail-disconnect]');
+    if (disconnectButton) {
+      e.preventDefault();
+      const box = mailboxes().find(b => b.id === disconnectButton.dataset.mailDisconnect);
+      if (box) openDisconnect(box);
+      return;
+    }
+    if (e.target.closest('[data-mail-connect]')) { e.preventDefault(); openConnectMailbox(); return; }
+    const loadMore = e.target.closest('[data-mail-load-more]');
+    if (loadMore) {
+      e.preventDefault();
+      if (loadMore.disabled || !live() || typeof workspaceStore.loadMoreMail !== 'function') return;
+      const here = M.parseMailRoute(routeParts);
+      workspaceStore.loadMoreMail(here.mailbox, here.folder);
+      render();
+      return;
+    }
+    if (e.target.closest('[data-mail-search-retry]')) {
+      e.preventDefault();
+      if (typeof workspaceStore.retrySearchMail === 'function') workspaceStore.retrySearchMail(queries.mail);
+      render();
+      return;
+    }
+    if (e.target.closest('[data-mail-mark-all-read]')) { e.preventDefault(); markAllRead(currentThreadList); return; }
     const star = e.target.closest('[data-mail-star]');
     if (star) { e.preventDefault(); toggleStar(star); return; }
     const unread = e.target.closest('[data-mail-unread]');
@@ -718,6 +992,29 @@
     if (e.target.closest && e.target.closest('.composer')) return;
     readerExpanded = false;
     render();
+  });
+
+  /* j/k and the arrow keys move to the next or previous conversation in
+     whatever is actually on screen right now (currentThreadList, set at the
+     top of every mailView() render) — the loaded list, or a search's own
+     results, in the order shown. Not while typing anywhere (the search box
+     itself included), not with a dialog open, and not while a draft is open:
+     a stray letter must not carry someone away from an answer they are
+     writing. Opening the next conversation this way marks it read exactly as
+     clicking it already does — the same route change, through navigate(). */
+  document.addEventListener('keydown', e => {
+    if (page !== 'mail' || (e.key !== 'j' && e.key !== 'k' && e.key !== 'ArrowDown' && e.key !== 'ArrowUp')) return;
+    if (e.target.closest && e.target.closest('input, textarea, select, [contenteditable]')) return;
+    if (document.querySelector('#modal').open || mailComposer.isOpen()) return;
+    if (!currentThreadList.length) return;
+    const idOf = item => (item.threadId !== undefined ? item.threadId : item.id);
+    const here = M.parseMailRoute(routeParts);
+    const index = here.threadId ? currentThreadList.findIndex(item => idOf(item) === here.threadId) : -1;
+    const delta = (e.key === 'j' || e.key === 'ArrowDown') ? 1 : -1;
+    const nextIndex = index === -1 ? 0 : Math.min(Math.max(index + delta, 0), currentThreadList.length - 1);
+    if (nextIndex === index) return;
+    e.preventDefault();
+    navigate(M.mailRoute({ mailbox: here.mailbox, folder: here.folder, threadId: idOf(currentThreadList[nextIndex]) }));
   });
 
   document.addEventListener('change', e => {

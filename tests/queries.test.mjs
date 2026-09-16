@@ -131,6 +131,19 @@ test('Starred reaches conversations filed away in Outlook, and Inbox and Sent st
   ]);
 });
 
+test('mailThreads asks for a page older than a given cursor, when "Load more" wants one', async () => {
+  const { data, queries } = loadTables();
+  await data.mailThreads(['inbox'], ['box-1'], '2026-09-01T00:00:00Z');
+  const filters = queries[0].calls.filter(([method]) => ['eq', 'lt'].includes(method)).map(call => call.join(' '));
+  assert.deepEqual(filters, ['eq folder inbox', 'eq connection_id box-1', 'lt last_message_at 2026-09-01T00:00:00Z']);
+});
+
+test('mailThreads asks for nothing older when no cursor is given, exactly as before', async () => {
+  const { data, queries } = loadTables();
+  await data.mailThreads(['inbox'], ['box-1']);
+  assert.ok(!queries[0].calls.some(([method]) => method === 'lt'), 'the ordinary load never bounds by date');
+});
+
 test('mailThreads asks for the other party, and no longer for whoever sent most recently', async () => {
   const { data, queries } = loadTables();
   await data.mailThreads(['inbox'], ['box-1']);
@@ -207,6 +220,28 @@ test('no importance reads as normal, and no attachments is an empty list, not mi
   assert.equal(m.importance, 'normal');
   assert.deepEqual([...m.bcc], []);
   assert.deepEqual([...m.attachments], []);
+});
+
+test('mailUnreadCounts asks the database, and shapes it as a plain map by mailbox', async () => {
+  const q = load(() => ({
+    data: [{ connection_id: 'box-1', unread_count: 3 }, { connection_id: 'box-2', unread_count: 0 }],
+    error: null
+  }));
+  const counts = await q.data.mailUnreadCounts();
+  assert.deepEqual({ ...counts }, { 'box-1': 3, 'box-2': 0 });
+  assert.equal(q.calls[0].name, 'mail_unread_counts');
+});
+
+test('mailUnreadCounts copes with a bigint answered as a string', async () => {
+  const q = load(() => ({ data: [{ connection_id: 'box-1', unread_count: '7' }], error: null }));
+  const counts = await q.data.mailUnreadCounts();
+  assert.equal(counts['box-1'], 7);
+});
+
+test('a failed unread count is a failure, said in words', async () => {
+  const q = load(() => ({ data: null, error: { message: 'permission denied for function mail_unread_counts' } }));
+  await assert.rejects(q.data.mailUnreadCounts(),
+    { message: 'Could not load the unread mail count: permission denied for function mail_unread_counts' });
 });
 
 test('searchMail reaches the database for a whole mailbox\'s words, and skips a blank query entirely', async () => {

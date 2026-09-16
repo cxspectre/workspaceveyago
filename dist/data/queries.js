@@ -776,7 +776,10 @@
        across whatever RLS lets this person see.
        Returns { threads, truncated } — truncated names the "mailbox|folder"
        lists that hit the limit, so the view can say it is not everything. */
-    async mailThreads(folders, mailboxIds) {
+    /* `before` (an ISO timestamp): a page older than that cursor, for "Load
+       more" (store.js loadMoreMail) — the ordinary load leaves it out
+       entirely, asking for the newest PER_FOLDER exactly as it always has. */
+    async mailThreads(folders, mailboxIds, before) {
       var PER_FOLDER = 200;   // a working inbox, not an archive
       var wanted = [].concat(folders || 'inbox').map(function (f) { return String(f).toLowerCase(); });
       var boxes = mailboxIds && mailboxIds.length ? mailboxIds : [null];
@@ -798,6 +801,7 @@
           ? q.eq('is_starred', true).not('folder', 'in', '(inbox,sent)')
           : q.eq('folder', folder);
         if (box) q = q.eq('connection_id', box);
+        if (before) q = q.lt('last_message_at', before);
         return q
           .order('last_message_at', { ascending: false, nullsFirst: false })
           .limit(PER_FOLDER)
@@ -898,6 +902,23 @@
         ? query.or('employee_id.is.null,employee_id.eq.' + me.id)
         : query.is('employee_id', null);
       return unwrap(await query.order('account_label'), 'mailboxes');
+    },
+
+    /* The true unread count for every mailbox this session may read
+       (mail_unread_counts(), 0062) — a real count(), not the 200-per-folder
+       window mailThreads() loads. security invoker on the database side, so
+       it answers under mail_threads' own RLS, the same rule mailThreads()
+       itself reads under; a colleague's personal mailbox is never in it.
+       Shaped as a plain {connectionId: count} map, which is what
+       mailModel.unreadCountInfo()/trueUnreadTotal() already expect — and
+       Number()'d, since a bigint count can come back from PostgREST as a
+       string rather than a number. */
+    async mailUnreadCounts() {
+      var res = await sb().rpc('mail_unread_counts');
+      if (res.error) throw new Error('Could not load the unread mail count: ' + res.error.message);
+      var out = {};
+      (res.data || []).forEach(function (r) { out[r.connection_id] = Number(r.unread_count) || 0; });
+      return out;
     },
 
     /* Every message this person could already open, not only the folders and
