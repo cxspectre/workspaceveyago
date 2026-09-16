@@ -341,6 +341,17 @@
     return `<tr><td colspan="2">${esc(label)}</td><td>${esc(F.money(amount, s.currency))}</td></tr>`;
   }
 
+  /* A client number (0053), given once a company first reaches the client
+     stage: queries.js embeds it straight off finance_invoices.company_id
+     (0051) onto the raw row, the same way it already carries tax and the
+     line items finance-model.js's own shapeInvoice() does not know about —
+     that peer file is not touched here either. An invoice with no company
+     linked, or one linked to a company not yet a client, has none to quote. */
+  function clientNumberOf(s) {
+    const company = (s.row || {}).company;
+    return company && company.client_number != null ? company.client_number : null;
+  }
+
   /* One invoice, shaped (finance-model.js): its own currency and cents, its
      status today, and the date that matters — when it falls due, or when it was
      paid. Its client's contact is the one with the invoice's address; a company
@@ -351,6 +362,7 @@
     const billedTo = contact ? `<p>${esc(contact.name)}<br>${esc(contact.email)}</p>` : s.clientEmail ? `<p>${esc(s.clientEmail)}</p>` : '';
     const lines = invoiceLineRows(s);
     const tax = taxRow(s);
+    const clientNumber = clientNumberOf(s);
     return detailHeader('finance/invoices', 'All invoices', s.number, s.client,
       statusAction(s) + `<button class="btn" data-print-invoice>${icon('external')}Print invoice</button>`)
       + '<div class="record-layout invoice-layout"><section class="panel invoice-document">'
@@ -371,7 +383,12 @@
          of it here could drift from that one and tell a client the wrong
          thing to pay into. This page says only where the real one is. */
       + '<div class="invoice-note"><h3>Thank you for building with Veyago.</h3><p>Printed from the workspace, for reference only. The document the client actually received — with where to pay — is the PDF sent from the admin.</p></div></section>'
-      + `<aside class="record-aside">${properties([['Status', pill(s.status)], ['Total', esc(s.amount)], ['Balance due', esc(s.balance)], ['Currency', esc(s.currency)], ['Issued', esc(s.issued || '—')], ['Last changed', esc(F.shortDate((s.row || {}).updated_at, financeDay()) || '—')]])}`
+      + `<aside class="record-aside">${properties([
+          ['Status', pill(s.status)],
+          ...(clientNumber != null ? [['Client No.', esc(String(clientNumber))]] : []),
+          ['Total', esc(s.amount)], ['Balance due', esc(s.balance)], ['Currency', esc(s.currency)],
+          ['Issued', esc(s.issued || '—')], ['Last changed', esc(F.shortDate((s.row || {}).updated_at, financeDay()) || '—')]
+        ])}`
       + linkedPanel('Client relationship', contact ? [[`crm/${contact.id}`, contact.name, s.client, 'crm']] : [])
       + `<p class="aside-note">Invoices are created and sent from ${adminLink('invoices/', 'the admin', 'record-link')}.</p></aside></div>`;
   }

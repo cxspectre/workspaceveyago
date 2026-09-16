@@ -330,6 +330,15 @@ test('an invoice page finds its client by the invoice address, never by a compan
   assert.doesNotMatch(nobody, /#crm\//);
 });
 
+test('an invoice page quotes its company\'s client number, when finance_invoices.company_id (0051) leads to one', () => {
+  const numbered = load({ list: [invoice({ company_id: 'co-1', company: { client_number: 42 } })], route: ['finance', U1] })();
+  assert.match(numbered, /<span>Client No\.<\/span><div>42<\/div>/);
+  const unlinked = load({ list: [invoice({ company_id: null, company: null })], route: ['finance', U1] })();
+  assert.doesNotMatch(unlinked, /Client No\./);
+  const notYetAClient = load({ list: [invoice({ company_id: 'co-2', company: { client_number: null } })], route: ['finance', U1] })();
+  assert.doesNotMatch(notYetAClient, /Client No\./, 'a linked company that has not reached the client stage has no number to quote');
+});
+
 test('a paid invoice\'s page says when it was paid, and that nothing is left to pay', () => {
   const page = load({ list: [invoice({ status: 'paid', paid_on: '2026-09-12' })], route: ['finance', U1] })();
   assert.match(page, /PAID ON/);

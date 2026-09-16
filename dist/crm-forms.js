@@ -371,6 +371,46 @@ const crmForms = (function () {
     form.addEventListener('submit', e => { e.preventDefault(); submitMerge(form, kind, keep); });
   }
 
+  /* ── Removing a company or a contact (deleted_at, actions.deleteCompany/
+     deleteContact) ─────────────────────────────────────────────────────
+     A confirm step first, the same pattern established projects-wide for
+     anything this permanent (project-panels.js's confirmLeaveTeam and
+     confirmRemovePerson): a plain dialog naming what stays behind, since a
+     removed record is off every list from the next load on, and there is no
+     "… anyway" here to press by mistake. Owners and admins only, which
+     crm-ui.js already checks before drawing the button; guard_soft_delete
+     (0012) checks again regardless of what the button offered. */
+  const REMOVE = Object.freeze({
+    company: {
+      noun: 'company', shape: r => C.shapeCompany(r), route: 'crm/companies', only: ['contacts', 'companies', 'tickets'],
+      warning: 'It leaves the pipeline, the companies list and its own page. Its people and its work — projects, tickets, mail and invoices — stay exactly where they are, filed under no company.',
+      action: id => workspaceActions.deleteCompany(id)
+    },
+    contact: {
+      noun: 'contact', shape: r => C.shapeContact(r, loadedCompanies()), route: 'crm/contacts', only: ['contacts'],
+      warning: 'It leaves every list and their own page. The projects, tickets and mail already linked to them stay exactly where they are.',
+      action: id => workspaceActions.deleteContact(id)
+    }
+  });
+
+  function submitDelete(form, kind, record) {
+    const cfg = REMOVE[kind];
+    sending(form, () => cfg.action(record.id), () => {
+      toast(`${record.name || 'It'} is removed from the CRM.`);
+      navigate(cfg.route);
+    }, { only: cfg.only });
+  }
+
+  function openDelete(record, kind) {
+    const cfg = REMOVE[kind];
+    const shaped = cfg.shape(record);
+    showModal('CRM · REMOVE', `<h2>Remove ${esc(shaped.name)} from the CRM?</h2>`
+      + `<p class="form-note">${cfg.warning}</p>`
+      + dialogForms.form(`crm-delete-${kind}-form`, '', `Remove ${cfg.noun}`));
+    const form = document.getElementById(`crm-delete-${kind}-form`);
+    form.addEventListener('submit', e => { e.preventDefault(); quiet(form); submitDelete(form, kind, shaped); });
+  }
+
   /* ── What the CRM's buttons do ─────────────────────────────────────── */
 
   /* A plain click, which opens a link here — not one for a new tab or window. */
@@ -384,7 +424,8 @@ const crmForms = (function () {
       if (plainClick(e) && typeof modal !== 'undefined' && modal.open) modal.close();
       return;
     }
-    const button = at('[data-crm-new-company], [data-crm-edit-company], [data-crm-new-contact], [data-crm-edit-contact], [data-crm-merge-company], [data-crm-merge-contact]');
+    const button = at('[data-crm-new-company], [data-crm-edit-company], [data-crm-new-contact], [data-crm-edit-contact], '
+      + '[data-crm-merge-company], [data-crm-merge-contact], [data-crm-delete-company], [data-crm-delete-contact]');
     if (!button) return;
     e.preventDefault();
     if (!ready()) return;
@@ -410,6 +451,18 @@ const crmForms = (function () {
       else toast('That contact is no longer in the CRM.');
       return;
     }
+    if (d.crmDeleteCompany !== undefined) {
+      const company = C.companyById(loadedCompanies(), id('crmDeleteCompany'));
+      if (company) openDelete(company, 'company');
+      else toast('That company is no longer in the CRM.');
+      return;
+    }
+    if (d.crmDeleteContact !== undefined) {
+      const contact = C.contactById(contacts, id('crmDeleteContact'));
+      if (contact) openDelete(contact, 'contact');
+      else toast('That contact is no longer in the CRM.');
+      return;
+    }
     const contact = C.contactById(contacts, id('crmEditContact'));
     if (contact) openContact(contact, '');
     else toast('That contact is no longer in the CRM.');
@@ -426,5 +479,5 @@ const crmForms = (function () {
     };
   }
 
-  return Object.freeze({ openCompany, openContact, openMerge });
+  return Object.freeze({ openCompany, openContact, openMerge, openDelete });
 })();

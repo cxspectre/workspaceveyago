@@ -235,6 +235,15 @@ test('the details show what is stored: every status and priority, and Unassigned
   assert.match(html, /data-record-kind="tickets" data-record-id="7" data-field="status"/);
 });
 
+test('a ticket filed under a company quotes its client number, next to the requester; one not yet a client, or no company at all, has none', () => {
+  const numbered = load({ route: ['tickets', '12'], list: [ticket(12, {}, { company_id: 'co-1', company: { name: 'Northline', client_number: 42 } })] }).view();
+  assert.match(numbered, /<span>Client No\.<\/span>42/);
+  const notYetAClient = load({ route: ['tickets', '13'], list: [ticket(13, {}, { company_id: 'co-2', company: { name: 'Early Talks', client_number: null } })] }).view();
+  assert.doesNotMatch(notYetAClient, /Client No\./);
+  const noCompany = load({ route: ['tickets', '14'], list: [ticket(14, {}, { company: null })] }).view();
+  assert.doesNotMatch(noCompany, /Client No\./);
+});
+
 test('a resolved ticket says whether it met its response target — not only one still waiting', () => {
   const missed = load({
     route: ['tickets', '9'],

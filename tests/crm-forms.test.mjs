@@ -173,6 +173,14 @@ function load({ companies = [], contacts = [], team = TEAM, loaded = true, parts
         writes.push(['mergeContacts', keep, drop]);
         if (refusing === 'merge') throw new Error('Only an owner or admin can merge contacts.');
         return { kept_id: keep, merged_id: drop };
+      },
+      deleteCompany: async id => {
+        writes.push(['deleteCompany', id]);
+        if (refusing === 'delete') throw new Error('The company was not removed: it has been removed already, or only an owner or admin can remove one.');
+      },
+      deleteContact: async id => {
+        writes.push(['deleteContact', id]);
+        if (refusing === 'delete') throw new Error('The contact was not removed: it has been removed already, or only an owner or admin can remove one.');
       }
     },
     document: {
@@ -634,6 +642,47 @@ test('the Merge button is offered on a company\'s page and on a contact\'s', () 
   assert.equal(h.toasts.at(-1), 'That contact is no longer in the CRM.');
 });
 
+/* ── Removing a company or a contact (soft delete, deleted_at) ─────────── */
+
+test('Remove company asks first, names what stays behind, and removes it once confirmed', async () => {
+  const northline = company(NORTHLINE, { name: 'Northline' });
+  const h = load({ companies: [northline] });
+  h.click({ 'data-crm-delete-company': NORTHLINE });
+  assert.match(h.body(), /<h2>Remove Northline from the CRM\?<\/h2>/);
+  assert.match(h.body(), /Its people and its work — projects, tickets, mail and invoices — stay exactly where they are, filed under no company\./);
+  assert.doesNotMatch(h.body(), /form-candidates/, 'nothing here to ask about a look-alike record');
+  await h.submit();
+  assert.deepEqual(h.writes, [['deleteCompany', NORTHLINE]]);
+  assert.equal(h.toasts.at(-1), 'Northline is removed from the CRM.');
+  assert.deepEqual(h.navigated, ['crm/companies']);
+  assert.equal(h.modal.open, false);
+});
+
+test('Remove contact asks first, names what stays behind, and a refusal (owners and admins only) is said on the dialog', async () => {
+  const northline = company(NORTHLINE);
+  const ana = contact(ANA, 'Ana Lima', 'ana@northline.example', northline);
+  const h = load({ companies: [northline], contacts: [ana], refuse: 'delete' });
+  h.click({ 'data-crm-delete-contact': ANA });
+  assert.match(h.body(), /<h2>Remove Ana Lima from the CRM\?<\/h2>/);
+  assert.match(h.body(), /The projects, tickets and mail already linked to them stay exactly where they are\./);
+  await h.submit();
+  assert.deepEqual(h.writes, [['deleteContact', ANA]]);
+  assert.equal(h.part('.form-error').textContent,
+    'The contact was not removed: it has been removed already, or only an owner or admin can remove one.');
+  assert.equal(h.modal.open, true, 'stays open so a manager watching can see why it did not go');
+  assert.deepEqual(h.navigated, [], 'not navigated away on a refusal');
+});
+
+test('Remove is offered on a company\'s page and on a contact\'s, and a record no longer loaded says so', () => {
+  const northline = company(NORTHLINE, { name: 'Northline' });
+  const ana = contact(ANA, 'Ana Lima', 'ana@northline.example', northline);
+  const h = load({ companies: [northline], contacts: [ana] });
+  h.click({ 'data-crm-delete-company': 'not-loaded' });
+  assert.equal(h.toasts.at(-1), 'That company is no longer in the CRM.');
+  h.click({ 'data-crm-delete-contact': 'not-loaded' });
+  assert.equal(h.toasts.at(-1), 'That contact is no longer in the CRM.');
+});
+
 /* ── Around the dialogs ───────────────────────────────────────────────── */
 
 test('Add contact, wherever it is pressed, opens this dialog, and every other create goes where it went', () => {
@@ -682,8 +731,10 @@ test('what anyone typed stays text in the dialogs and in what they ask', async (
   const h = load({ companies: [evil], contacts: [person] });
   h.click({ 'data-crm-edit-company': NORTHLINE });
   h.click({ 'data-crm-edit-contact': ANA });
+  h.click({ 'data-crm-delete-company': NORTHLINE });
+  h.click({ 'data-crm-delete-contact': ANA });
   h.create('crm');
-  assert.equal(h.modals.length, 3);
+  assert.equal(h.modals.length, 5);
   for (const { body } of h.modals) {
     assert.doesNotMatch(body, /<img src=x|<script>|"><script|<\/textarea><img/i);
     assert.match(body, /&lt;img src=x onerror=alert\(1\)&gt;/, 'shown as what was typed');

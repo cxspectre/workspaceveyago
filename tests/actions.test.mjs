@@ -335,6 +335,28 @@ test('saving a task writes only the columns that changed, to that task, and a re
   assert.equal(nothing.written.length, 0);
 });
 
+test('removing a company or a contact from the CRM is a manager-only soft delete, and one already removed is a refusal', async () => {
+  const removed = workspace(async () => ({ data: null, error: null }), { rows: table => [{ id: table === 'crm_companies' ? 'co-1' : 'c-1' }] });
+  await removed.actions.deleteCompany('co-1');
+  await removed.actions.deleteContact('c-1');
+  assert.deepEqual(removed.written.map(w => [w.table, w.what]), [['crm_companies', 'update'], ['crm_contacts', 'update']]);
+  assert.ok('deleted_at' in removed.written[0].change);
+  assert.ok('deleted_at' in removed.written[1].change);
+  assert.deepEqual(removed.written[0].where, [['id', 'co-1'], ['deleted_at', { is: null }]]);
+  assert.deepEqual(removed.written[1].where, [['id', 'c-1'], ['deleted_at', { is: null }]]);
+
+  const staff = workspace(async () => ({ data: null, error: null }), { manager: false });
+  await assert.rejects(staff.actions.deleteCompany('co-1'), { message: 'Only an owner or admin can remove a company from the CRM.' });
+  await assert.rejects(staff.actions.deleteContact('c-1'), { message: 'Only an owner or admin can remove a contact from the CRM.' });
+  assert.equal(staff.written.length, 0, 'refused before it reaches the database');
+
+  const already = workspace(async () => ({ data: null, error: null }), { rows: () => [] });
+  await assert.rejects(already.actions.deleteCompany('co-1'),
+    { message: 'The company was not removed: it has been removed already, or only an owner or admin can remove one.' });
+  await assert.rejects(already.actions.deleteContact('c-1'),
+    { message: 'The contact was not removed: it has been removed already, or only an owner or admin can remove one.' });
+});
+
 test('saving a company or a contact writes only the columns given, to that row while it is in the CRM, and a refusal is said as one', async () => {
   const saved = workspace(async () => ({ data: null, error: null }), { rows: table => [{ id: table === 'crm_companies' ? 'co-1' : 'c-1' }] });
   assert.equal((await saved.actions.updateCompany('co-1', { stage: 'client' })).id, 'co-1');

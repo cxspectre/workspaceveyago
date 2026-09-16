@@ -184,15 +184,27 @@
     return ' ' + pill(WORDS[status] + ' · ' + when(dueAt), TONE[status]);
   }
 
+  /* A client number (0053), read straight off the ticket's own row the same
+     way finance-ui.js reads it off an invoice's: company:crm_companies
+     already carries it (queries.js), and tickets-model.js — a peer file — is
+     never asked. Only a company the ticket is filed under directly (its own
+     company_id, not one reached through its contact) has one to quote here. */
+  function clientNumberOf(t) {
+    const company = (t.row || {}).company;
+    return company && company.client_number != null ? company.client_number : null;
+  }
+
   function details(t) {
     const r = t.row || {};
     const age = T.durationLabel(r.created_at, new Date().toISOString());
     const mergedInto = t.mergedIntoId ? byUuid(t.mergedIntoId) : null;
+    const clientNumber = clientNumberOf(t);
     return [
       ['Status', choice('Ticket status', t, 'status', T.STATUSES.map(s => [s.value, s.label]), T.statusOf(t))],
       ['Priority', choice('Ticket priority', t, 'priority', T.PRIORITIES.map(p => [p.value, p.label]), T.priorityOf(t))],
       ['Owner', choice('Ticket owner', t, 'owner', T.ownerOptions(team, T.assigneeOf(t), t.assigneeName), T.assigneeOf(t) || '')],
       ['Requester', esc(t.client) + (t.contactEmail ? `<br><small>${esc(t.contactEmail)}</small>` : '')],
+      ...(clientNumber != null ? [['Client No.', esc(String(clientNumber))]] : []),
       ['Product', esc(t.product)],
       ['Came in', esc([SOURCES[r.source] || '', when(r.created_at)].filter(Boolean).join(' · ') || '—') + (age ? ` <small>(${esc(age)} old)</small>` : '')],
       ['First reply', esc(r.first_response_at ? when(r.first_response_at) : 'Not sent yet') + targetLine(r.first_response_due_at, r.first_response_at)],
