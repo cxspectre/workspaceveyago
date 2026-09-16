@@ -871,6 +871,24 @@
       return threadState(threadId, { starred: !!starred });
     },
 
+    /* An attachment's bytes, fetched from Graph through mail-attachment-content
+       (0063) — the content stays there until a person actually asks for one,
+       the same reasoning mail_attachments' own comment gives for storing only
+       its metadata. Returns the Blob supabase-js hands back, untouched: the
+       function's own response is always application/octet-stream, since only
+       that type (or application/pdf) reaches this far as a Blob rather than
+       mangled text, so mail.js is the one that re-types it with the
+       attachment's own contentType before showing or offering it. */
+    async mailAttachmentContent(attachmentId) {
+      must(attachmentId, 'That attachment is not loaded any more. Reload the page.');
+      var res = await sb().functions.invoke('mail-attachment-content', {
+        body: { attachmentId: attachmentId }
+      });
+      if (res.error) throw new Error(await functionError(res, 'Could not open that attachment.'));
+      must(res.data && typeof res.data.size === 'number', 'Could not open that attachment.');
+      return res.data;
+    },
+
     /* ── Notifications ───────────────────────────────────────────────── */
 
     /* Marks one bell item seen (notification_dismissals, 0061) — a plain

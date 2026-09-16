@@ -45,6 +45,20 @@
     return /^(https?:|mailto:|tel:)/i.test(href) ? href : null;
   }
 
+  /* The Content-ID a cid: src names, or null when the src is not one — RFC
+     2392's own reference form, with no angle brackets (Graph's own contentId
+     never has them either; a raw Content-ID header sometimes does, but that
+     is not this string). A bad %-escape is read as the literal text rather
+     than thrown away: an unusual cid is still worth trying to match, and
+     dropping it entirely would only turn "wrong" into "never shown". */
+  function cidFromSrc(src) {
+    var m = /^cid:(.*)$/i.exec(String(src || '').trim());
+    if (!m) return null;
+    var raw = m[1].trim();
+    try { return decodeURIComponent(raw) || null; }
+    catch (badEscape) { return raw || null; }
+  }
+
   /* An inline style is CSS, and DOMPurify does not read CSS. Left alone, an
      email's style="" can fetch a remote image — a tracking pixel that walks
      straight past "images blocked" — or pin itself over the workspace with
@@ -101,6 +115,7 @@
   window.mailHtml = {
     styleAllowed: styleAllowed,
     cleanStyle: cleanStyle,
+    cidFromSrc: cidFromSrc,
 
     /* Returns { html, blockedImages } — the caller decides how to offer the
        "show images" affordance, and how many were hidden. */
@@ -132,13 +147,28 @@
         else el.removeAttribute('style');
       });
 
+      /* Inline images (cid:) come from this message's own attachments — the
+         same bytes mail-attachment-content fetches for a download link, so
+         there is no sender to leak to by showing one, unlike a remote image.
+         Nothing here fetches it, though: render() has no way to await
+         anything, and mailBody() (app.js) calls it with only the message, no
+         way to hand in what has been fetched since. So every cid: image comes
+         out marked (data-mail-cid) with no src, and mail.js's own
+         withResolvedInlineImages fills in a real src on the cached HTML
+         STRING this returns, once it has actually fetched one — a targeted
+         string replace rather than a second DOM pass, since nothing here
+         keeps the DOM this built around to run one on later. */
       var blocked = 0;
       host.querySelectorAll('img').forEach(function (img) {
         var src = String(img.getAttribute('src') || '');
-        /* cid: images are inline attachments we have not fetched; there is
-           nothing to show, so they go entirely rather than leaving a broken
-           icon. */
-        if (/^cid:/i.test(src)) { img.remove(); return; }
+        var cid = cidFromSrc(src);
+        if (cid !== null) {
+          img.removeAttribute('src');
+          img.setAttribute('data-mail-cid', cid);
+          if (!img.getAttribute('alt')) img.setAttribute('alt', 'Loading image…');
+          img.classList.add('mail-image-inline');
+          return;
+        }
         /* A data: image is self-contained — no request, nothing to leak. */
         if (/^data:image\//i.test(src)) return;
         if (!/^https?:/i.test(src)) { img.remove(); return; }
