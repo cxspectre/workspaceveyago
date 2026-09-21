@@ -198,6 +198,14 @@ function load({ companies = [], contacts = [], team = TEAM, loaded = true, parts
     click: attributes => clickOn(target(attributes)),
     clickOn,
     create: kind => context.createForm(kind),
+    /* crmForms.openContact as another file calls it — Mail's "Add sender to
+       the CRM" reuses this dialog rather than growing a second one. */
+    /* `const crmForms = …` lives in the script's own lexical scope, not on
+       the context object — read the way every classic script reads a peer's
+       global: by name, in the same scope they share. */
+    open: (person, companyId, over) => vm.runInContext('crmForms', context)
+      .openContact(person, companyId || '', over),
+    contactRow: id => contacts.find(c => c.id === id),
     form: () => form,
     part: selector => form.querySelector(selector),
     fill: more => Object.assign(form.values, more),
@@ -744,4 +752,54 @@ test('what anyone typed stays text in the dialogs and in what they ask', async (
   await h.submit();
   assert.doesNotMatch(h.part('.form-candidates').innerHTML, /<img src=x/);
   assert.match(h.part('.form-candidates').innerHTML, /&lt;img src=x onerror=alert\(1\)&gt;<\/a>/);
+});
+
+/* ── Opened from outside the CRM (Mail's "Add sender to the CRM") ───────
+   Mail hands over who a conversation is with so nobody retypes an address
+   they are looking at, and says what happens once they exist — it links the
+   conversation to them — in place of walking off to the new contact's page.
+   Everything this dialog enforces is unchanged by either. */
+
+test('a caller may start a new contact\'s name and address, and every rule still runs on what is submitted', async () => {
+  const h = load();
+  h.open(null, '', { name: 'Anna Berg', email: 'anna@client.com' });
+  assert.deepEqual(fieldsOf(h.body()).name, 'Anna Berg');
+  assert.deepEqual(fieldsOf(h.body()).email, 'anna@client.com');
+  await h.submit();
+  assert.equal(h.writes.at(-1)[0], 'createContactWithCompany');
+  assert.equal(h.writes.at(-1)[1].fullName, 'Anna Berg');
+  assert.equal(h.writes.at(-1)[1].email, 'anna@client.com');
+});
+
+test('a pre-filled address another contact already has is still refused, exactly as a typed one is', async () => {
+  const h = load({ contacts: [contact(ANA, 'Ana Lima', 'anna@client.com')] });
+  h.open(null, '', { name: 'Anna Berg', email: 'anna@client.com' });
+  h.send();
+  assert.equal(h.writes.length, 0, 'the database would refuse it, so nothing is sent');
+  assert.match(h.part('.form-error').textContent, /already has the same email address/);
+});
+
+test('a caller with its own next step is told who was added, and the CRM does not navigate away from their page', async () => {
+  const h = load();
+  const added = [];
+  h.open(null, '', { name: 'Anna Berg', email: 'anna@client.com', onAdded: made => added.push({ ...made }) });
+  await h.submit();
+  assert.deepEqual(added, [{ contactId: ADDED, companyId: null }]);
+  assert.deepEqual(h.navigated, [], 'Mail stays where it is: it has its own work to do with that id');
+  assert.equal(h.toasts.at(-1), 'Anna Berg added.');
+});
+
+test('opened from the CRM itself, with no caller to tell, it still opens the new contact\'s page', async () => {
+  const h = load();
+  h.create('crm');
+  h.fill({ name: 'Ana Lima', email: 'ana@northline.example' });
+  await h.submit();
+  assert.deepEqual(h.navigated, [`crm/${ADDED}`]);
+});
+
+test('an existing contact\'s own record is never pre-filled by a caller', () => {
+  const h = load({ contacts: [contact(ANA, 'Ana Lima', 'ana@northline.example')] });
+  h.open(h.contactRow(ANA), '', { name: 'Someone Else', email: 'someone@else.example' });
+  assert.equal(fieldsOf(h.body()).name, 'Ana Lima');
+  assert.equal(fieldsOf(h.body()).email, 'ana@northline.example');
 });

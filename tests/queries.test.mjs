@@ -153,6 +153,39 @@ test('mailThreads asks for the other party, and no longer for whoever sent most 
   assert.ok(!select.includes('last_from_name'), 'the renamed column is gone, not just supplemented');
 });
 
+/* A client number (0053) already showed on a company's page, on a ticket and
+   on an invoice — everywhere a client appears except the one place they are
+   most often actually talked to. It rides along on the conversation's own row,
+   the way a ticket already carries it, rather than costing a second round
+   trip per conversation opened. */
+test('mailThreads asks for the conversation\'s company and its client number', async () => {
+  const { data, queries } = loadTables();
+  await data.mailThreads(['inbox'], ['box-1']);
+  const select = queries[0].calls.find(([method]) => method === 'select')[1];
+  assert.ok(select.includes('company_id'), 'asks which company the conversation is filed under');
+  assert.ok(select.includes('company:crm_companies (name, client_number)'), 'and for that company\'s client number');
+});
+
+test('a conversation filed under a client carries its number; one under nobody carries none', async () => {
+  const { data } = loadTables(table => (table !== 'mail_threads' ? [] : [
+    { id: 't1', connection_id: 'box-1', folder: 'inbox', message_count: 1, last_message_at: '2026-09-10T09:00:00Z',
+      subject: 'Renewal', snippet: 'x', is_read: true, is_starred: false,
+      other_party_name: 'Ana Lima', other_party_email: 'ana@northline.example',
+      ticket_id: null, contact_id: null, contact: null,
+      company_id: 'co1', company: { name: 'Northline', client_number: 1042 } },
+    { id: 't2', connection_id: 'box-1', folder: 'inbox', message_count: 1, last_message_at: '2026-09-09T09:00:00Z',
+      subject: 'Intro', snippet: 'x', is_read: true, is_starred: false,
+      other_party_name: null, other_party_email: 'stranger@newbiz.example',
+      ticket_id: null, contact_id: null, contact: null, company_id: null, company: null }
+  ]));
+  const { threads } = await data.mailThreads(['inbox'], ['box-1']);
+  const byId = Object.fromEntries(threads.map(t => [t.id, t]));
+  assert.equal(byId.t1.companyId, 'co1');
+  assert.equal(byId.t1.row.company.client_number, 1042, 'read off the row, as tickets-ui.js reads a ticket\'s');
+  assert.equal(byId.t2.companyId, null);
+  assert.equal(byId.t2.row.company, null);
+});
+
 test('a thread shows the OTHER party — never whoever wrote most recently — and a CRM contact outranks both', async () => {
   const { data } = loadTables(table => (table !== 'mail_threads' ? [] : [
     { id: 't1', connection_id: 'box-1', folder: 'inbox', message_count: 2, last_message_at: '2026-09-10T09:00:00Z',

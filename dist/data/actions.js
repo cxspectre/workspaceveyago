@@ -904,6 +904,67 @@
       return threadState(threadId, { starred: !!starred });
     },
 
+    /* Archive a conversation, mark it as junk, or delete it — where DELETE
+       MEANS a move to Outlook's Deleted Items and never a permanent purge
+       (the owner's decision, 2026-09-21; graph-guard.ts holds the whole of
+       what it is allowed to mean, and 0069 the database half).
+
+       Deliberately no fallback to writing mail_threads.folder here, for a
+       stronger reason than markThreadRead's: the browser has no write on that
+       column at all (0038 revoked it precisely so nobody could re-file a
+       colleague's mail), and even if it had, a move recorded here that Graph
+       never took is undone by the very next delta — the conversation would
+       come back minutes after the button said it had gone. move-mail-thread
+       refuses outright when Outlook cannot be reached, and that refusal is
+       what the caller should show.
+
+       Resolves to { ok, moved, thread, reason, incomplete }: `thread` is the
+       conversation as it now stands (null when there was nothing to move),
+       and `reason` is worth saying even on success — messages that had
+       already moved in Outlook, or a long conversation the function ran out
+       of time on, which asking again finishes. */
+    async moveMailThread(threadId, to) {
+      must(threadId, 'That conversation is not loaded any more. Reload the page.');
+      must(mailModel.moveFor(to), 'A conversation can only be archived, marked as junk or deleted.');
+      var res = await sb().functions.invoke('move-mail-thread', {
+        body: { threadId: threadId, to: to }
+      });
+      if (res.error) throw new Error(await functionError(res, 'That conversation was not moved.'));
+      return res.data;
+    },
+
+    /* ── Mail and the CRM ────────────────────────────────────────────────── */
+
+    /* Who a conversation is with, said by hand (link_mail_thread, 0055) —
+       contactId null clears it. The company follows from the contact in the
+       database, not here, so there is one answer to "which company is this
+       conversation with" rather than two that could disagree. Any member of
+       staff who can already read the conversation may set it, which is the
+       same permission the CRM's own writes use; the database checks again. */
+    async linkMailThread(threadId, contactId) {
+      must(threadId, 'That conversation is not loaded any more. Reload the page.');
+      var res = await sb().rpc('link_mail_thread', {
+        p_thread: threadId, p_contact: contactId || null
+      });
+      if (res.error) throw new Error('Could not link this conversation: ' + res.error.message);
+      return Array.isArray(res.data) ? res.data[0] : res.data;
+    },
+
+    /* The back-fill nothing has ever run for mail stored before its sender was
+       added to the CRM (rematch_mail_threads, 0055). Manager-only, and the
+       reason is worth repeating here: unlike linking one conversation somebody
+       is already looking at, this reaches into every mailbox at once,
+       including ones the caller cannot themselves read. The check below fails
+       fast with a sentence a person can read; the database refuses it
+       regardless of what this said. */
+    async rematchMailThreads(limit) {
+      must(window.workspaceSession.isManager && window.workspaceSession.isManager(),
+        'Only an owner or admin can match older mail to the CRM.');
+      var res = await sb().rpc('rematch_mail_threads', { p_limit: limit || 500 });
+      if (res.error) throw new Error('Could not match older mail to the CRM: ' + res.error.message);
+      return Number(res.data) || 0;
+    },
+
     /* An attachment's bytes, fetched from Graph through mail-attachment-content
        (0063) — the content stays there until a person actually asks for one,
        the same reasoning mail_attachments' own comment gives for storing only

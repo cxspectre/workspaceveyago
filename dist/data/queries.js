@@ -804,7 +804,18 @@
           .from('mail_threads')
           .select('id, connection_id, subject, snippet, folder, is_read, is_starred, message_count, ' +
                   'last_message_at, other_party_name, other_party_email, ticket_id, contact_id, ' +
-                  'contact:crm_contacts (full_name, email)');
+                  'contact:crm_contacts (full_name, email), ' +
+                  /* company_id and its client_number (0053) ride along on the
+                     conversation's own row, the same way a ticket already
+                     carries them (the tickets query above) — so the reading
+                     pane can quote the number beside a client's name without
+                     a second round trip, and read it straight off the row
+                     (mail.js's clientNumberOf, the twin of tickets-ui.js's).
+                     mail_threads.company_id is set by the CRM match on an
+                     address (0025/0055), widened to a sender's domain for
+                     inbound mail no contact claims (0059), or by hand
+                     (link_mail_thread). */
+                  'company_id, company:crm_companies (name, client_number)');
         /* Starred reaches past the folders listed: a conversation filed away in
            Outlook (0045) with a flag on it is still one you marked to come back
            to. Inbox and Sent load as themselves, so they are left out here. */
@@ -849,7 +860,7 @@
           time: day === 'Today' ? clockTime(r.last_message_at) : day,
           unread: !r.is_read, starred: r.is_starred, count: r.message_count,
           mailboxId: r.connection_id, folder: r.folder,
-          ticketId: r.ticket_id, contactId: r.contact_id,
+          ticketId: r.ticket_id, contactId: r.contact_id, companyId: r.company_id,
           /* Filled in by workspaceStore.loadThread() when this thread is
              opened. Absent, not empty, so the reader can tell "not loaded yet"
              from "this message has no body". */
