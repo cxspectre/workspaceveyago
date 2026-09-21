@@ -167,6 +167,79 @@ test('a conversation the function cannot find is an error, not a quiet write to 
     'writing the thread row directly would be undone by the next sync, and never reach Outlook');
 });
 
+/* ── Moving a conversation (0069) ─────────────────────────────────────── */
+
+test('archiving goes through move-mail-thread, and nothing is written here', async () => {
+  const ws = workspace(async () => ({ data: { ok: true, moved: 2, thread: { id: THREAD, folder: 'archive' } }, error: null }));
+  const result = await ws.actions.moveMailThread(THREAD, 'archive');
+  assert.equal(result.moved, 2);
+  assert.deepEqual(ws.invoked, [{ name: 'move-mail-thread', body: { threadId: THREAD, to: 'archive' } }]);
+  assert.equal(ws.written.length, 0,
+    'the browser has no write on mail_threads.folder (0038), and a move it recorded alone would be undone by the next delta');
+});
+
+test('junk and delete are the other two, spelled the way the database spells them', async () => {
+  for (const to of ['spam', 'trash']) {
+    const ws = workspace(async () => ({ data: { ok: true, moved: 1 }, error: null }));
+    await ws.actions.moveMailThread(THREAD, to);
+    assert.equal(ws.invoked[0].body.to, to);
+  }
+});
+
+/* The owner named three folders. Anything else is refused before a request is
+   made — the Edge Function and graph-guard.ts refuse it again regardless. */
+test('nowhere else is a place to send a conversation', async () => {
+  for (const to of ['inbox', 'sent', 'deleteditems', 'starred', '', null]) {
+    const ws = workspace(async () => ({ data: {}, error: null }));
+    await assert.rejects(ws.actions.moveMailThread(THREAD, to), { message: /archived, marked as junk or deleted/ });
+    assert.equal(ws.invoked.length, 0, String(to));
+  }
+});
+
+test('a mailbox that cannot be reached is a refusal in the function\'s own words', async () => {
+  const ws = workspace(async () => httpError(409, { error: 'This mailbox is disconnected, so nothing can be moved in Outlook.' }));
+  await assert.rejects(ws.actions.moveMailThread(THREAD, 'trash'),
+    { message: 'This mailbox is disconnected, so nothing can be moved in Outlook.' });
+  assert.equal(ws.written.length, 0);
+});
+
+/* ── Mail and the CRM (0055, finally called) ──────────────────────────── */
+
+test('linking a conversation calls link_mail_thread; the company follows in the database, not here', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }), {
+    rpc: () => ({ data: { id: THREAD, contact_id: 'c1', company_id: 'co1' }, error: null })
+  });
+  const row = await ws.actions.linkMailThread(THREAD, 'c1');
+  assert.deepEqual([...ws.called].map(c => ({ ...c })), [{ name: 'link_mail_thread', args: { p_thread: THREAD, p_contact: 'c1' } }]);
+  assert.equal(row.company_id, 'co1');
+  assert.equal(ws.written.length, 0, 'never a direct write to mail_threads.contact_id');
+});
+
+test('no contact means null, which is how the database clears one', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }), { rpc: () => ({ data: null, error: null }) });
+  await ws.actions.linkMailThread(THREAD, '');
+  assert.equal(ws.called[0].args.p_contact, null);
+});
+
+test('a refusal from link_mail_thread is said in a sentence, not as a raw database error', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }), {
+    rpc: () => ({ data: null, error: { message: 'That contact is not in the CRM.' } })
+  });
+  await assert.rejects(ws.actions.linkMailThread(THREAD, 'gone'), { message: /Could not link this conversation: That contact is not in the CRM./ });
+});
+
+test('the back-fill is a manager\'s, and is refused here before it is refused again in the database', async () => {
+  const notManager = workspace(async () => ({ data: null, error: null }), { manager: false, rpc: () => ({ data: 3, error: null }) });
+  await assert.rejects(notManager.actions.rematchMailThreads(), { message: /Only an owner or admin/ });
+  assert.equal(notManager.called.length, 0, 'it reaches into every mailbox at once — including ones the caller cannot read');
+});
+
+test('a manager\'s back-fill answers how many conversations it matched', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }), { rpc: () => ({ data: 7, error: null }) });
+  assert.equal(await ws.actions.rematchMailThreads(), 7);
+  assert.deepEqual({ ...ws.called[0].args }, { p_limit: 500 });
+});
+
 /* ── Mail attachments ─────────────────────────────────────────────────── */
 
 test('an attachment\'s bytes come back from mail-attachment-content, as the blob supabase-js hands over', async () => {
