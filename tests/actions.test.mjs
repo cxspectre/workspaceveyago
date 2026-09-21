@@ -416,6 +416,66 @@ test('a new company is added in the currency and with the owner it was given, or
   assert.equal(ws.written[2].change.owner_id, null, '"No owner" is no owner');
 });
 
+test('a new deal is added for its company, in the currency and with the owner it was given, or else the defaults', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }));
+  await ws.actions.createDeal({ companyId: 'co-1', title: '  Renewal  ', stage: 'proposal', value: 12000, currency: 'EUR', expectedClose: '2026-11-30' });
+  await ws.actions.createDeal({ companyId: 'co-1', title: 'Audit' });
+  await ws.actions.createDeal({ companyId: 'co-1', title: 'Pilot', ownerId: null });
+  assert.deepEqual(ws.written.map(w => [w.table, w.what]), [['crm_deals', 'insert'], ['crm_deals', 'insert'], ['crm_deals', 'insert']]);
+  assert.equal(ws.written[0].change.title, 'Renewal', 'the spaces around a typed name are not part of it');
+  assert.equal(ws.written[0].change.company_id, 'co-1');
+  assert.equal(ws.written[0].change.currency, 'EUR');
+  assert.equal(ws.written[0].change.expected_close, '2026-11-30');
+  assert.equal('currency' in ws.written[1].change, false, 'the column\'s own default');
+  assert.equal(ws.written[1].change.stage, 'lead', 'a deal starts at the first stage');
+  assert.equal(ws.written[1].change.value, null);
+  assert.equal(ws.written[1].change.owner_id, 'emp-1', 'nothing said: whoever adds it');
+  assert.equal(ws.written[2].change.owner_id, null, '"No owner" is no owner');
+  for (const written of ws.written) {
+    assert.equal('outcome' in written.change, false, 'a new deal is always open: won and lost are decided later');
+    assert.equal('closed_at' in written.change, false);
+  }
+});
+
+test('a deal cannot be added without a company or a name, and neither reaches the database', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }));
+  await assert.rejects(ws.actions.createDeal({ title: 'Renewal' }), { message: 'Pick the company this deal is for.' });
+  await assert.rejects(ws.actions.createDeal({ companyId: 'co-1', title: '   ' }), { message: 'A deal needs a name.' });
+  assert.equal(ws.written.length, 0, 'refused before it reaches the database');
+});
+
+test('saving a deal writes only the columns given, to that deal while it is still there, and a refusal is said as one', async () => {
+  const saved = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: 'd-1' }] });
+  assert.equal((await saved.actions.updateDeal('d-1', { stage: 'proposal' })).id, 'd-1');
+  assert.equal((await saved.actions.updateDeal('d-1', { outcome: 'won', closed_at: '2026-09-14T00:00:00Z' })).id, 'd-1');
+  assert.deepEqual(saved.written.map(w => [w.table, w.what, w.change, w.where]), [
+    ['crm_deals', 'update', { stage: 'proposal' }, [['id', 'd-1'], ['deleted_at', { is: null }]]],
+    ['crm_deals', 'update', { outcome: 'won', closed_at: '2026-09-14T00:00:00Z' }, [['id', 'd-1'], ['deleted_at', { is: null }]]]
+  ], 'a deal a manager removed is not changed back into view');
+  const refused = workspace(async () => ({ data: null, error: null }), { rows: () => [] });
+  await assert.rejects(refused.actions.updateDeal('d-1', { stage: 'proposal' }),
+    { message: 'The deal was not saved: it has been removed, or you may not change it.' });
+  const nothing = workspace(async () => ({ data: null, error: null }));
+  await assert.rejects(nothing.actions.updateDeal('d-1', {}), { message: 'Nothing to save.' });
+  assert.equal(nothing.written.length, 0);
+});
+
+test('removing a deal is a manager-only soft delete, and one already removed is a refusal', async () => {
+  const removed = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: 'd-1' }] });
+  await removed.actions.deleteDeal('d-1');
+  assert.deepEqual(removed.written.map(w => [w.table, w.what]), [['crm_deals', 'update']]);
+  assert.ok('deleted_at' in removed.written[0].change);
+  assert.deepEqual(removed.written[0].where, [['id', 'd-1'], ['deleted_at', { is: null }]]);
+
+  const staff = workspace(async () => ({ data: null, error: null }), { manager: false });
+  await assert.rejects(staff.actions.deleteDeal('d-1'), { message: 'Only an owner or admin can remove a deal.' });
+  assert.equal(staff.written.length, 0, 'refused before it reaches the database');
+
+  const already = workspace(async () => ({ data: null, error: null }), { rows: () => [] });
+  await assert.rejects(already.actions.deleteDeal('d-1'),
+    { message: 'The deal was not removed: it has been removed already, or only an owner or admin can remove one.' });
+});
+
 test('a company at a domain another already has says so plainly, not the database\'s own words', async () => {
   const ws = workspace(async () => ({ data: null, error: null }), {
     fail: table => (table === 'crm_companies'

@@ -682,6 +682,60 @@
         'remove the contact', 'The contact was not removed: it has been removed already, or only an owner or admin can remove one.');
     },
 
+    /* ── Deals (crm_deals, 0067) ──────────────────────────────────────
+       Staff add and change a deal, only a manager removes one — the split
+       0021 gave the rest of the CRM, which 0067 gave this table too. Every
+       shape rule the database keeps (a name, a stage it has, a value that is
+       not negative, a three-letter currency, an outcome and a close date that
+       are both set or both not) is checked by dealsModel first, so what
+       arrives here is already a row the database will take; these checks are
+       the ones worth failing fast on in a sentence a person can read. */
+
+    async createDeal(fields) {
+      var f = fields || {};
+      must(f.companyId, 'Pick the company this deal is for.');
+      must(f.title && f.title.trim(), 'A deal needs a name.');
+      /* A new deal is always open: crm_deals_closed_check (0067) refuses an
+         outcome without a date, and "won" is not something the Add dialog
+         offers — a deal is won from the board, once it exists. */
+      return one(await sb().from('crm_deals').insert(Object.assign({
+        company_id: f.companyId,
+        title: f.title.trim(),
+        stage: f.stage || 'lead',
+        value: f.value ?? null,
+        expected_close: f.expectedClose || null,
+        notes: f.notes || null,
+        /* No owner, when the form says none; the person adding it, when
+           nothing says — the same reading createCompany gives ownerId. */
+        owner_id: f.ownerId !== undefined ? f.ownerId : (me() ? me().id : null)
+      }, f.currency ? { currency: f.currency } : {})).select().single(), 'add the deal');
+    },
+
+    /* What an edit, a move between columns or a won/lost decision changes
+       (dealsModel.dealChanges / moveChanges / closeChanges), and only that.
+       Staff may change a deal, but not one a manager has removed: that, or a
+       change RLS refuses, touches no row, and the rows changed are asked back
+       to say so — the same shape updateCompany has. */
+    async updateDeal(dealId, changes) {
+      must(changes && Object.keys(changes).length, 'Nothing to save.');
+      return touched(await sb().from('crm_deals').update(changes).eq('id', dealId).is('deleted_at', null).select(),
+        'save the deal',
+        'The deal was not saved: it has been removed, or you may not change it.')[0];
+    },
+
+    /* Soft delete, the same rule and the same reasoning as deleteCompany
+       above: owners and admins only, and guard_soft_delete (0012, wired to
+       crm_deals by 0067) enforces it again whichever way deleted_at is
+       changed. The company keeps every other deal it has; only this one
+       leaves the board from the next load on. */
+    async deleteDeal(dealId) {
+      must(window.workspaceSession.isManager && window.workspaceSession.isManager(),
+        'Only an owner or admin can remove a deal.');
+      touched(await sb().from('crm_deals')
+        .update({ deleted_at: new Date().toISOString() }).eq('id', dealId).is('deleted_at', null).select('id'),
+        'remove the deal', 'The deal was not removed: it has been removed already, or only an owner or admin can remove one.');
+    },
+
     /* Turn a /websites/ enquiry into a company + contact. Safe to call twice:
        the function returns the same contact rather than making a duplicate. */
     async promoteEnquiry(enquiryId) {

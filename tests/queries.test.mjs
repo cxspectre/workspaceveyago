@@ -852,6 +852,42 @@ test('a client carries its number; a company not yet one has none', async () => 
   assert.equal(lead.clientNumber, null);
 });
 
+test('every deal loads — open and closed alike — a page at a time, in a fixed order, and a removed one is left out', async () => {
+  let served = 0;
+  const { data, queries } = loadTables(table => {
+    if (table !== 'crm_deals') return [];
+    served += 1;
+    return served === 1
+      ? Array.from({ length: 1000 }, (_, i) => ({ id: `d${i}`, company_id: 'co1', title: `Deal ${i}`, stage: 'lead' }))
+      : [{ id: 'd-last', company_id: 'co1', title: 'Zeta', stage: 'proposal', outcome: 'won', closed_at: '2026-09-10T09:00:00Z' }];
+  });
+  const list = await data.deals();
+  assert.equal(list.length, 1001);
+  assert.equal(list[1000].title, 'Zeta');
+  assert.deepEqual(queries.map(q => q.calls.filter(([method]) => method === 'range').map(call => call.slice(1).join('-'))), [['0-999'], ['1000-1999']]);
+  assert.ok(queries[0].calls.some(call => call.join(' ') === 'order id'), 'pages in a fixed order do not overlap');
+  assert.ok(queries[0].calls.some(([method, column, value]) => method === 'is' && column === 'deleted_at' && value === null),
+    'a removed deal is off every list');
+});
+
+test('a deal arrives with everything the board draws it from, and a closed one is read by its outcome', async () => {
+  const { data, queries } = loadTables(table => (table !== 'crm_deals' ? [] : [
+    { id: 'd1', company_id: 'co1', title: 'Renewal', stage: 'proposal', value: 12000, currency: 'EUR',
+      owner_id: 'e-sam', expected_close: '2026-11-30', outcome: null, closed_at: null, notes: null, created_at: '2026-09-01T00:00:00Z' },
+    { id: 'd2', company_id: 'co1', title: 'Pilot', stage: 'qualified', value: 400, currency: 'EUR',
+      owner_id: null, expected_close: null, outcome: 'won', closed_at: '2026-09-10T09:00:00Z', notes: null, created_at: '2026-08-01T00:00:00Z' }
+  ]));
+  const [open, won] = await data.deals();
+  const selected = queries[0].calls.find(([method]) => method === 'select')[1].split(/,\s*/);
+  for (const column of ['company_id', 'title', 'stage', 'value', 'currency', 'owner_id', 'expected_close', 'outcome', 'closed_at']) {
+    assert.ok(selected.includes(column), `${column} is asked for`);
+  }
+  assert.equal(open.row.expected_close, '2026-11-30');
+  assert.equal(open.stage, 'Proposal');
+  assert.equal(won.stage, 'Won', 'a closed deal is read by its outcome, never by the stage it kept');
+  assert.equal(won.row.stage, 'qualified', 'and the stage it kept is still on the row, which is the history');
+});
+
 test('enquiries arrive newest first, with what the promote button and the list need', async () => {
   const { data, queries } = loadTables(table => (table !== 'website_enquiries' ? [] : [{
     id: 'enq-1', kind: 'website', name: 'Bo Ahn', email: 'bo@example.com', business: 'Ahn Studio',

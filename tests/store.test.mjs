@@ -67,6 +67,7 @@ function answers(over = {}) {
     revenueSeries: async () => [],
     revenueMix: async () => [],
     companies: async () => [],
+    deals: async () => [],
     upcomingProjectEvents: async () => [],
     projectMembers: async () => [],
     projectContacts: async () => [],
