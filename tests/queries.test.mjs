@@ -657,7 +657,15 @@ test('one event is asked for by its id — a uuid, and nothing else — and none
   assert.equal(found.id, EV);
   assert.equal(found.title, 'Pitch');
   assert.deepEqual(plain(queries[0].calls.find(([method]) => method === 'eq')), ['eq', 'id', EV]);
-  assert.match(queries[0].calls.find(([method]) => method === 'select')[1], /connection_id, calendar_id, created_by, organizer_name, organizer_email, meeting_url, time_zone, attendees/, 'every column its page reads');
+  assert.match(queries[0].calls.find(([method]) => method === 'select')[1], /connection_id, calendar_id, created_by, organizer_name, organizer_email, meeting_url, time_zone/, 'every column its page reads');
+  assert.match(queries[0].calls.find(([method]) => method === 'select')[1], /\battendees\b/, 'who is invited, which only one event asked for by its id brings');
+  /* 0068: how often it repeats, whether a reminder is set, a zone a browser
+     can compute in, and how this calendar answered — all small scalars, so
+     unlike attendees they ride along with every list too (EVENT_LIST_COLUMNS). */
+  for (const column of ['recurrence_type', 'series_master_id', 'recurrence_summary',
+    'reminder_on', 'reminder_minutes', 'time_zone_iana', 'response_status', 'is_organizer']) {
+    assert.match(queries[0].calls.find(([method]) => method === 'select')[1], new RegExp('\\b' + column + '\\b'), column);
+  }
   assert.match(queries[0].calls.find(([method]) => method === 'select')[1], /\bupdated_at\b/, 'and when it last changed, which an edit is made against');
   assert.equal(await loadTables(() => []).data.event(EV), null);
   const crafted = loadTables(() => []);

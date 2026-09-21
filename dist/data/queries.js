@@ -196,8 +196,17 @@
      largest column an event has and only its page reads it, so it comes
      with one event asked for by its id (event, eventInvitees) rather than
      with every week, project meeting and past meeting, which are loaded
-     again every two minutes. */
-  var EVENT_LIST_COLUMNS = EVENT_COLUMNS + ', connection_id, calendar_id, created_by, organizer_name, organizer_email, meeting_url, time_zone';
+     again every two minutes.
+     0068's eight are all small scalars, and they are in the LIST for a
+     reason: recurrence_type marks a series in the week, the day, the
+     schedule and the month, and the rest are read by an event's page, which
+     is very often drawn from a row a list already brought (agenda-ui.js
+     eventById). Following attendees' lead and fetching them separately would
+     mean a second round trip to print four words. The bar attendees clears —
+     "the largest column an event has" — is not one a boolean and an integer
+     come near. */
+  var EVENT_LIST_COLUMNS = EVENT_COLUMNS + ', connection_id, calendar_id, created_by, organizer_name, organizer_email, meeting_url, time_zone' +
+    ', recurrence_type, series_master_id, recurrence_summary, reminder_on, reminder_minutes, time_zone_iana, response_status, is_organizer';
   var EVENT_PAGE_COLUMNS = EVENT_LIST_COLUMNS + ', attendees';
 
   function agendaEvent(r) {

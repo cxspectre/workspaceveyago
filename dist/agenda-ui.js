@@ -16,7 +16,12 @@
  * follows. An event's page says who is invited and how each answered, whether
  * it is only tentative or cancelled, who booked it and who organised it, its
  * video-call link, the calendar it came from, and the company, person and
- * project it is filed under — each by its id. Each calendar — a kind of event
+ * project it is filed under — each by its id. One of a recurring series is
+ * marked as one wherever it is drawn, and its page says how often it comes
+ * round, whether a reminder is set, which zone it was booked in and how this
+ * calendar answered the invitation — with Accept, Maybe and Decline beside
+ * it (0068; event-invite.js draws all of that and owns the reply). Each
+ * calendar — a kind of event
  * — can be hidden from the week, the day and the schedule, and this browser
  * remembers which. A connections panel below the mini month names every
  * calendar this session may act on, when it last synced, and lets it be
@@ -272,14 +277,25 @@
     hiddenCount: day.events.filter(p => hidden.has(p.kind.value)).length
   });
 
+  /* Whether an event is one of a recurring series (0068, event-invite.js):
+     what a week, a day and the schedule mark, so twelve stand-ups no longer
+     read as twelve unrelated meetings. A page loaded without event-invite.js
+     simply marks nothing. */
+  const isSeries = p => Boolean(window.eventInvite && typeof eventInvite.repeats === 'function'
+    && eventInvite.repeats((p && p.event) || null));
+
   /* An event on one of its days: the time it has there, and what it clashes with. */
   function card(p) {
-    const classes = ['calendar-event', 'type-' + p.kind.value, 'part-' + p.part, p.clash ? 'clash' : '', p.tentative ? 'tentative' : '']
-      .filter(Boolean).join(' ');
+    const series = isSeries(p);
+    const classes = ['calendar-event', 'type-' + p.kind.value, 'part-' + p.part, p.clash ? 'clash' : '',
+      p.tentative ? 'tentative' : '', series ? 'recurring' : ''].filter(Boolean).join(' ');
     const detail = p.event && p.event.detail ? `<small>${esc(p.event.detail)}</small>` : '';
     const others = p.clashesWith.filter(Boolean);
     const clash = p.clash ? `<small class="clash-note">Clashes with ${esc(others.length ? others.join(', ') : 'another event')}</small>` : '';
-    return `<a class="${classes}" href="#agenda/${esc(p.id)}"><small>${esc(p.time)}</small><strong>${esc(p.title)}</strong><span class="sr-only">, ${esc(p.kind.label)}${p.tentative ? ', tentative' : ''}.</span>${detail}${clash}</a>`;
+    /* The mark is decoration; the sentence after it is what a screen reader
+       reads, beside the kind and "tentative" it already reads there. */
+    const repeat = series ? '<span class="repeat-mark" aria-hidden="true">↻</span>' : '';
+    return `<a class="${classes}" href="#agenda/${esc(p.id)}"><small>${esc(p.time)}${repeat}</small><strong>${esc(p.title)}</strong><span class="sr-only">, ${esc(p.kind.label)}${p.tentative ? ', tentative' : ''}${series ? ', repeats' : ''}.</span>${detail}${clash}</a>`;
   }
 
   const dayButton = d => `<button type="button" class="calendar-day-button" data-agenda-day="${d.key}"`
@@ -309,7 +325,7 @@
   const scheduleView = drawn => '<section class="panel schedule-view">'
     + drawn.map(d => `<div class="schedule-date${d.today ? ' today' : ''}"${d.today ? ' aria-current="date"' : ''}>${esc(d.weekday)}<strong>${esc(d.label)}</strong></div>`
       + (d.events.length
-        ? d.events.map(p => `<a href="#agenda/${esc(p.id)}" class="schedule-row${p.clash ? ' clash' : ''}"><span>${esc(p.time)}</span><strong>${esc(p.title)}</strong>${p.tentative ? '<small class="tentative-note">Tentative</small>' : ''}${pill(p.kind.label, p.kind.tone)}</a>`).join('')
+        ? d.events.map(p => `<a href="#agenda/${esc(p.id)}" class="schedule-row${p.clash ? ' clash' : ''}${isSeries(p) ? ' recurring' : ''}"><span>${esc(p.time)}</span><strong>${esc(p.title)}</strong>${isSeries(p) ? '<small class="repeat-note">Repeats</small>' : ''}${p.tentative ? '<small class="tentative-note">Tentative</small>' : ''}${pill(p.kind.label, p.kind.tone)}</a>`).join('')
           + (d.hiddenCount ? `<p class="quiet-text schedule-empty">${inHidden(d.hiddenCount, true)}.</p>` : '')
         : `<p class="quiet-text schedule-empty">${d.hiddenCount ? inHidden(d.hiddenCount, false) : 'No events scheduled'}.</p>`)).join('')
     + '</section>';
@@ -528,13 +544,22 @@
     const organizerRow = (row.organizer_name || row.organizer_email)
       ? [['Organiser', esc(row.organizer_name || row.organizer_email)]]
       : [];
-    const zoneRow = row.time_zone ? [['Booked in', esc(row.time_zone)]] : [];
+    /* How often it repeats, whether a reminder is set, the zone it was booked
+       in — honestly, which is not always convertible — and how this calendar
+       answered its invitation (0068, event-invite.js). That file replaced the
+       plain "Booked in" row this page used to draw from time_zone alone: with
+       an IANA name beside it, the page can say "10:00 there, 09:00 here"
+       instead of naming a Windows zone and leaving the reader to do it.
+       Nothing at all when the file is not on the page. */
+    const inviteRows = window.eventInvite && typeof eventInvite.properties === 'function'
+      ? eventInvite.properties(row) : [];
     const company = row.company_id ? companyOf(row.company_id) : null;
     return detailHeader('agenda', 'Calendar', title, A.dateLabel(e), actions)
       + '<div class="record-layout"><div class="record-main">'
       + `<section class="panel event-summary"><div class="date-tile" aria-hidden="true"><span>${esc(names ? names.monthAbbr : '')}</span><strong>${names ? names.number : ''}</strong></div>`
       + `<div><h2>${esc(title)}</h2><p>${esc(A.timeLabel(e))}</p>${row.location ? `<small>${esc(row.location)}</small>` : ''}</div>${pill(kind.label, kind.tone)}</section>`
       + (row.detail ? `<section class="panel content-panel"><h2>Meeting brief</h2><p class="body-copy">${esc(row.detail)}</p></section>` : '')
+      + (window.eventInvite && typeof eventInvite.panel === 'function' ? eventInvite.panel(e) : '')
       + invitedPanel(e, row)
       + notesPanel('agenda', String(e.id)) + '</div>'
       + `<aside class="record-aside">${properties([
@@ -547,7 +572,7 @@
         ...booked,
         ...booker,
         ...organizerRow,
-        ...zoneRow
+        ...inviteRows
       ])}`
       + linkedPanel('Connected work', [
         ...(company ? [[`crm/companies/${company.id}`, company.name, 'Company', 'crm']] : []),

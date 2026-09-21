@@ -69,6 +69,7 @@ function load({ list = [], projectEvents = [], route = ['agenda'], mode = 'week'
   const removed = [];
   const repaints = [];
   const synced = [];
+  const replied = [];
   const connected = [];
   const opened = [];
   const locationAssigns = [];
@@ -169,7 +170,10 @@ function load({ list = [], projectEvents = [], route = ['agenda'], mode = 'week'
       connectCalendar: async (address, employeeId) => {
         connected.push([address, employeeId]);
         return connectCalendar ? connectCalendar(address, employeeId) : 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize?x';
-      }
+      },
+      /* event-invite.js's own dialog sends through this; its behaviour is
+         tested in tests/event-invite.test.mjs, so here it only has to exist. */
+      respondToEvent: async (id, response, options) => { replied.push([id, response, { ...options }]); }
     },
     open: (...args) => { opened.push(args); return openTab(); },
     location: { assign: url => locationAssigns.push(url) },
@@ -201,7 +205,10 @@ function load({ list = [], projectEvents = [], route = ['agenda'], mode = 'week'
   }
   vm.runInContext(`const RealDate = Date; var __now = ${NOW};
     Date = class extends RealDate { constructor(...a) { super(...(a.length ? a : [__now])); } static now() { return __now; } };`, context);
-  for (const file of ['agenda-model.js', 'dialog-forms.js', 'agenda-ui.js']) {
+  /* event-invite.js last, the way index.html loads it: it asks window.agendaUi
+     who may act on a calendar, and agenda-ui.js asks window.eventInvite what an
+     event's page says about a series, a reminder, a zone and a reply (0068). */
+  for (const file of ['agenda-model.js', 'dialog-forms.js', 'agenda-ui.js', 'event-invite.js']) {
     vm.runInContext(readFileSync(new URL(`../dist/${file}`, import.meta.url), 'utf8'), context);
   }
   return {
@@ -225,7 +232,7 @@ function load({ list = [], projectEvents = [], route = ['agenda'], mode = 'week'
     /* Fills in the dialog currently open's form fields, for the next submit(). */
     type: fields => { form.fields = fields; },
     shown, modals, navigated, toasts, removed, repaints, button, error, title, asks, retried, invitesAsked, kindButton, modal: context.modal,
-    synced, connected, opened, locationAssigns, loads2, monthsShown
+    synced, replied, connected, opened, locationAssigns, loads2, monthsShown
   };
 }
 
@@ -1075,4 +1082,82 @@ test('connecting needs an address, said on the dialog rather than sent to Micros
   assert.equal(h.connected.length, 0, 'nothing was sent to Microsoft');
   assert.equal(h.opened.length, 0, 'and no blank tab was left open either');
   assert.match(h.error.textContent, /address/i);
+});
+
+/* 0068: a series, a reminder, a zone and an invitation on the page. What each
+   of those SAYS is tested in tests/event-invite.test.mjs; what is tested here
+   is that the Agenda actually asks — a page that quietly stopped calling
+   event-invite.js would still pass that file's own tests.
+
+   The studio's calendar, which this session may act on (conn-1 is what
+   event() puts on every row), and a colleague's own, which it may not. */
+const inviteCalendars = [
+  { id: 'conn-1', label: 'hello@veyago.cloud', employeeId: null, ownerName: 'Studio', live: true },
+  { id: 'conn-3', label: 'ana@veyago.cloud', employeeId: 'e-ana', ownerName: 'Ana Lima', live: true }
+];
+
+test('one of a recurring series is marked wherever it is drawn, in words a screen reader gets too', () => {
+  const series = { recurrence_type: 'occurrence', recurrence_summary: 'Every week on Monday' };
+  const week = load({ list: [event('r', at(16, 10), at(16, 11), series)] }).view();
+  assert.match(week, /class="calendar-event [^"]*recurring/);
+  assert.match(week, /, repeats\./, 'the mark itself is aria-hidden, so the sentence carries it');
+
+  const schedule = load({ list: [event('r', at(16, 10), at(16, 11), series)], mode: 'schedule' }).view();
+  assert.match(schedule, /class="schedule-row recurring"/);
+  assert.match(schedule, /<small class="repeat-note">Repeats<\/small>/);
+});
+
+test('a one-off is marked as nothing at all', () => {
+  const week = load({ list: [event('o', at(16, 10), at(16, 11), { recurrence_type: 'singleInstance' })] }).view();
+  assert.doesNotMatch(week, /recurring|repeats/);
+});
+
+test('an event\'s page carries how often it repeats, its reminder, its zone and the reply given', () => {
+  const page = load({
+    list: [event('p', at(17, 14), at(17, 15), {
+      recurrence_type: 'occurrence', recurrence_summary: 'Every week on Monday',
+      reminder_on: true, reminder_minutes: 15,
+      time_zone: 'W. Europe Standard Time', time_zone_iana: 'Europe/Amsterdam',
+      response_status: 'accepted', is_organizer: false
+    })],
+    route: ['agenda', 'p'], calendars: inviteCalendars
+  }).view();
+  assert.match(page, /<span>Repeats<\/span><div>Every week on Monday<\/div>/);
+  assert.match(page, /<span>Reminder<\/span><div>15 minutes before<\/div>/);
+  assert.match(page, /<span>Booked in<\/span><div>Europe\/Amsterdam<\/div>/,
+    'the Windows name Graph sent is not what a page shows when there is an IANA one beside it');
+  assert.match(page, /<span>Your reply<\/span><div>You accepted<\/div>/);
+});
+
+test('an invitation offers Accept, Maybe and Decline, with the answer already given shown as the one in effect', () => {
+  const page = load({
+    list: [event('i', at(17, 14), at(17, 15), { response_status: 'tentativelyAccepted', is_organizer: false })],
+    route: ['agenda', 'i'], calendars: inviteCalendars
+  }).view();
+  assert.match(page, /class="panel content-panel invite-panel"/);
+  assert.match(page, /data-agenda-reply="i" data-agenda-answer="accepted" aria-pressed="false"/);
+  assert.match(page, /data-agenda-reply="i" data-agenda-answer="tentativelyAccepted" aria-pressed="true"/);
+});
+
+test('a meeting you organised, and a hand-made event, offer no reply panel at all', () => {
+  const organised = load({
+    list: [event('g', at(17, 14), at(17, 15), { response_status: 'organizer', is_organizer: true })],
+    route: ['agenda', 'g'], calendars: inviteCalendars
+  }).view();
+  assert.doesNotMatch(organised, /invite-panel|Your reply/);
+
+  const local = load({
+    list: [event('l', at(17, 14), at(17, 15), { connection_id: null, response_status: 'none' })],
+    route: ['agenda', 'l'], calendars: inviteCalendars
+  }).view();
+  assert.doesNotMatch(local, /invite-panel|Your reply|Repeats|Reminder|Booked in/,
+    'a hand-made event gains none of 0068\'s rows rather than four empty ones');
+});
+
+test('a colleague\'s own calendar offers no reply — the same line the backend draws (mayActOn)', () => {
+  const page = load({
+    list: [event('c', at(17, 14), at(17, 15), { connection_id: 'conn-3', response_status: 'notResponded', is_organizer: false })],
+    route: ['agenda', 'c'], calendars: inviteCalendars
+  }).view();
+  assert.doesNotMatch(page, /invite-panel/);
 });
