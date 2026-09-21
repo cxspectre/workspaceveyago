@@ -196,8 +196,17 @@
      largest column an event has and only its page reads it, so it comes
      with one event asked for by its id (event, eventInvitees) rather than
      with every week, project meeting and past meeting, which are loaded
-     again every two minutes. */
-  var EVENT_LIST_COLUMNS = EVENT_COLUMNS + ', connection_id, calendar_id, created_by, organizer_name, organizer_email, meeting_url, time_zone';
+     again every two minutes.
+     0068's eight are all small scalars, and they are in the LIST for a
+     reason: recurrence_type marks a series in the week, the day, the
+     schedule and the month, and the rest are read by an event's page, which
+     is very often drawn from a row a list already brought (agenda-ui.js
+     eventById). Following attendees' lead and fetching them separately would
+     mean a second round trip to print four words. The bar attendees clears —
+     "the largest column an event has" — is not one a boolean and an integer
+     come near. */
+  var EVENT_LIST_COLUMNS = EVENT_COLUMNS + ', connection_id, calendar_id, created_by, organizer_name, organizer_email, meeting_url, time_zone' +
+    ', recurrence_type, series_master_id, recurrence_summary, reminder_on, reminder_minutes, time_zone_iana, response_status, is_organizer';
   var EVENT_PAGE_COLUMNS = EVENT_LIST_COLUMNS + ', attendees';
 
   function agendaEvent(r) {
@@ -658,6 +667,39 @@
       });
     },
 
+    /* Every deal, a page at a time (everyRow), as companies and contacts are:
+       a studio's pipeline only ever grows, and the closed deals are the part
+       that never stops growing.
+
+       Open and closed alike — the board draws both, and the Won and Lost
+       columns ARE the history 0067 added the table for. Soft-deleted ones are
+       left out, the same as a removed company or contact.
+
+       Ordered by created_at then id, so every reload puts a column's cards in
+       the same order rather than PostgREST's own. The shape stays thin on
+       purpose: dealsModel.shapeDeal() builds what the views read, from these
+       same columns, and is tested without a browser. */
+    async deals() {
+      var rows = await everyRow(function (from, to) {
+        return sb()
+          .from('crm_deals')
+          .select('id, company_id, title, stage, value, currency, owner_id, ' +
+                  'expected_close, outcome, closed_at, notes, created_at')
+          .is('deleted_at', null)
+          .order('created_at')
+          .order('id')
+          .range(from, to);
+      }, 'deals');
+      return rows.map(function (r) {
+        return {
+          id: r.id, title: r.title,
+          stage: label(r.outcome || r.stage),
+          value: money(r.value, r.currency) || '—',
+          row: r
+        };
+      });
+    },
+
     /* Leads from the public "Get a quote" form (managers only — RLS returns []
        for anyone else, 0019). The site admin already lists these; this is the
        same table, read for the workspace's own Promote button. */
@@ -804,7 +846,18 @@
           .from('mail_threads')
           .select('id, connection_id, subject, snippet, folder, is_read, is_starred, message_count, ' +
                   'last_message_at, other_party_name, other_party_email, ticket_id, contact_id, ' +
-                  'contact:crm_contacts (full_name, email)');
+                  'contact:crm_contacts (full_name, email), ' +
+                  /* company_id and its client_number (0053) ride along on the
+                     conversation's own row, the same way a ticket already
+                     carries them (the tickets query above) — so the reading
+                     pane can quote the number beside a client's name without
+                     a second round trip, and read it straight off the row
+                     (mail.js's clientNumberOf, the twin of tickets-ui.js's).
+                     mail_threads.company_id is set by the CRM match on an
+                     address (0025/0055), widened to a sender's domain for
+                     inbound mail no contact claims (0059), or by hand
+                     (link_mail_thread). */
+                  'company_id, company:crm_companies (name, client_number)');
         /* Starred reaches past the folders listed: a conversation filed away in
            Outlook (0045) with a flag on it is still one you marked to come back
            to. Inbox and Sent load as themselves, so they are left out here. */
@@ -849,7 +902,7 @@
           time: day === 'Today' ? clockTime(r.last_message_at) : day,
           unread: !r.is_read, starred: r.is_starred, count: r.message_count,
           mailboxId: r.connection_id, folder: r.folder,
-          ticketId: r.ticket_id, contactId: r.contact_id,
+          ticketId: r.ticket_id, contactId: r.contact_id, companyId: r.company_id,
           /* Filled in by workspaceStore.loadThread() when this thread is
              opened. Absent, not empty, so the reader can tell "not loaded yet"
              from "this message has no body". */

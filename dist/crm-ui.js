@@ -1,5 +1,7 @@
-/* crm-ui.js — the CRM: its figures, the pipeline of companies, the companies
-   and contacts lists, and each company's and contact's page.
+/* crm-ui.js — the CRM: its figures, the companies and contacts lists, and
+   each company's and contact's page. The pipeline board itself is
+   deals-board.js's (crm_deals, 0067), which this file calls for the pipeline
+   tab, for a company's own deals, and for the deals the stat strip counts.
 
    As crm-model.js has them: the company is the unit, each once however many
    people work there; every stage has its column; everything is found by id,
@@ -16,6 +18,8 @@
    and lost deals and added euros to dollars; active clients counted people; a
    company with nobody at it was on no page; the board had three of the six
    stages; and a contact's page found projects and invoices by a matching name.
+   The board itself then moved onto deals (0067) and out into deals-board.js,
+   which loads after this file and is called from it.
 
    `crmUi` is what is worked out rather than drawn. The pages replace the one
    app.js drew, with the page helpers workspace.js defines, so this file loads
@@ -24,6 +28,7 @@ const crmUi = (function () {
   'use strict';
 
   const C = crmModel;
+  const D = dealsModel;
   const NONE = '—';
   const CODE = /^[A-Z]{3}$/;
   const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -127,31 +132,32 @@ const crmUi = (function () {
   }
 
   /* The strip at the top of the CRM, as statStrip() takes it: [label, value,
-     caption] for each figure. `contacts` and `companies` are the lists as
-     loaded — null when either did not load, and then what is worked out from
-     them is a dash, never a zero: a studio that has not answered yet is not
+     caption] for each figure. `contacts`, `companies` and `deals` are the
+     lists as loaded — null when one did not load, and then what is worked out
+     from it is a dash, never a zero: a studio that has not answered yet is not
      the same as one with nobody in it. `main` is the studio's currency, when
-     it is known. */
-  function stats(contacts, companies, main) {
+     it is known.
+
+     Pipeline value is the DEALS still to be won (0067), not the companies:
+     before crm_deals existed a client with two pieces of work in flight could
+     hold only one value between them, so this figure counted one deal per
+     company however many it really had, and counted nothing at all for the
+     second. Active clients stays a count of companies — a client is a
+     relationship, which is still what crm_companies.stage records. */
+  function stats(contacts, companies, main, deals) {
     const people = Array.isArray(contacts)
       ? ['Contacts', contacts.length, 'People in your network']
       : ['Contacts', NONE, 'Contacts did not load'];
+    const open = Array.isArray(deals) ? D.pipeline(deals).open : null;
+    const value = open
+      ? ['Pipeline value', open.totals.length ? moneyLine(open.totals, main) : NONE,
+        open.count ? `${plural(open.count, 'deal', 'deals')} still to win` : 'No open deals']
+      : ['Pipeline value', NONE, 'Deals did not load'];
     if (!Array.isArray(companies)) {
-      return Object.freeze([
-        people,
-        ['Pipeline value', NONE, 'Companies did not load'],
-        ['Active clients', NONE, 'Companies did not load']
-      ]);
+      return Object.freeze([people, value, ['Active clients', NONE, 'Companies did not load']]);
     }
-    const board = C.pipeline(companies);
-    const open = board.open;
-    const clients = board.columns.find(column => column.stage === 'client') || { count: 0 };
-    return Object.freeze([
-      people,
-      ['Pipeline value', open.totals.length ? moneyLine(open.totals, main) : NONE,
-        open.count ? `${plural(open.count, 'company', 'companies')} still to win` : 'No open deals'],
-      ['Active clients', clients.count, 'Companies you work with']
-    ]);
+    const clients = C.pipeline(companies).columns.find(column => column.stage === 'client') || { count: 0 };
+    return Object.freeze([people, value, ['Active clients', clients.count, 'Companies you work with']]);
   }
 
   /* The invoices sent to a contact: to their address, however either was
@@ -343,6 +349,12 @@ const crmUi = (function () {
 
   /* The pipeline (#crm), the companies (#crm/companies) or the contacts
      (#crm/contacts): each tab an address, with the figures above them all. */
+  const SEARCH_LABEL = Object.freeze({
+    pipeline: 'Search deals and their companies',
+    companies: 'Search companies and their people',
+    contacts: 'Search contacts'
+  });
+
   function listPage(tab, companies) {
     const query = queries.crm;
     const main = studioCurrency();
@@ -351,51 +363,27 @@ const crmUi = (function () {
       ? (people
         ? contactTable(C.contactList(people, companies).filter(person => C.matchesQuery(person, query)))
         : `<section class="panel">${empty('Contacts did not load', 'They are tried again by themselves.')}</section>`)
-      : companyView(tab, companies, query, main);
+      : tab === 'companies' ? companyView(companies, query)
+        : dealsBoardUi.view(companies, query, main);
+    /* "New deal" only where a deal can be added: it needs a company to pick
+       from, so it is offered once the companies have arrived. */
+    const newDeal = companies && companies.length
+      ? `<button class="btn" type="button" data-deal-new>${icon('plus')}New deal</button>` : '';
     return titlebar('Good relationships, in one place.', 'Keep the people, conversations, and work connected.',
-      `<button class="btn" type="button" data-crm-new-company>${icon('plus')}New company</button>` + createButton('Add contact', 'crm'))
-      + statStrip(stats(people, companies, main))
+      newDeal + `<button class="btn" type="button" data-crm-new-company>${icon('plus')}New company</button>` + createButton('Add contact', 'crm'))
+      + statStrip(stats(people, companies, main, dealsBoardUi.shaped(companies)))
       + subnav(crmTabs(), tab)
-      + `<div class="view-toolbar">${queryInput('crm', tab === 'contacts' ? 'Search contacts' : 'Search companies and their people')}</div>`
+      + `<div class="view-toolbar">${queryInput('crm', SEARCH_LABEL[tab] || SEARCH_LABEL.companies)}</div>`
       + body;
   }
 
-  /* The pipeline or the companies list: every company with its people and
-     work, narrowed by search and by the filter bar, then in the order picked. */
-  function companyView(tab, companies, query, main) {
+  /* The companies list: every company with its people and work, narrowed by
+     search and by the filter bar, then in the order picked. */
+  function companyView(companies, query) {
     if (!companies) return `<section class="panel">${empty('Companies did not load', 'They are tried again by themselves.')}</section>`;
     const matching = C.companyList(companies, sources(companies)).filter(entry => C.matchesQuery(entry, query));
     const entries = sortedBy(narrowedBy(matching, boardFilters), boardFilters.sort);
-    const narrowed = isNarrowed(query);
-    return filterBar() + (tab === 'companies' ? companyTable(entries, narrowed) : board(entries, main, narrowed));
-  }
-
-  /* A column for each of the six stages, each company on it once, with what
-     the column is worth in each currency. Every card and column carries what
-     a drop needs to know (data-crm-card, data-crm-column): the drag itself is
-     the browser's own, native to a link and a section, and cannot be run
-     without one — verified here by reading the handler below, not by a
-     browser test (tests/crm-ui.test.mjs's harness has no DOM to drag across). */
-  function board(entries, main, narrowed) {
-    const columns = C.pipeline(entries).columns.map(column => {
-      const id = `crm-stage-${esc(column.stage)}`;
-      const empty = narrowed ? 'Nothing here matches.' : 'No companies at this stage.';
-      return `<section class="board-column" aria-labelledby="${id}" data-crm-column="${esc(column.stage)}"><div class="board-heading"><h2 id="${id}">${esc(column.heading)}</h2>${countTag(column.count)}</div>`
-        + (column.totals.length ? `<p class="board-total">${esc(moneyLine(column.totals, main))}</p>` : '')
-        + `<div class="board-cards">${column.companies.map(companyCard).join('') || `<div class="board-empty">${esc(empty)}</div>`}</div></section>`;
-    });
-    return `<div class="project-board stage-board crm-board">${columns.join('')}</div>`;
-  }
-
-  function companyCard(entry) {
-    const people = entry.contacts;
-    const who = people.length ? people[0].name + (people.length > 1 ? ` and ${people.length - 1} more` : '') : 'Nobody here yet';
-    return `<a class="panel contact-card" href="#${esc(entry.route)}" draggable="true" data-crm-card="${esc(entry.id)}">`
-      + `<div class="card-top">${avatar(entry.name, null, 'contact-avatar')}${icon('chevron')}</div>`
-      + `<h3>${esc(entry.name)}</h3><p>${esc(who)}</p>`
-      + `<div class="contact-value"><strong>${esc(valueText(entry))}</strong><span>${entry.stage === 'client' ? 'Yearly value' : 'Deal value'}</span></div>`
-      + (entry.domain ? `<small>${esc(entry.domain)}</small>` : '')
-      + '</a>';
+    return filterBar() + companyTable(entries, isNarrowed(query));
   }
 
   /* A list with its heading and count, drawing at most ROW_LIMIT rows and
@@ -586,6 +574,7 @@ const crmUi = (function () {
     const id = esc(c.id);
     const notes = tab === 'activity';
     const actions = (c.stageLabel ? pill(c.stageLabel) : '')
+      + `<button class="btn" type="button" data-deal-new="${id}">${icon('plus')}Add deal</button>`
       + `<button class="btn" type="button" data-crm-new-contact="${id}">${icon('plus')}Add person</button>`
       + (isManagerNow() ? `<button class="btn" type="button" data-crm-merge-company="${id}">Merge…</button>` : '')
       + (isManagerNow() ? `<button class="btn" type="button" data-crm-delete-company="${id}">Remove company</button>` : '')
@@ -596,6 +585,7 @@ const crmUi = (function () {
       + linkedPanel('People', work.contacts.map(person =>
         [person.route, person.name,
           [person.row && person.row.is_primary ? 'Primary contact' : null, person.title, person.email].filter(Boolean).join(' · ') || 'Contact', 'crm']))
+      + dealsBoardUi.companyPanel(c.id, companies)
       + linkedPanel('Projects & support', [
         ...work.projects.map(project => ['projects/' + project.id, project.name, 'Project · ' + text(project.status), 'projects']),
         ...work.tickets.map(ticket => ['tickets/' + ticket.id, ticket.title, 'VYG-' + ticket.id + ' · ' + text(ticket.status), 'tickets'])
@@ -756,52 +746,6 @@ const crmUi = (function () {
     boardFilters.kind = '';
     boardFilters.owner = '';
     repaint();
-  });
-
-  /* Dragging a card onto another column's stage saves it there — the same
-     write the Edit company dialog's own Stage select makes (crm-forms.js),
-     so it follows the same rules. Native HTML5 drag and drop: a dragover
-     handler must call preventDefault() for a drop to be allowed onto an
-     element at all, and the id travels in the browser's own DataTransfer,
-     which nothing here invents. A real drag cannot be run in tests/crm-ui.
-     test.mjs's sandbox (no DOM to drag across); its harness calls these
-     three handlers directly with a stand-in event instead, and the case
-     that matters most — dropping a card back on the column it is already
-     on — is read here rather than run: shapeCompany(company).stage === stage
-     short-circuits before workspaceActions is ever reached. */
-  document.addEventListener('dragstart', e => {
-    const card = e.target.closest && e.target.closest('[data-crm-card]');
-    if (!card || !e.dataTransfer) return;
-    e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('text/plain', card.dataset.crmCard);
-  });
-
-  document.addEventListener('dragover', e => {
-    if (!(e.target.closest && e.target.closest('[data-crm-column]'))) return;
-    e.preventDefault();
-  });
-
-  document.addEventListener('drop', e => {
-    const column = e.target.closest && e.target.closest('[data-crm-column]');
-    if (!column) return;
-    e.preventDefault();
-    const id = e.dataTransfer && e.dataTransfer.getData('text/plain');
-    const stage = column.dataset.crmColumn;
-    const company = id && C.companyById(loadedCompanies(), id);
-    if (!company || !stage) return;
-    const shaped = C.shapeCompany(company);
-    if (shaped.stage === stage) return;
-    if (!window.workspaceStore || !workspaceStore.state.loaded) {
-      if (typeof toast === 'function') toast('Not yet: the workspace is still loading.');
-      return;
-    }
-    /* Only contacts and companies ever change from a CRM write — never mail,
-       tickets, invoices or anything else the workspace loads — so only those
-       two are asked for again rather than the whole workspace (store.js's
-       after(), the same fix crm-forms.js's own writes use below). */
-    workspaceStore.after(workspaceActions.updateCompany(id, { stage }), { only: ['contacts', 'companies'] })
-      .then(() => { if (typeof toast === 'function') toast(`${shaped.name} moved to ${C.stageLabel(stage)}.`); })
-      .catch(() => {});
   });
 
   /* The shared search box (workspace.js) redraws the whole page on every

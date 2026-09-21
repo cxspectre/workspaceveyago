@@ -190,12 +190,25 @@
     const connectButton = canConnect
       ? `<button type="button" id="mail-connect-button" class="btn mailbox-connect" data-mail-connect="">Connect a mailbox</button>` : '';
 
+    /* The back-fill for mail that arrived before its sender was in the CRM
+       (rematch_mail_threads, 0055 — written then, called by nothing until
+       now). Manager-only, and not because managers are trusted more with the
+       CRM: unlike linking one conversation somebody is already looking at,
+       this reaches into every mailbox at once, including ones the caller
+       cannot themselves read, which is exactly why the database makes it a
+       manager's call. Down here with the connections rather than over the
+       list, because it is a one-off piece of housekeeping, not something to
+       do while reading. */
+    const rematchButton = canConnect
+      ? '<button type="button" id="mail-rematch" class="text-btn mail-rematch" data-mail-rematch="">Match older mail to the CRM</button>'
+      : '';
+
     const newMessage = `<button class="btn btn-primary mail-new" data-action="compose">${icon('plus')}`
       + `${mailComposer.isOpen() ? 'Continue draft' : 'New message'}</button>`;
     return `<aside class="mail-folders">${newMessage}<div class="mailbox-switcher"><span class="eyebrow">MAILBOXES</span>${all}${each}</div>`
       /* A div, not <nav>: the sidebar's `nav a` rules would stack every folder
          into an icon-over-label tile. */
-      + `${select}<div class="mail-folder-list" role="navigation" aria-label="Folders">${folders}</div><div class="mail-folder-foot">${foot}${connectButton}</div></aside>`;
+      + `${select}<div class="mail-folder-list" role="navigation" aria-label="Folders">${folders}</div><div class="mail-folder-foot">${foot}${connectButton}${rematchButton}</div></aside>`;
   }
 
   /* ── The conversation list ─────────────────────────────────────────── */
@@ -477,14 +490,68 @@
     }).join('');
   }
 
+  /* A client number (0053), read straight off the conversation's own row
+     exactly the way tickets-ui.js's clientNumberOf reads it off a ticket's and
+     finance-ui.js off an invoice's: company:crm_companies already carries it
+     (queries.js), and mail-model.js — a peer file — is never asked. Only a
+     company the conversation is filed under directly (its own company_id, not
+     one reached through its contact) has one to quote here; a thread search
+     alone found carries no company row at all, so it simply has none. */
+  function clientNumberOf(thread) {
+    const company = (thread.row || {}).company;
+    return company && company.client_number != null ? company.client_number : null;
+  }
+
+  /* Who this conversation is with, as far as anything here knows: the CRM
+     contact it is linked to, else nobody. Kept apart from the address it came
+     from, below, because the two answer different questions — "is it linked"
+     and "is that person in the CRM at all". */
+  const contactOf = thread => (thread.contactId ? contacts.find(x => x.id === thread.contactId) : null) || null;
+
+  /* The other party's name and address, for linking and for adding them to the
+     CRM. queries.js already puts the other party on the row (0055:
+     never whoever wrote most recently), so this is only reading it — and an
+     address is what both actions actually need, so one without it offers
+     neither. */
+  function senderOf(thread) {
+    const row = thread.row || {};
+    const email = String(row.other_party_email || thread.email || '').trim();
+    return email ? { name: String(row.other_party_name || thread.sender || '').trim(), email } : null;
+  }
+
+  /* Who a conversation is with, the ticket it opened, and — new — the two
+     ways to say who it is with when the database guessed wrong or could not
+     guess. link_mail_thread and rematch_mail_threads have existed since 0055
+     with nothing in the workspace that ever called either.
+
+     The block is drawn even with nothing linked, which it never used to be:
+     "no contact" was exactly the case that needed a button, and hiding the
+     whole row meant the only conversations offering to be linked were the
+     ones already linked. */
   function related(thread) {
+    /* A thread only a search found knows none of this about itself
+       (M.threadFromSearchHit), so it is offered none of it rather than shown
+       a guess — the same rule the star and Mark as unread already follow. */
+    if (thread.fromSearch) return '';
     const ticket = thread.ticketId ? tickets.find(t => t.uuid === thread.ticketId) : null;
-    const contact = thread.contactId ? contacts.find(x => x.id === thread.contactId) : null;
-    if (!contact && !ticket) return '';
+    const contact = contactOf(thread);
+    const sender = senderOf(thread);
+    const known = sender ? M.contactByEmail(contacts, sender.email) : null;
+    const linkLabel = contact ? 'Change who this is with' : 'Link this conversation to a contact';
+    const linkButton = `<button type="button" id="mail-link-${esc(thread.id)}" class="text-btn related-action"`
+      + ` data-mail-link="${esc(thread.id)}">${linkLabel}</button>`;
+    /* Offered only for an address the CRM does not already hold: adding
+       somebody who is already in it is the one thing this button must not
+       quietly do twice. Where they ARE in it but the conversation is not
+       linked, the Link button above is the right one, and it is already there. */
+    const addButton = sender && !known
+      ? `<button type="button" id="mail-add-contact-${esc(thread.id)}" class="text-btn related-action"`
+        + ` data-mail-add-contact="${esc(thread.id)}">Add ${esc(sender.name || sender.email)} to the CRM</button>`
+      : '';
     return '<div class="reader-related"><span class="eyebrow">CONNECTED TO THIS CONVERSATION</span>'
       + (contact ? link('crm/' + contact.id, contact.company || contact.name, 'crm', 'related-chip') : '')
       + (ticket ? link('tickets/' + ticket.id, 'VYG-' + ticket.id, 'tickets', 'related-chip') : '')
-      + '</div>';
+      + `${linkButton}${addButton}</div>`;
   }
 
   /* A draft with nowhere else to be shown: a new message, or an answer whose
@@ -507,6 +574,30 @@
     if (!readFailed[thread.id]) return '';
     return '<div class="mail-load-note"><span role="status">Could not mark this conversation as read.</span>'
       + `<button type="button" id="mail-retry-read-${esc(thread.id)}" class="text-btn" data-mail-retry-read="${esc(thread.id)}">Retry</button></div>`;
+  }
+
+  /* Archive, Junk and Delete (M.MOVES, and move-mail-thread behind them).
+     Until now the workspace could only ever say where mail WAS, never put it
+     anywhere: a conversation dealt with stayed in the list for good unless
+     somebody went to Outlook. Delete moves to Deleted Items — the button says
+     so in its title, since a button labelled "Delete" beside a client's
+     correspondence had better be clear that it is not a permanent one.
+
+     Placed after "Create ticket", furthest from Reply, and pushed to the
+     right of the row (mail-file-away, workspace.css): filing a conversation
+     away and answering it are opposite intentions and should not sit
+     shoulder to shoulder.
+
+     Withheld for a thread only a search found, the same rule the star and
+     Mark as unread already follow: M.threadFromSearchHit knows neither its
+     folder nor its messages, so there is nothing here that could honestly
+     say whether there is anything left to move. */
+  function fileAwayButtons(thread) {
+    if (thread.fromSearch) return '';
+    return '<span class="mail-file-away">' + M.MOVES.map(move =>
+      `<button type="button" id="mail-move-${esc(move.to)}-${esc(thread.id)}" class="btn"`
+      + ` data-mail-move="${esc(move.to)}" data-thread-id="${esc(thread.id)}"`
+      + ` title="${esc(move.title)}" aria-label="${esc(move.title)}">${esc(move.label)}</button>`).join('') + '</span>';
   }
 
   function reader(thread, boxes, listLength, expanded) {
@@ -533,11 +624,22 @@
        id, so they work exactly as they do for a thread the list did load. */
     const toggles = thread.fromSearch ? '' : `<button id="mail-unread-${esc(thread.id)}" class="icon-btn" data-mail-unread="${esc(thread.id)}" title="Mark as unread" aria-label="Mark as unread">${icon('mail')}</button>`
       + `<button id="mail-star-${esc(thread.id)}" class="icon-btn${thread.starred ? ' starred' : ''}" data-mail-star="${esc(thread.id)}" aria-pressed="${thread.starred ? 'true' : 'false'}" title="${starLabel}" aria-label="${starLabel}">${thread.starred ? '★' : '☆'}</button>`;
+    /* The client number the CRM gave this company when it first reached the
+       client stage (0053) — shown on a company's page, on a ticket and on an
+       invoice, and until now nowhere in Mail, so the one place a client is
+       most often actually talked to was the one place their number was not to
+       hand. Beside the message count rather than in the toolbar: it belongs to
+       the conversation's subject line, not to the mailbox it arrived in. */
+    const clientNumber = clientNumberOf(thread);
+    const threadMeta = [
+      thread.count > 1 ? `${thread.count} messages` : '',
+      clientNumber != null ? `Client No. ${clientNumber}` : ''
+    ].filter(Boolean).join(' · ');
     return `<div class="reader" data-thread-id="${esc(thread.id)}"><div class="reader-toolbar">`
       + `<span>${box ? pill(box.address, box.kind === 'personal' ? 'purple' : 'blue') : ''}</span><div class="reader-tools">${expandButton(expanded)}`
       + `${toggles}`
       + `</div></div><div class="reader-content">${readFailedNote(thread)}<h2>${esc(thread.subject)}</h2>`
-      + (thread.count > 1 ? `<small class="mail-thread-count">${thread.count} messages</small>` : '')
+      + (threadMeta ? `<small class="mail-thread-count">${esc(threadMeta)}</small>` : '')
       /* An answer being written sits above the conversation, where it is seen. */
       + (mailComposer.threadId() === thread.id ? '<div data-composer-slot></div>' : '')
       + `<div class="mail-conversation">${conversation(thread)}</div><div class="mail-actions">`
@@ -545,6 +647,7 @@
       + `<button class="btn" data-mail-answer="replyAll" data-thread-id="${esc(thread.id)}">Reply all</button>`
       + `<button class="btn" data-mail-answer="forward" data-thread-id="${esc(thread.id)}">${icon('arrow')}Forward</button>`
       + `<button class="btn" data-action="email-ticket" data-thread-id="${esc(thread.id)}">${icon('tickets')}${hasTicket ? 'Open ticket' : 'Create ticket'}</button>`
+      + `${fileAwayButtons(thread)}`
       + `</div>${related(thread)}</div></div>`;
   }
 
@@ -766,6 +869,133 @@
         button.focus({ preventScroll: true });
         toast(err.message || 'That did not save.');
       });
+  }
+
+  /* ── Filing a conversation away ────────────────────────────────────── */
+
+  /* Not optimistic, like every other write here: the conversation moves when
+     move-mail-thread says Outlook took it. There is deliberately no confirm
+     step, including for Delete — nothing is destroyed, the mail goes to
+     Deleted Items and Outlook itself asks for no confirmation either; a
+     dialog in front of a reversible move would only teach people to click
+     through dialogs.
+
+     The button is disabled directly rather than through a render, the same
+     reason toggleStar gives: a redraw mid-flight would throw away the very
+     button holding the click. */
+  function moveThread(button) {
+    const thread = threadById(button.dataset.threadId);
+    const move = M.moveFor(button.dataset.mailMove);
+    if (!thread || !move || !live()) return;
+    button.disabled = true;
+    workspaceActions.moveMailThread(thread.id, move.to)
+      .then(result => {
+        /* Nothing to move: the conversation was already where it was being
+           sent. Said, not treated as a success that visibly did nothing —
+           and the button comes back, since nothing below it changes and no
+           render will put a fresh one there. */
+        if (result && result.moved === 0) {
+          button.disabled = false;
+          toast(result.reason || move.done);
+          return;
+        }
+        /* The folder the database actually settled on, which is not always
+           the one asked for: a conversation still holding a reply of ours in
+           Sent goes to Sent, not to Junk (0045's rule, reused by 0069). */
+        const landed = (result && result.thread && result.thread.folder) || move.to;
+        replaceThread(thread.id, { folder: landed, row: { folder: landed } });
+        const route = M.parseMailRoute(routeParts);
+        /* Close the reader: the conversation has left this folder, and an
+           open pane showing mail that is no longer in the list is the same
+           confusion marking one unread already navigates away from. */
+        navigate(M.mailRoute({ mailbox: route.mailbox, folder: route.folder }));
+        toast(result && result.reason ? `${move.done} ${result.reason}` : move.done);
+      })
+      .catch(err => {
+        button.disabled = false;
+        button.focus({ preventScroll: true });
+        toast(err.message || 'That conversation was not moved.');
+      });
+  }
+
+  /* ── Saying who a conversation is with ─────────────────────────────── */
+
+  /* link_mail_thread (0055) has been in the database since it was written and
+     has never had a button. The company follows from the contact in the
+     database, so there is nothing to pick here but the person. */
+  function openLinkContact(thread) {
+    const current = thread.contactId || '';
+    const people = (contacts || []).filter(c => c && c.id)
+      .map(c => ({ value: c.id, label: c.company ? `${c.name} · ${c.company}` : c.name }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+    showModal('MAIL · CONTACT', `<h2>Who is this conversation with?</h2>`
+      + '<p class="form-note">The company follows from the contact. Leaving it blank unlinks the conversation without changing the contact.</p>'
+      + dialogForms.form('mail-link-form',
+        dialogForms.field('Contact', '<select name="contactId" autofocus><option value="">Nobody in the CRM</option>'
+          + dialogForms.options(people, current) + '</select>'),
+        'Save'));
+    const form = document.getElementById('mail-link-form');
+    form.addEventListener('submit', submitted => {
+      submitted.preventDefault();
+      dialogForms.quiet(form);
+      const contactId = String(new FormData(form).get('contactId') || '');
+      if (contactId === current) { dialogForms.closeDialog(form); toast('Nothing changed.'); return; }
+      /* Only mail comes back changed — the CRM itself is untouched — so only
+         that part is asked for again (store.js's after()). */
+      dialogForms.sending(form, () => workspaceActions.linkMailThread(thread.id, contactId || null), () => {
+        const person = contactId ? (contacts.find(c => c.id === contactId) || {}).name : null;
+        toast(person ? `This conversation is with ${person}.` : 'Unlinked from the CRM.');
+      }, { record: `mail-link:${thread.id}`, part: ['mail'], only: ['mail'] });
+    });
+  }
+
+  /* "Add sender to the CRM": the CRM's own New contact dialog, pre-filled
+     with who this conversation is with — crm-forms.js's openContact, not a
+     second copy of a form that already knows about look-alike records,
+     companies matched by name and create_contact_with_company (0053). Once it
+     has added them, the conversation is linked to them, which is the whole
+     point of having pressed it here rather than in the CRM. */
+  function addSenderToCrm(thread) {
+    const sender = senderOf(thread);
+    if (!sender) { toast('There is no address on this conversation to add.'); return; }
+    if (!window.crmForms || typeof crmForms.openContact !== 'function') {
+      toast('The CRM is still loading. Try again in a moment.');
+      return;
+    }
+    crmForms.openContact(null, '', {
+      name: sender.name, email: sender.email,
+      /* Told to link this conversation to whoever it just made. crm-forms.js
+         does the adding; this file does the linking, so neither has to know
+         the other's rules. */
+      onAdded: made => {
+        const contactId = made && made.contactId;
+        if (!contactId) return;
+        workspaceActions.linkMailThread(thread.id, contactId)
+          .then(() => Promise.resolve(workspaceStore.reload()))
+          .then(() => { if (page === 'mail') render(); })
+          .catch(err => toast(err.message || 'They were added, but this conversation was not linked to them.'));
+      }
+    });
+  }
+
+  /* The back-fill, for a manager (rematch_mail_threads, 0055). Behind a
+     confirm, not because it is dangerous — it only ever fills a blank, and
+     never overwrites a link somebody made by hand — but because it touches
+     every mailbox at once, including ones the person pressing it cannot read,
+     and that is worth saying once in words before it runs. */
+  function openRematch() {
+    showModal('MAIL · CRM', '<h2>Match older mail to the CRM?</h2>'
+      + '<p class="form-note">Every conversation with nobody on it yet is matched against the CRM by the other party’s address — across every mailbox, including ones you cannot read yourself. A conversation someone linked by hand is left alone.</p>'
+      + dialogForms.form('mail-rematch-form', '', 'Match older mail'));
+    const form = document.getElementById('mail-rematch-form');
+    form.addEventListener('submit', submitted => {
+      submitted.preventDefault();
+      dialogForms.quiet(form);
+      dialogForms.sending(form, () => workspaceActions.rematchMailThreads(), matched => {
+        toast(matched ? `${matched} conversation${matched === 1 ? '' : 's'} matched to the CRM.`
+          : 'Nothing left to match: every conversation with an address the CRM knows is already linked.');
+      }, { record: 'mail-rematch', part: ['mail'], only: ['mail'] });
+    });
   }
 
   /* ── Writing ───────────────────────────────────────────────────────── */
@@ -1079,6 +1309,23 @@
       return;
     }
     if (e.target.closest('[data-mail-mark-all-read]')) { e.preventDefault(); markAllRead(currentThreadList); return; }
+    const move = e.target.closest('[data-mail-move]');
+    if (move) { e.preventDefault(); moveThread(move); return; }
+    const linkContact = e.target.closest('[data-mail-link]');
+    if (linkContact) {
+      e.preventDefault();
+      const thread = threadById(linkContact.dataset.mailLink);
+      if (thread) openLinkContact(thread);
+      return;
+    }
+    const addContact = e.target.closest('[data-mail-add-contact]');
+    if (addContact) {
+      e.preventDefault();
+      const thread = threadById(addContact.dataset.mailAddContact);
+      if (thread) addSenderToCrm(thread);
+      return;
+    }
+    if (e.target.closest('[data-mail-rematch]')) { e.preventDefault(); openRematch(); return; }
     const star = e.target.closest('[data-mail-star]');
     if (star) { e.preventDefault(); toggleStar(star); return; }
     const unread = e.target.closest('[data-mail-unread]');

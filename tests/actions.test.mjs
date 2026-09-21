@@ -167,6 +167,79 @@ test('a conversation the function cannot find is an error, not a quiet write to 
     'writing the thread row directly would be undone by the next sync, and never reach Outlook');
 });
 
+/* ── Moving a conversation (0069) ─────────────────────────────────────── */
+
+test('archiving goes through move-mail-thread, and nothing is written here', async () => {
+  const ws = workspace(async () => ({ data: { ok: true, moved: 2, thread: { id: THREAD, folder: 'archive' } }, error: null }));
+  const result = await ws.actions.moveMailThread(THREAD, 'archive');
+  assert.equal(result.moved, 2);
+  assert.deepEqual(ws.invoked, [{ name: 'move-mail-thread', body: { threadId: THREAD, to: 'archive' } }]);
+  assert.equal(ws.written.length, 0,
+    'the browser has no write on mail_threads.folder (0038), and a move it recorded alone would be undone by the next delta');
+});
+
+test('junk and delete are the other two, spelled the way the database spells them', async () => {
+  for (const to of ['spam', 'trash']) {
+    const ws = workspace(async () => ({ data: { ok: true, moved: 1 }, error: null }));
+    await ws.actions.moveMailThread(THREAD, to);
+    assert.equal(ws.invoked[0].body.to, to);
+  }
+});
+
+/* The owner named three folders. Anything else is refused before a request is
+   made — the Edge Function and graph-guard.ts refuse it again regardless. */
+test('nowhere else is a place to send a conversation', async () => {
+  for (const to of ['inbox', 'sent', 'deleteditems', 'starred', '', null]) {
+    const ws = workspace(async () => ({ data: {}, error: null }));
+    await assert.rejects(ws.actions.moveMailThread(THREAD, to), { message: /archived, marked as junk or deleted/ });
+    assert.equal(ws.invoked.length, 0, String(to));
+  }
+});
+
+test('a mailbox that cannot be reached is a refusal in the function\'s own words', async () => {
+  const ws = workspace(async () => httpError(409, { error: 'This mailbox is disconnected, so nothing can be moved in Outlook.' }));
+  await assert.rejects(ws.actions.moveMailThread(THREAD, 'trash'),
+    { message: 'This mailbox is disconnected, so nothing can be moved in Outlook.' });
+  assert.equal(ws.written.length, 0);
+});
+
+/* ── Mail and the CRM (0055, finally called) ──────────────────────────── */
+
+test('linking a conversation calls link_mail_thread; the company follows in the database, not here', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }), {
+    rpc: () => ({ data: { id: THREAD, contact_id: 'c1', company_id: 'co1' }, error: null })
+  });
+  const row = await ws.actions.linkMailThread(THREAD, 'c1');
+  assert.deepEqual([...ws.called].map(c => ({ ...c })), [{ name: 'link_mail_thread', args: { p_thread: THREAD, p_contact: 'c1' } }]);
+  assert.equal(row.company_id, 'co1');
+  assert.equal(ws.written.length, 0, 'never a direct write to mail_threads.contact_id');
+});
+
+test('no contact means null, which is how the database clears one', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }), { rpc: () => ({ data: null, error: null }) });
+  await ws.actions.linkMailThread(THREAD, '');
+  assert.equal(ws.called[0].args.p_contact, null);
+});
+
+test('a refusal from link_mail_thread is said in a sentence, not as a raw database error', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }), {
+    rpc: () => ({ data: null, error: { message: 'That contact is not in the CRM.' } })
+  });
+  await assert.rejects(ws.actions.linkMailThread(THREAD, 'gone'), { message: /Could not link this conversation: That contact is not in the CRM./ });
+});
+
+test('the back-fill is a manager\'s, and is refused here before it is refused again in the database', async () => {
+  const notManager = workspace(async () => ({ data: null, error: null }), { manager: false, rpc: () => ({ data: 3, error: null }) });
+  await assert.rejects(notManager.actions.rematchMailThreads(), { message: /Only an owner or admin/ });
+  assert.equal(notManager.called.length, 0, 'it reaches into every mailbox at once — including ones the caller cannot read');
+});
+
+test('a manager\'s back-fill answers how many conversations it matched', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }), { rpc: () => ({ data: 7, error: null }) });
+  assert.equal(await ws.actions.rematchMailThreads(), 7);
+  assert.deepEqual({ ...ws.called[0].args }, { p_limit: 500 });
+});
+
 /* ── Mail attachments ─────────────────────────────────────────────────── */
 
 test('an attachment\'s bytes come back from mail-attachment-content, as the blob supabase-js hands over', async () => {
@@ -276,6 +349,79 @@ test('with no connection id, both still go straight to the table exactly as befo
   await ws.actions.deleteEvent('ev-1', undefined);
   assert.deepEqual(ws.written.map(w => [w.table, w.what]), [['calendar_events', 'update'], ['calendar_events', 'delete']]);
   assert.equal(ws.invoked.length, 0);
+});
+
+/* ── Answering an invitation (0068) ──────────────────────────────────────── */
+
+test('a reply always goes through respond-calendar-event, never the table', async () => {
+  /* 0057's column guard holds a non-manager to an event's title, times, place
+     and details, and response_status is deliberately not among them: a reply
+     written here that never reached Outlook is an answer no organiser was ever
+     told about. So there is no table path to fall back to, for anyone. */
+  const ws = workspace(async () => ({ data: { ok: true, response: 'accepted', scope: 'occurrence', updated: 1 }, error: null }));
+  const result = await ws.actions.respondToEvent('ev-1', 'accepted');
+  assert.deepEqual(result, { ok: true, response: 'accepted', scope: 'occurrence', updated: 1 });
+  assert.deepEqual(ws.invoked, [{
+    name: 'respond-calendar-event',
+    body: { eventId: 'ev-1', response: 'accepted', scope: 'occurrence', comment: null, sendResponse: true }
+  }], 'this date by default, the organiser told by default, and no note unless one was written');
+  assert.equal(ws.written.length, 0);
+});
+
+test('a reply can answer for the whole series, and carry a note to the organiser', async () => {
+  const ws = workspace(async () => ({ data: { ok: true, updated: 12 }, error: null }));
+  await ws.actions.respondToEvent('ev-1', 'declined', { scope: 'series', comment: '  Clashes with the studio day.  ' });
+  assert.deepEqual(ws.invoked[0].body, {
+    eventId: 'ev-1', response: 'declined', scope: 'series',
+    comment: 'Clashes with the studio day.', sendResponse: true
+  });
+});
+
+test('a scope nobody offers answers for this date rather than for every one of them', async () => {
+  const ws = workspace(async () => ({ data: { ok: true }, error: null }));
+  await ws.actions.respondToEvent('ev-1', 'tentativelyAccepted', { scope: 'everything' });
+  assert.equal(ws.invoked[0].body.scope, 'occurrence');
+});
+
+test('only the three answers Graph knows are sent, in Graph\'s own spelling', async () => {
+  const ws = workspace(async () => ({ data: { ok: true }, error: null }));
+  for (const bad of ['maybe', 'Accepted', 'organizer', 'notResponded', '', undefined]) {
+    await assert.rejects(ws.actions.respondToEvent('ev-1', bad), { message: 'A reply is Accept, Maybe or Decline.' });
+  }
+  await assert.rejects(ws.actions.respondToEvent('', 'accepted'), /which event/i);
+  assert.equal(ws.invoked.length, 0, 'refused here, so Outlook is never asked');
+});
+
+test('a note longer than the function would take is refused before the round trip', async () => {
+  const ws = workspace(async () => ({ data: { ok: true }, error: null }));
+  await assert.rejects(ws.actions.respondToEvent('ev-1', 'accepted', { comment: 'x'.repeat(1001) }), /1000 characters/);
+  assert.equal(ws.invoked.length, 0);
+});
+
+test('the organiser can be left untold, but only by saying so', async () => {
+  const ws = workspace(async () => ({ data: { ok: true }, error: null }));
+  await ws.actions.respondToEvent('ev-1', 'accepted', { sendResponse: false });
+  assert.equal(ws.invoked[0].body.sendResponse, false);
+});
+
+test('a refusal is said in respond-calendar-event\'s own words', async () => {
+  const ws = workspace(async () => httpError(409, { error: 'You organised this meeting, so there is no invitation to answer.' }));
+  await assert.rejects(ws.actions.respondToEvent('ev-1', 'accepted'),
+    { message: 'You organised this meeting, so there is no invitation to answer.' });
+});
+
+test('an answer that never arrived is still a refusal, and never a quiet success', async () => {
+  /* The transport's own words win over the fallback here, exactly as they do
+     for every other function this file calls (errorMessage). What matters is
+     that the reply is REFUSED rather than resolving: a decline that silently
+     "worked" would leave an organiser waiting forever. */
+  const ws = workspace(async () => unreachable);
+  await assert.rejects(ws.actions.respondToEvent('ev-1', 'declined'), /Failed to send a request/);
+});
+
+test('a gateway page rather than JSON falls back to this action\'s own sentence', async () => {
+  const ws = workspace(async () => httpError(502, undefined));
+  await assert.rejects(ws.actions.respondToEvent('ev-1', 'declined'), { message: 'Edge Function returned a non-2xx status code' });
 });
 
 /* ── Connecting and syncing a calendar (0057) ────────────────────────────── */
@@ -414,6 +560,66 @@ test('a new company is added in the currency and with the owner it was given, or
   assert.equal('currency' in ws.written[1].change, false, 'the column\'s own default');
   assert.equal(ws.written[1].change.owner_id, 'emp-1', 'nothing said: whoever adds it');
   assert.equal(ws.written[2].change.owner_id, null, '"No owner" is no owner');
+});
+
+test('a new deal is added for its company, in the currency and with the owner it was given, or else the defaults', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }));
+  await ws.actions.createDeal({ companyId: 'co-1', title: '  Renewal  ', stage: 'proposal', value: 12000, currency: 'EUR', expectedClose: '2026-11-30' });
+  await ws.actions.createDeal({ companyId: 'co-1', title: 'Audit' });
+  await ws.actions.createDeal({ companyId: 'co-1', title: 'Pilot', ownerId: null });
+  assert.deepEqual(ws.written.map(w => [w.table, w.what]), [['crm_deals', 'insert'], ['crm_deals', 'insert'], ['crm_deals', 'insert']]);
+  assert.equal(ws.written[0].change.title, 'Renewal', 'the spaces around a typed name are not part of it');
+  assert.equal(ws.written[0].change.company_id, 'co-1');
+  assert.equal(ws.written[0].change.currency, 'EUR');
+  assert.equal(ws.written[0].change.expected_close, '2026-11-30');
+  assert.equal('currency' in ws.written[1].change, false, 'the column\'s own default');
+  assert.equal(ws.written[1].change.stage, 'lead', 'a deal starts at the first stage');
+  assert.equal(ws.written[1].change.value, null);
+  assert.equal(ws.written[1].change.owner_id, 'emp-1', 'nothing said: whoever adds it');
+  assert.equal(ws.written[2].change.owner_id, null, '"No owner" is no owner');
+  for (const written of ws.written) {
+    assert.equal('outcome' in written.change, false, 'a new deal is always open: won and lost are decided later');
+    assert.equal('closed_at' in written.change, false);
+  }
+});
+
+test('a deal cannot be added without a company or a name, and neither reaches the database', async () => {
+  const ws = workspace(async () => ({ data: null, error: null }));
+  await assert.rejects(ws.actions.createDeal({ title: 'Renewal' }), { message: 'Pick the company this deal is for.' });
+  await assert.rejects(ws.actions.createDeal({ companyId: 'co-1', title: '   ' }), { message: 'A deal needs a name.' });
+  assert.equal(ws.written.length, 0, 'refused before it reaches the database');
+});
+
+test('saving a deal writes only the columns given, to that deal while it is still there, and a refusal is said as one', async () => {
+  const saved = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: 'd-1' }] });
+  assert.equal((await saved.actions.updateDeal('d-1', { stage: 'proposal' })).id, 'd-1');
+  assert.equal((await saved.actions.updateDeal('d-1', { outcome: 'won', closed_at: '2026-09-14T00:00:00Z' })).id, 'd-1');
+  assert.deepEqual(saved.written.map(w => [w.table, w.what, w.change, w.where]), [
+    ['crm_deals', 'update', { stage: 'proposal' }, [['id', 'd-1'], ['deleted_at', { is: null }]]],
+    ['crm_deals', 'update', { outcome: 'won', closed_at: '2026-09-14T00:00:00Z' }, [['id', 'd-1'], ['deleted_at', { is: null }]]]
+  ], 'a deal a manager removed is not changed back into view');
+  const refused = workspace(async () => ({ data: null, error: null }), { rows: () => [] });
+  await assert.rejects(refused.actions.updateDeal('d-1', { stage: 'proposal' }),
+    { message: 'The deal was not saved: it has been removed, or you may not change it.' });
+  const nothing = workspace(async () => ({ data: null, error: null }));
+  await assert.rejects(nothing.actions.updateDeal('d-1', {}), { message: 'Nothing to save.' });
+  assert.equal(nothing.written.length, 0);
+});
+
+test('removing a deal is a manager-only soft delete, and one already removed is a refusal', async () => {
+  const removed = workspace(async () => ({ data: null, error: null }), { rows: () => [{ id: 'd-1' }] });
+  await removed.actions.deleteDeal('d-1');
+  assert.deepEqual(removed.written.map(w => [w.table, w.what]), [['crm_deals', 'update']]);
+  assert.ok('deleted_at' in removed.written[0].change);
+  assert.deepEqual(removed.written[0].where, [['id', 'd-1'], ['deleted_at', { is: null }]]);
+
+  const staff = workspace(async () => ({ data: null, error: null }), { manager: false });
+  await assert.rejects(staff.actions.deleteDeal('d-1'), { message: 'Only an owner or admin can remove a deal.' });
+  assert.equal(staff.written.length, 0, 'refused before it reaches the database');
+
+  const already = workspace(async () => ({ data: null, error: null }), { rows: () => [] });
+  await assert.rejects(already.actions.deleteDeal('d-1'),
+    { message: 'The deal was not removed: it has been removed already, or only an owner or admin can remove one.' });
 });
 
 test('a company at a domain another already has says so plainly, not the database\'s own words', async () => {

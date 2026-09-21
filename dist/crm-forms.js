@@ -113,14 +113,22 @@ const crmForms = (function () {
 
   /* A contact's fields, filled in from them (crmModel.shapeContact). A company
      they are at that has left the CRM stays chosen, so saving their title does
-     not quietly take it away; a new contact may also be at a new company. */
-  function contactFields(person, companies, { allowNew = false, companyId = '' } = {}) {
+     not quietly take it away; a new contact may also be at a new company.
+
+     `start` is what a NEW contact's name and address begin as — how Mail's
+     "Add sender to the CRM" hands over who the conversation is with, so
+     nobody retypes an address they are looking at. It is only ever a starting
+     point: every field stays editable and every rule below still runs on what
+     is actually submitted. An existing contact ignores it outright; their own
+     record is not something a caller gets to pre-fill. */
+  function contactFields(person, companies, { allowNew = false, companyId = '', start = {} } = {}) {
+    const began = person ? { name: '', email: '' } : { name: text(start.name), email: text(start.email) };
     const choices = companies.map(co => C.shapeCompany(co)).sort((a, b) => a.name.localeCompare(b.name))
       .map(co => ({ value: co.id, label: co.name }));
     const current = person ? companyIdOf(person) : companyId;
     const gone = current && !choices.some(o => o.value === current) ? [{ value: current, label: 'Current company (no longer in the CRM)' }] : [];
-    return field('Name', `<input name="name" required maxlength="200" value="${esc(person ? person.name : '')}">`)
-      + field('Email', `<input type="email" name="email" value="${esc(person ? person.email : '')}">`)
+    return field('Name', `<input name="name" required maxlength="200" value="${esc(person ? person.name : began.name)}">`)
+      + field('Email', `<input type="email" name="email" value="${esc(person ? person.email : began.email)}">`)
       + '<div class="form-pair">'
       + field('Phone', `<input type="tel" name="phone" value="${esc(person ? person.phone : '')}">`)
       + field('Title', `<input name="title" value="${esc(person ? person.title : '')}">`)
@@ -254,7 +262,7 @@ const crmForms = (function () {
     return domain && !C.isPublicMail(domain) ? domain : '';
   }
 
-  function submitNewContact(form) {
+  function submitNewContact(form, added) {
     const v = values(form);
     quiet(form);
     const atNew = v.companyId === NEW_COMPANY;
@@ -284,6 +292,12 @@ const crmForms = (function () {
       companyId: atNew ? null : person.values.companyId, companyName: atNew ? companyName : null
     }), made => {
       toast(`${person.values.fullName} added.`);
+      /* Opened from somewhere with its own idea of what happens next — Mail,
+         which links the conversation to whoever was just added — that caller
+         says so, and the CRM does NOT then navigate away from the page they
+         pressed it on. Opened from the CRM, as it always was, there is no
+         such caller and the contact's own page is where to go. */
+      if (added) { added(made); return; }
       navigate(C.contactRoute(made.contactId));
     }, { only: ['contacts', 'companies'] });
   }
@@ -305,11 +319,21 @@ const crmForms = (function () {
     sending(form, () => workspaceActions.updateContact(opened.id, edit.changes), () => toast(`${name} saved.`), { only: ['contacts'] });
   }
 
-  function openContact(contact, companyId) {
+  /* `over` is for a caller outside the CRM — Mail's "Add sender to the CRM",
+     so far: { name, email } to start a NEW contact's fields with, and
+     onAdded(made) for what happens once they exist, in place of walking off
+     to their page. Every rule this dialog enforces is unaffected by either:
+     the fields are a starting point, and onAdded runs after the same write
+     the CRM's own path makes. */
+  function openContact(contact, companyId, over = {}) {
     const companies = loadedCompanies();
     const person = contact ? C.shapeContact(contact, companies) : null;
     showModal(person ? 'CRM · CONTACT' : 'CRM · NEW CONTACT', `<h2>${person ? `Edit ${esc(person.name)}` : 'New contact'}</h2>`
-      + dialogForm('crm-contact-form', contactFields(person, companies, { allowNew: !person, companyId: companyId || '' }),
+      + dialogForm('crm-contact-form',
+        contactFields(person, companies, {
+          allowNew: !person, companyId: companyId || '',
+          start: { name: over.name, email: over.email }
+        }),
         person ? 'Save contact' : 'Add contact'));
     const form = document.getElementById('crm-contact-form');
     drawn.set(form, values(form));
@@ -319,7 +343,7 @@ const crmForms = (function () {
     form.addEventListener('submit', e => {
       e.preventDefault();
       if (contact) submitEditContact(form, contact);
-      else submitNewContact(form);
+      else submitNewContact(form, typeof over.onAdded === 'function' ? over.onAdded : null);
     });
   }
 

@@ -153,6 +153,39 @@ test('mailThreads asks for the other party, and no longer for whoever sent most 
   assert.ok(!select.includes('last_from_name'), 'the renamed column is gone, not just supplemented');
 });
 
+/* A client number (0053) already showed on a company's page, on a ticket and
+   on an invoice — everywhere a client appears except the one place they are
+   most often actually talked to. It rides along on the conversation's own row,
+   the way a ticket already carries it, rather than costing a second round
+   trip per conversation opened. */
+test('mailThreads asks for the conversation\'s company and its client number', async () => {
+  const { data, queries } = loadTables();
+  await data.mailThreads(['inbox'], ['box-1']);
+  const select = queries[0].calls.find(([method]) => method === 'select')[1];
+  assert.ok(select.includes('company_id'), 'asks which company the conversation is filed under');
+  assert.ok(select.includes('company:crm_companies (name, client_number)'), 'and for that company\'s client number');
+});
+
+test('a conversation filed under a client carries its number; one under nobody carries none', async () => {
+  const { data } = loadTables(table => (table !== 'mail_threads' ? [] : [
+    { id: 't1', connection_id: 'box-1', folder: 'inbox', message_count: 1, last_message_at: '2026-09-10T09:00:00Z',
+      subject: 'Renewal', snippet: 'x', is_read: true, is_starred: false,
+      other_party_name: 'Ana Lima', other_party_email: 'ana@northline.example',
+      ticket_id: null, contact_id: null, contact: null,
+      company_id: 'co1', company: { name: 'Northline', client_number: 1042 } },
+    { id: 't2', connection_id: 'box-1', folder: 'inbox', message_count: 1, last_message_at: '2026-09-09T09:00:00Z',
+      subject: 'Intro', snippet: 'x', is_read: true, is_starred: false,
+      other_party_name: null, other_party_email: 'stranger@newbiz.example',
+      ticket_id: null, contact_id: null, contact: null, company_id: null, company: null }
+  ]));
+  const { threads } = await data.mailThreads(['inbox'], ['box-1']);
+  const byId = Object.fromEntries(threads.map(t => [t.id, t]));
+  assert.equal(byId.t1.companyId, 'co1');
+  assert.equal(byId.t1.row.company.client_number, 1042, 'read off the row, as tickets-ui.js reads a ticket\'s');
+  assert.equal(byId.t2.companyId, null);
+  assert.equal(byId.t2.row.company, null);
+});
+
 test('a thread shows the OTHER party — never whoever wrote most recently — and a CRM contact outranks both', async () => {
   const { data } = loadTables(table => (table !== 'mail_threads' ? [] : [
     { id: 't1', connection_id: 'box-1', folder: 'inbox', message_count: 2, last_message_at: '2026-09-10T09:00:00Z',
@@ -624,7 +657,15 @@ test('one event is asked for by its id — a uuid, and nothing else — and none
   assert.equal(found.id, EV);
   assert.equal(found.title, 'Pitch');
   assert.deepEqual(plain(queries[0].calls.find(([method]) => method === 'eq')), ['eq', 'id', EV]);
-  assert.match(queries[0].calls.find(([method]) => method === 'select')[1], /connection_id, calendar_id, created_by, organizer_name, organizer_email, meeting_url, time_zone, attendees/, 'every column its page reads');
+  assert.match(queries[0].calls.find(([method]) => method === 'select')[1], /connection_id, calendar_id, created_by, organizer_name, organizer_email, meeting_url, time_zone/, 'every column its page reads');
+  assert.match(queries[0].calls.find(([method]) => method === 'select')[1], /\battendees\b/, 'who is invited, which only one event asked for by its id brings');
+  /* 0068: how often it repeats, whether a reminder is set, a zone a browser
+     can compute in, and how this calendar answered — all small scalars, so
+     unlike attendees they ride along with every list too (EVENT_LIST_COLUMNS). */
+  for (const column of ['recurrence_type', 'series_master_id', 'recurrence_summary',
+    'reminder_on', 'reminder_minutes', 'time_zone_iana', 'response_status', 'is_organizer']) {
+    assert.match(queries[0].calls.find(([method]) => method === 'select')[1], new RegExp('\\b' + column + '\\b'), column);
+  }
   assert.match(queries[0].calls.find(([method]) => method === 'select')[1], /\bupdated_at\b/, 'and when it last changed, which an edit is made against');
   assert.equal(await loadTables(() => []).data.event(EV), null);
   const crafted = loadTables(() => []);
@@ -850,6 +891,42 @@ test('a client carries its number; a company not yet one has none', async () => 
   assert.ok(queries[0].calls.find(([method]) => method === 'select')[1].split(/,\s*/).includes('client_number'));
   assert.equal(client.clientNumber, 42);
   assert.equal(lead.clientNumber, null);
+});
+
+test('every deal loads — open and closed alike — a page at a time, in a fixed order, and a removed one is left out', async () => {
+  let served = 0;
+  const { data, queries } = loadTables(table => {
+    if (table !== 'crm_deals') return [];
+    served += 1;
+    return served === 1
+      ? Array.from({ length: 1000 }, (_, i) => ({ id: `d${i}`, company_id: 'co1', title: `Deal ${i}`, stage: 'lead' }))
+      : [{ id: 'd-last', company_id: 'co1', title: 'Zeta', stage: 'proposal', outcome: 'won', closed_at: '2026-09-10T09:00:00Z' }];
+  });
+  const list = await data.deals();
+  assert.equal(list.length, 1001);
+  assert.equal(list[1000].title, 'Zeta');
+  assert.deepEqual(queries.map(q => q.calls.filter(([method]) => method === 'range').map(call => call.slice(1).join('-'))), [['0-999'], ['1000-1999']]);
+  assert.ok(queries[0].calls.some(call => call.join(' ') === 'order id'), 'pages in a fixed order do not overlap');
+  assert.ok(queries[0].calls.some(([method, column, value]) => method === 'is' && column === 'deleted_at' && value === null),
+    'a removed deal is off every list');
+});
+
+test('a deal arrives with everything the board draws it from, and a closed one is read by its outcome', async () => {
+  const { data, queries } = loadTables(table => (table !== 'crm_deals' ? [] : [
+    { id: 'd1', company_id: 'co1', title: 'Renewal', stage: 'proposal', value: 12000, currency: 'EUR',
+      owner_id: 'e-sam', expected_close: '2026-11-30', outcome: null, closed_at: null, notes: null, created_at: '2026-09-01T00:00:00Z' },
+    { id: 'd2', company_id: 'co1', title: 'Pilot', stage: 'qualified', value: 400, currency: 'EUR',
+      owner_id: null, expected_close: null, outcome: 'won', closed_at: '2026-09-10T09:00:00Z', notes: null, created_at: '2026-08-01T00:00:00Z' }
+  ]));
+  const [open, won] = await data.deals();
+  const selected = queries[0].calls.find(([method]) => method === 'select')[1].split(/,\s*/);
+  for (const column of ['company_id', 'title', 'stage', 'value', 'currency', 'owner_id', 'expected_close', 'outcome', 'closed_at']) {
+    assert.ok(selected.includes(column), `${column} is asked for`);
+  }
+  assert.equal(open.row.expected_close, '2026-11-30');
+  assert.equal(open.stage, 'Proposal');
+  assert.equal(won.stage, 'Won', 'a closed deal is read by its outcome, never by the stage it kept');
+  assert.equal(won.row.stage, 'qualified', 'and the stage it kept is still on the row, which is the history');
 });
 
 test('enquiries arrive newest first, with what the promote button and the list need', async () => {

@@ -682,6 +682,60 @@
         'remove the contact', 'The contact was not removed: it has been removed already, or only an owner or admin can remove one.');
     },
 
+    /* ── Deals (crm_deals, 0067) ──────────────────────────────────────
+       Staff add and change a deal, only a manager removes one — the split
+       0021 gave the rest of the CRM, which 0067 gave this table too. Every
+       shape rule the database keeps (a name, a stage it has, a value that is
+       not negative, a three-letter currency, an outcome and a close date that
+       are both set or both not) is checked by dealsModel first, so what
+       arrives here is already a row the database will take; these checks are
+       the ones worth failing fast on in a sentence a person can read. */
+
+    async createDeal(fields) {
+      var f = fields || {};
+      must(f.companyId, 'Pick the company this deal is for.');
+      must(f.title && f.title.trim(), 'A deal needs a name.');
+      /* A new deal is always open: crm_deals_closed_check (0067) refuses an
+         outcome without a date, and "won" is not something the Add dialog
+         offers — a deal is won from the board, once it exists. */
+      return one(await sb().from('crm_deals').insert(Object.assign({
+        company_id: f.companyId,
+        title: f.title.trim(),
+        stage: f.stage || 'lead',
+        value: f.value ?? null,
+        expected_close: f.expectedClose || null,
+        notes: f.notes || null,
+        /* No owner, when the form says none; the person adding it, when
+           nothing says — the same reading createCompany gives ownerId. */
+        owner_id: f.ownerId !== undefined ? f.ownerId : (me() ? me().id : null)
+      }, f.currency ? { currency: f.currency } : {})).select().single(), 'add the deal');
+    },
+
+    /* What an edit, a move between columns or a won/lost decision changes
+       (dealsModel.dealChanges / moveChanges / closeChanges), and only that.
+       Staff may change a deal, but not one a manager has removed: that, or a
+       change RLS refuses, touches no row, and the rows changed are asked back
+       to say so — the same shape updateCompany has. */
+    async updateDeal(dealId, changes) {
+      must(changes && Object.keys(changes).length, 'Nothing to save.');
+      return touched(await sb().from('crm_deals').update(changes).eq('id', dealId).is('deleted_at', null).select(),
+        'save the deal',
+        'The deal was not saved: it has been removed, or you may not change it.')[0];
+    },
+
+    /* Soft delete, the same rule and the same reasoning as deleteCompany
+       above: owners and admins only, and guard_soft_delete (0012, wired to
+       crm_deals by 0067) enforces it again whichever way deleted_at is
+       changed. The company keeps every other deal it has; only this one
+       leaves the board from the next load on. */
+    async deleteDeal(dealId) {
+      must(window.workspaceSession.isManager && window.workspaceSession.isManager(),
+        'Only an owner or admin can remove a deal.');
+      touched(await sb().from('crm_deals')
+        .update({ deleted_at: new Date().toISOString() }).eq('id', dealId).is('deleted_at', null).select('id'),
+        'remove the deal', 'The deal was not removed: it has been removed already, or only an owner or admin can remove one.');
+    },
+
     /* Turn a /websites/ enquiry into a company + contact. Safe to call twice:
        the function returns the same contact rather than making a duplicate. */
     async promoteEnquiry(enquiryId) {
@@ -852,6 +906,43 @@
         'The event was not changed: it was changed or removed since this was opened, or only whoever booked it, or an owner or admin, can change it. Close this and open the event again.')[0];
     },
 
+    /* Answering an invitation (0068). Never a table write, whoever is asking:
+       0057's column guard holds a non-manager to an event's title, times,
+       place and details, and response_status is deliberately not among them —
+       a reply recorded here that never reached Outlook is an answer no
+       organiser was ever told about, which is worse than no answer at all. So
+       this always goes through respond-calendar-event, which sends it to
+       Graph first and writes the row with the service role only once Graph
+       has taken it — the same order updateEvent and deleteEvent already use
+       for a synced event.
+
+       `scope` answers for this date ('occurrence', the default) or for every
+       one in the series ('series'), which the function resolves through the
+       row's own series_master_id: the browser never has to know Outlook's id
+       for anything. The three answers are Graph's own spellings, checked here,
+       again in the function, and a third time by the column's check
+       constraint — one spelling all the way down. */
+    async respondToEvent(eventId, response, options) {
+      var ANSWERS = ['accepted', 'tentativelyAccepted', 'declined'];
+      var settings = options || {};
+      must(eventId, 'Which event to answer was not given.');
+      must(ANSWERS.indexOf(response) !== -1, 'A reply is Accept, Maybe or Decline.');
+      var scope = settings.scope === 'series' ? 'series' : 'occurrence';
+      var comment = String(settings.comment == null ? '' : settings.comment).trim();
+      must(comment.length <= 1000, 'A note with a reply can be at most 1000 characters.');
+      var res = await sb().functions.invoke('respond-calendar-event', {
+        body: {
+          eventId: eventId, response: response, scope: scope,
+          comment: comment || null,
+          /* The organiser is told unless someone deliberately says not to —
+             one who is never told cannot plan a room. */
+          sendResponse: settings.sendResponse !== false
+        }
+      });
+      if (res.error) throw new Error(await functionError(res, 'The reply was not sent.'));
+      return res.data;
+    },
+
     /* ── Notes ───────────────────────────────────────────────────────── */
 
     /* author_id must be the caller's own employee row — RLS refuses anything
@@ -902,6 +993,67 @@
 
     async starThread(threadId, starred) {
       return threadState(threadId, { starred: !!starred });
+    },
+
+    /* Archive a conversation, mark it as junk, or delete it — where DELETE
+       MEANS a move to Outlook's Deleted Items and never a permanent purge
+       (the owner's decision, 2026-09-21; graph-guard.ts holds the whole of
+       what it is allowed to mean, and 0069 the database half).
+
+       Deliberately no fallback to writing mail_threads.folder here, for a
+       stronger reason than markThreadRead's: the browser has no write on that
+       column at all (0038 revoked it precisely so nobody could re-file a
+       colleague's mail), and even if it had, a move recorded here that Graph
+       never took is undone by the very next delta — the conversation would
+       come back minutes after the button said it had gone. move-mail-thread
+       refuses outright when Outlook cannot be reached, and that refusal is
+       what the caller should show.
+
+       Resolves to { ok, moved, thread, reason, incomplete }: `thread` is the
+       conversation as it now stands (null when there was nothing to move),
+       and `reason` is worth saying even on success — messages that had
+       already moved in Outlook, or a long conversation the function ran out
+       of time on, which asking again finishes. */
+    async moveMailThread(threadId, to) {
+      must(threadId, 'That conversation is not loaded any more. Reload the page.');
+      must(mailModel.moveFor(to), 'A conversation can only be archived, marked as junk or deleted.');
+      var res = await sb().functions.invoke('move-mail-thread', {
+        body: { threadId: threadId, to: to }
+      });
+      if (res.error) throw new Error(await functionError(res, 'That conversation was not moved.'));
+      return res.data;
+    },
+
+    /* ── Mail and the CRM ────────────────────────────────────────────────── */
+
+    /* Who a conversation is with, said by hand (link_mail_thread, 0055) —
+       contactId null clears it. The company follows from the contact in the
+       database, not here, so there is one answer to "which company is this
+       conversation with" rather than two that could disagree. Any member of
+       staff who can already read the conversation may set it, which is the
+       same permission the CRM's own writes use; the database checks again. */
+    async linkMailThread(threadId, contactId) {
+      must(threadId, 'That conversation is not loaded any more. Reload the page.');
+      var res = await sb().rpc('link_mail_thread', {
+        p_thread: threadId, p_contact: contactId || null
+      });
+      if (res.error) throw new Error('Could not link this conversation: ' + res.error.message);
+      return Array.isArray(res.data) ? res.data[0] : res.data;
+    },
+
+    /* The back-fill nothing has ever run for mail stored before its sender was
+       added to the CRM (rematch_mail_threads, 0055). Manager-only, and the
+       reason is worth repeating here: unlike linking one conversation somebody
+       is already looking at, this reaches into every mailbox at once,
+       including ones the caller cannot themselves read. The check below fails
+       fast with a sentence a person can read; the database refuses it
+       regardless of what this said. */
+    async rematchMailThreads(limit) {
+      must(window.workspaceSession.isManager && window.workspaceSession.isManager(),
+        'Only an owner or admin can match older mail to the CRM.');
+      var res = await sb().rpc('rematch_mail_threads', { p_limit: limit || 500 });
+      if (res.error) throw new Error('Could not match older mail to the CRM: ' + res.error.message);
+      return Number(res.data) || 0;
     },
 
     /* An attachment's bytes, fetched from Graph through mail-attachment-content

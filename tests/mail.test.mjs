@@ -721,6 +721,9 @@ function loadMail(options = {}) {
     mailboxesFailed = false, mailTruncated = [], notice = null, mailUnreadCounts = null,
     bodies = () => null, failedThreadIds = [], retriedThreadIds = [],
     markThreadReadResult = async () => ({}), starThreadResult = async () => ({}),
+    /* move-mail-thread's own answer shape: { ok, moved, thread, reason }. */
+    moveMailThreadResult = async () => ({ ok: true, moved: 1, thread: null, reason: null }),
+    linkMailThreadResult = async () => ({}), rematchMailThreadsResult = async () => 0,
     reconnectMailboxResult = async () => 'https://login.microsoftonline.com/x',
     connectMailboxResult = async () => 'https://login.microsoftonline.com/x',
     disconnectMailboxResult = async () => ({}),
@@ -736,6 +739,11 @@ function loadMail(options = {}) {
   const searchMailCalls = [];
   const retrySearchMailCalls = [];
   const loadMoreMailCalls = [];
+  const moveCalls = [];
+  const linkCalls = [];
+  const rematchCalls = [];
+  const crmContactDialogs = [];
+  const modals = [];
 
   const toasts = [];
   const navigated = [];
@@ -804,6 +812,36 @@ function loadMail(options = {}) {
     }
   };
 
+  /* A dialog the way every caller of dialog-forms.js uses one: showModal()
+     writes a form's HTML, the file then finds that form by id and listens
+     for its submit. Nothing is drawn here — a form is a plain object holding
+     the values a test gives it, found by getElementById the same way a real
+     one would be, and submitDialog() runs the very handler mail.js
+     registered. dialogForms.sending() is stubbed down to what this file
+     actually needs to prove: run the write, then tell the caller. The real
+     one's store bookkeeping (records, parts, re-asking the store) is
+     dialog-forms.js's own, tested where it lives. */
+  const dialogElements = {};
+  const dialogFormEl = id => ({
+    id, values: {}, submits: [],
+    addEventListener(type, fn) { if (type === 'submit') this.submits.push(fn); },
+    querySelector: () => null
+  });
+  const showModalStub = (eyebrow, html) => {
+    modals.push({ eyebrow, html });
+    for (const match of html.matchAll(/<form id="([^"]+)"/g)) dialogElements[match[1]] = dialogFormEl(match[1]);
+  };
+  const dialogFormsStub = {
+    field: (label, control, attributes = '') => `<label${attributes}>${label}${control}</label>`,
+    options: (list, current) => list.map(x =>
+      `<option value="${escape(x.value)}"${x.value === current ? ' selected' : ''}>${escape(x.label)}</option>`).join(''),
+    form: (id, body, submitLabel) =>
+      `<form id="${id}">${body}<button type="submit" data-label="${escape(submitLabel)}">${escape(submitLabel)}</button></form>`,
+    say: () => {}, quiet: () => {}, closeDialog: () => {},
+    sending: (form, work, done) => Promise.resolve().then(work)
+      .then(done, err => toasts.push((err && err.message) || 'That was not saved'))
+  };
+
   /* Every <a> created for a download (mail.js's downloadAttachment, the same
      shape tickets-ui.js's own downloadFile already uses with no test of its
      own — the actual click is a real browser's to make of a real anchor).
@@ -835,7 +873,7 @@ function loadMail(options = {}) {
       const m = /^#main #(.+)$/.exec(selector);
       return (m && elementsById[m[1]]) ? [elementsById[m[1]]] : [];
     },
-    getElementById: id => elementsById[id] || null
+    getElementById: id => elementsById[id] || dialogElements[id] || null
   };
 
   /* app.js's own focusKey/repaintKeepingFocus, copied rather than
@@ -943,8 +981,16 @@ function loadMail(options = {}) {
       reconnectMailbox: address => reconnectMailboxResult(address),
       connectMailbox: (address, whose) => connectMailboxResult(address, whose),
       disconnectMailbox: id => disconnectMailboxResult(id),
-      mailAttachmentContent: id => { mailAttachmentRequests.push(id); return mailAttachmentContentResult(id); }
+      mailAttachmentContent: id => { mailAttachmentRequests.push(id); return mailAttachmentContentResult(id); },
+      moveMailThread: (id, to) => { moveCalls.push({ id, to }); return moveMailThreadResult(id, to); },
+      linkMailThread: (id, contactId) => { linkCalls.push({ id, contactId }); return linkMailThreadResult(id, contactId); },
+      rematchMailThreads: limit => { rematchCalls.push(limit); return rematchMailThreadsResult(limit); }
     },
+    showModal: showModalStub,
+    dialogForms: dialogFormsStub,
+    crmForms: { openContact: (contact, companyId, over) => crmContactDialogs.push({ contact, companyId, over: over || {} }) },
+    /* new FormData(form).get(name) over a stub form's own values. */
+    FormData: class { constructor(form) { this.form = form; } get(name) { const v = this.form.values[name]; return v === undefined ? null : v; } },
     mailComposer: {
       open(init) { openedWith.push(init); return options.refuseComposerOpen ? false : true; },
       close() { composerClosed.push(true); },
@@ -981,6 +1027,10 @@ function loadMail(options = {}) {
   });
   context.window.workspaceSession = context.workspaceSession;
   context.window.workspaceStore = context.workspaceStore;
+  /* mail.js reaches for window.crmForms before opening the CRM's own New
+     contact dialog, exactly so a page loaded without crm-forms.js says so
+     rather than throwing — options.noCrmForms is that page. */
+  if (!options.noCrmForms) context.window.crmForms = context.crmForms;
 
   vm.runInContext(readFileSync(new URL('../dist/mail-model.js', import.meta.url), 'utf8'), context);
   vm.runInContext(readFileSync(new URL('../dist/mail.js', import.meta.url), 'utf8'), context);
@@ -1024,7 +1074,20 @@ function loadMail(options = {}) {
       const raw = storageMap.get('veyago.mail.draft');
       return raw ? JSON.parse(raw) : null;
     },
+    /* Runs the submit handler mail.js registered on a dialog's form, with the
+       values a person would have picked in it. */
+    submitDialog(formId, values = {}) {
+      const form = dialogElements[formId];
+      assert.ok(form, `no dialog form ${formId} was opened`);
+      Object.assign(form.values, values);
+      form.submits.forEach(fn => fn({ preventDefault() {} }));
+    },
+    /* The store's own shared thread array, as the page has left it: what
+       every other view reads too, so a write that only changed the HTML
+       would show up here as no change at all. */
+    threads: () => mailsArr.map(t => ({ ...t })),
     toasts, navigated, openedWith, composerClosed, mailAttachmentRequests, downloadLinks,
+    moveCalls, linkCalls, rematchCalls, crmContactDialogs, modals,
     compose: (...args) => vm.runInContext(`compose(${args.map(a => JSON.stringify(a)).join(',')})`, context)
   };
 }
@@ -1884,4 +1947,300 @@ test('a mail refresh already just asked for (by the two-minute clock or a write)
   s.fireIntervals(45000);
   await tick();
   assert.equal(loads, 2, 'too soon since the last one: mail\'s own tick waits its turn');
+});
+
+/* ── Moving mail, linking it to the CRM, and the client number ────────────
+   Three Mail items that all landed on the same file. The owner's decision on
+   2026-09-21 is that the workspace may archive, mark as junk and delete,
+   where DELETE MEANS Deleted Items; link_mail_thread and
+   rematch_mail_threads have existed since 0055 with nothing calling either;
+   and a client number (0053) showed everywhere a client appears except the
+   one place they are most often actually talked to. */
+
+test('the three destinations are the three the owner named, and nothing else is one', () => {
+  assert.deepEqual([...model.MOVES.map(m => m.to)], ['archive', 'spam', 'trash']);
+  assert.equal(model.moveFor('trash').label, 'Delete');
+  /* A button beside a client's correspondence saying "Delete" had better say
+     where the mail actually goes. */
+  assert.match(model.moveFor('trash').title, /Deleted Items/);
+  assert.match(model.moveFor('trash').done, /Deleted Items/);
+  for (const to of ['inbox', 'sent', 'starred', 'deleteditems', '', null, undefined]) {
+    assert.equal(model.moveFor(to), null, String(to));
+  }
+});
+
+test('an address the CRM already holds is found whatever its case; one it does not is not invented', () => {
+  const people = [{ id: 'c1', name: 'Anna Berg', email: 'anna@client.com' }, { id: 'c2', name: 'No Address', email: null }];
+  assert.equal(model.contactByEmail(people, 'ANNA@Client.com').id, 'c1');
+  assert.equal(model.contactByEmail(people, 'someone@else.example'), null);
+  assert.equal(model.contactByEmail(people, ''), null, 'a conversation with no address matches nobody');
+  assert.equal(model.contactByEmail(people, null), null);
+});
+
+test('the reading pane offers Archive, Junk and Delete', () => {
+  const html = loadMail({ threads: [mthread({ id: T1 })], route: ['mail', 'all', 'inbox', T1] }).view();
+  assert.match(html, /data-mail-move="archive"/);
+  assert.match(html, /data-mail-move="spam"/);
+  assert.match(html, /data-mail-move="trash"/);
+  assert.match(html, /title="Move this conversation to Deleted Items in Outlook"/);
+});
+
+/* The same rule the star and Mark as unread already follow: a thread only a
+   search found knows neither its folder nor its messages, so nothing here
+   could honestly say there is anything left to move. */
+test('a conversation only a search found is offered none of them', () => {
+  const html = loadMail({
+    threads: [], route: ['mail', 'all', 'inbox', T1], query: 'launch',
+    searchMailAnswer: () => ({
+      state: 'done',
+      results: [{ threadId: T1, mailboxId: STUDIO, subject: 'Launch plan', preview: 'x', time: '09:00', row: {} }]
+    })
+  }).view();
+  assert.doesNotMatch(html, /data-mail-move/);
+  assert.doesNotMatch(html, /data-mail-link/);
+});
+
+test('archiving a conversation tells Outlook, takes it out of the folder, and closes the reader', async () => {
+  const page = loadMail({
+    threads: [mthread({ id: T1 })], route: ['mail', 'all', 'inbox', T1],
+    moveMailThreadResult: async () => ({ ok: true, moved: 2, thread: { id: T1, folder: 'archive' }, reason: null })
+  });
+  page.view();
+  page.click(page.byId(`mail-move-archive-${T1}`));
+  await tick();
+  assert.deepEqual([...page.moveCalls].map(c => ({ ...c })), [{ id: T1, to: 'archive' }]);
+  assert.equal(page.navigated.at(-1), 'mail/all/inbox', 'the reader closes: the conversation has left this folder');
+  assert.doesNotMatch(page.view(), new RegExp(`mail-thread-${T1}`), 'and it is out of the list');
+  assert.match(page.toasts.at(-1), /Archived/);
+});
+
+/* 0045's rule, reused by 0069: a conversation still holding a reply of ours
+   goes to Sent, which the workspace lists — not to Junk. The view follows
+   where the database actually put it, never where the button asked. */
+test('a junked conversation that still holds our reply lands where the database says, not where the button asked', async () => {
+  const page = loadMail({
+    threads: [mthread({ id: T1 })], route: ['mail', 'all', 'inbox', T1],
+    moveMailThreadResult: async () => ({ ok: true, moved: 1, thread: { id: T1, folder: 'sent' }, reason: null })
+  });
+  page.view();
+  page.click(page.byId(`mail-move-spam-${T1}`));
+  await tick();
+  assert.equal(page.threads()[0].folder, 'sent', 'not "spam": the database decided, and the store follows it');
+  assert.equal(page.threads()[0].row.folder, 'sent');
+  assert.doesNotMatch(page.view(), new RegExp(`mail-thread-${T1}`), 'so it has left the Inbox, and shows under Sent');
+});
+
+test('a conversation already where it was being sent says so instead of looking like nothing happened', async () => {
+  const page = loadMail({
+    threads: [mthread({ id: T1 })], route: ['mail', 'all', 'inbox', T1],
+    moveMailThreadResult: async () => ({ ok: true, moved: 0, thread: null, reason: 'This conversation is already archived.' })
+  });
+  page.view();
+  page.click(page.byId(`mail-move-archive-${T1}`));
+  await tick();
+  assert.match(page.toasts.at(-1), /already archived/);
+  assert.equal(page.navigated.length, 0, 'nothing moved, so the reader stays open on it');
+});
+
+/* move-mail-thread refuses outright when Outlook cannot be reached, because a
+   move written here that Graph never took would be undone by the next delta.
+   The refusal is what a person must see — not a conversation that vanishes
+   and comes back. */
+test('a refused move leaves the conversation where it is and says why', async () => {
+  const page = loadMail({
+    threads: [mthread({ id: T1 })], route: ['mail', 'all', 'inbox', T1],
+    moveMailThreadResult: async () => { throw new Error('This mailbox is disconnected, so nothing can be moved in Outlook.'); }
+  });
+  page.view();
+  page.click(page.byId(`mail-move-trash-${T1}`));
+  await tick();
+  assert.match(page.toasts.at(-1), /disconnected/);
+  assert.equal(page.navigated.length, 0);
+  assert.match(page.view(), new RegExp(`mail-thread-${T1}`), 'still in the inbox');
+});
+
+test('what Outlook could not finish is said alongside the success, not swallowed', async () => {
+  const page = loadMail({
+    threads: [mthread({ id: T1 })], route: ['mail', 'all', 'inbox', T1],
+    moveMailThreadResult: async () => ({
+      ok: true, moved: 1, thread: { id: T1, folder: 'archive' },
+      reason: 'Outlook is answering slowly, so 4 more messages are left — ask again to finish.'
+    })
+  });
+  page.view();
+  page.click(page.byId(`mail-move-archive-${T1}`));
+  await tick();
+  assert.match(page.toasts.at(-1), /Archived\./);
+  assert.match(page.toasts.at(-1), /4 more messages are left/);
+});
+
+/* ── Linking a conversation to the CRM by hand (0055) ──────────────────── */
+
+test('a conversation with nobody on it still offers to be linked — that was the case that needed a button', () => {
+  const html = loadMail({
+    threads: [mthread({ id: T1, contactId: null })], route: ['mail', 'all', 'inbox', T1],
+    contacts: [{ id: 'c1', name: 'Anna Berg', email: 'anna@client.com', company: 'Northline' }]
+  }).view();
+  assert.match(html, /data-mail-link/);
+  assert.match(html, /Link this conversation to a contact/);
+});
+
+test('one already linked offers to change it, and names who it is with', () => {
+  const html = loadMail({
+    threads: [mthread({ id: T1, contactId: 'c1' })], route: ['mail', 'all', 'inbox', T1],
+    contacts: [{ id: 'c1', name: 'Anna Berg', email: 'anna@client.com', company: 'Northline' }]
+  }).view();
+  assert.match(html, /Change who this is with/);
+  assert.match(html, /Northline/);
+});
+
+test('picking a contact links the conversation to them', async () => {
+  const page = loadMail({
+    threads: [mthread({ id: T1, contactId: null })], route: ['mail', 'all', 'inbox', T1],
+    contacts: [{ id: 'c1', name: 'Anna Berg', email: 'anna@client.com', company: 'Northline' }]
+  });
+  page.view();
+  page.click(page.byId(`mail-link-${T1}`));
+  assert.match(page.modals.at(-1).html, /Anna Berg · Northline/);
+  page.submitDialog('mail-link-form', { contactId: 'c1' });
+  await tick();
+  assert.deepEqual([...page.linkCalls].map(c => ({ ...c })), [{ id: T1, contactId: 'c1' }]);
+  assert.match(page.toasts.at(-1), /with Anna Berg/);
+});
+
+test('leaving it blank unlinks the conversation rather than doing nothing', async () => {
+  const page = loadMail({
+    threads: [mthread({ id: T1, contactId: 'c1' })], route: ['mail', 'all', 'inbox', T1],
+    contacts: [{ id: 'c1', name: 'Anna Berg', email: 'anna@client.com', company: 'Northline' }]
+  });
+  page.view();
+  page.click(page.byId(`mail-link-${T1}`));
+  page.submitDialog('mail-link-form', { contactId: '' });
+  await tick();
+  assert.deepEqual([...page.linkCalls].map(c => ({ ...c })), [{ id: T1, contactId: null }]);
+  assert.match(page.toasts.at(-1), /Unlinked/);
+});
+
+test('picking the contact it already has makes no write at all', async () => {
+  const page = loadMail({
+    threads: [mthread({ id: T1, contactId: 'c1' })], route: ['mail', 'all', 'inbox', T1],
+    contacts: [{ id: 'c1', name: 'Anna Berg', email: 'anna@client.com', company: 'Northline' }]
+  });
+  page.view();
+  page.click(page.byId(`mail-link-${T1}`));
+  page.submitDialog('mail-link-form', { contactId: 'c1' });
+  await tick();
+  assert.equal(page.linkCalls.length, 0);
+  assert.match(page.toasts.at(-1), /Nothing changed/);
+});
+
+/* ── Adding the sender to the CRM (the CRM's own dialog, not a second one) ── */
+
+const withSender = (over = {}) => mthread({
+  id: T1, contactId: null,
+  row: { last_message_at: '2026-09-14T09:00:00Z', message_count: 1,
+         other_party_name: 'Anna Berg', other_party_email: 'anna@client.com' },
+  ...over
+});
+
+test('a sender the CRM does not know is offered as a contact to add, by name', () => {
+  const html = loadMail({ threads: [withSender()], route: ['mail', 'all', 'inbox', T1], contacts: [] }).view();
+  assert.match(html, /data-mail-add-contact/);
+  assert.match(html, /Add Anna Berg to the CRM/);
+});
+
+test('a sender already in the CRM is not offered again — that is what the link button is for', () => {
+  const html = loadMail({
+    threads: [withSender()], route: ['mail', 'all', 'inbox', T1],
+    contacts: [{ id: 'c1', name: 'Anna Berg', email: 'ANNA@client.com', company: 'Northline' }]
+  }).view();
+  assert.doesNotMatch(html, /data-mail-add-contact/);
+  assert.match(html, /data-mail-link/);
+});
+
+test('adding the sender opens the CRM\'s own New contact dialog, filled in, and links the conversation afterwards', async () => {
+  const page = loadMail({ threads: [withSender()], route: ['mail', 'all', 'inbox', T1], contacts: [] });
+  page.view();
+  page.click(page.byId(`mail-add-contact-${T1}`));
+  assert.equal(page.crmContactDialogs.length, 1, 'crm-forms.js\'s own path, not a second copy of it');
+  const opened = page.crmContactDialogs[0];
+  assert.equal(opened.contact, null, 'a new contact');
+  assert.equal(opened.over.name, 'Anna Berg');
+  assert.equal(opened.over.email, 'anna@client.com');
+  opened.over.onAdded({ contactId: 'c9' });
+  await tick();
+  assert.deepEqual([...page.linkCalls].map(c => ({ ...c })), [{ id: T1, contactId: 'c9' }]);
+});
+
+test('a page without the CRM\'s forms says so rather than throwing', () => {
+  const page = loadMail({ threads: [withSender()], route: ['mail', 'all', 'inbox', T1], contacts: [], noCrmForms: true });
+  page.view();
+  page.click(page.byId(`mail-add-contact-${T1}`));
+  assert.match(page.toasts.at(-1), /still loading/);
+});
+
+/* ── The back-fill (rematch_mail_threads, 0055): manager-only ──────────── */
+
+test('matching older mail to the CRM is offered to a manager only', () => {
+  assert.match(loadMail({ manager: true }).view(), /data-mail-rematch/);
+  assert.doesNotMatch(loadMail({ manager: false }).view(), /data-mail-rematch/);
+});
+
+test('the back-fill says what it reaches before it runs, and how much it matched after', async () => {
+  const page = loadMail({ manager: true, rematchMailThreadsResult: async () => 7 });
+  page.view();
+  page.click(page.byId('mail-rematch'));
+  assert.match(page.modals.at(-1).html, /every mailbox, including ones you cannot read yourself/);
+  page.submitDialog('mail-rematch-form');
+  await tick();
+  assert.equal(page.rematchCalls.length, 1);
+  assert.match(page.toasts.at(-1), /7 conversations matched/);
+});
+
+test('a back-fill that matched nothing says that plainly, not "0 conversations"', async () => {
+  const page = loadMail({ manager: true, rematchMailThreadsResult: async () => 0 });
+  page.view();
+  page.click(page.byId('mail-rematch'));
+  page.submitDialog('mail-rematch-form');
+  await tick();
+  assert.match(page.toasts.at(-1), /Nothing left to match/);
+});
+
+/* ── The client number in a conversation's header (0053) ───────────────── */
+
+test('a conversation with a client company quotes its client number beside the subject', () => {
+  const html = loadMail({
+    threads: [mthread({
+      id: T1, count: 3,
+      row: { last_message_at: '2026-09-14T09:00:00Z', message_count: 3, company: { name: 'Northline', client_number: 1042 } }
+    })],
+    route: ['mail', 'all', 'inbox', T1]
+  }).view();
+  assert.match(html, /3 messages · Client No\. 1042/);
+});
+
+test('a client number of its own is shown even on a conversation with a single message', () => {
+  const html = loadMail({
+    threads: [mthread({
+      id: T1, count: 1,
+      row: { last_message_at: '2026-09-14T09:00:00Z', message_count: 1, company: { name: 'Northline', client_number: 7 } }
+    })],
+    route: ['mail', 'all', 'inbox', T1]
+  }).view();
+  assert.match(html, /Client No\. 7/);
+});
+
+/* A company that has not reached the client stage has no number yet (0053),
+   and a conversation filed under no company has no company row at all —
+   neither invents one, exactly as tickets-ui.js's clientNumberOf does not. */
+test('a company with no number yet, and a conversation with no company, quote nothing', () => {
+  const noNumber = loadMail({
+    threads: [mthread({ id: T1, row: { last_message_at: '2026-09-14T09:00:00Z', company: { name: 'Northline', client_number: null } } })],
+    route: ['mail', 'all', 'inbox', T1]
+  }).view();
+  assert.doesNotMatch(noNumber, /Client No\./);
+  const noCompany = loadMail({
+    threads: [mthread({ id: T1 })], route: ['mail', 'all', 'inbox', T1]
+  }).view();
+  assert.doesNotMatch(noCompany, /Client No\./);
 });

@@ -529,6 +529,21 @@ a.agenda-item:focus-visible{outline:2px solid #0071e3;outline-offset:2px;border-
 .attendee-list small{color:#66758a;font-size:.75rem;overflow-wrap:anywhere}
 .attendee-reply{flex-shrink:0;color:#66758a;font-size:.75rem}
 
+/* Answering an invitation (0068, event-invite.js). The answer already given
+   reads as the one in effect rather than being hidden: changing your mind is
+   ordinary, and someone who accepted last week still needs to see that they
+   did. aria-pressed carries the same thing for a screen reader, so the colour
+   is never the only way to tell. */
+.invite-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.invite-actions .reply-btn{padding:6px 14px;font-size:.8125rem}
+.invite-actions .reply-btn[aria-pressed="true"]{border-color:#0071e3;background:#eef5ff;color:#0b4da2;font-weight:500}
+.invite-actions .reply-btn:disabled{opacity:.55;cursor:progress}
+/* A meeting that is one of a series, marked wherever it is drawn: a small
+   glyph beside the time in a week or a day, a word in the schedule. The
+   glyph is aria-hidden — the card's own sentence says "repeats" instead. */
+.repeat-mark{margin-left:4px;opacity:.75}
+.repeat-note{margin-left:8px;color:#66758a;font-size:.75rem}
+
 /* The agenda's calendars (agenda-ui.js): each a toggle in its colour, above the
    week so a phone has them too; a hidden one reads faded and struck through. */
 .agenda-kinds{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 16px}
@@ -604,3 +619,43 @@ a.agenda-item:focus-visible{outline:2px solid #0071e3;outline-offset:2px;border-
    drawn as the card's h2 used to be; and a long list says it shows the first rows. */
 .contact-card>h3{font-size:1.125rem;letter-spacing:-.35px;font-weight:600;line-height:1.4}
 .list-limit{margin:12px 2px 0;font-size:.8125rem}
+
+/* Mail: filing a conversation away, and saying who it is with (0069, and
+   0055's link_mail_thread/rematch_mail_threads finally getting buttons).
+   Archive, Junk and Delete sit in the same row as Reply, pushed to its far
+   end: answering a conversation and disposing of it are opposite
+   intentions, and they should not be shoulder to shoulder. On a narrow
+   screen the row wraps (.mail-actions is already flex-wrap), and the auto
+   margin then simply has nothing left to push against. */
+.mail-file-away{display:flex;gap:8px;margin-left:auto}
+.mail-file-away .btn:disabled{opacity:.55;cursor:progress}
+@media (max-width: 640px){.mail-file-away{margin-left:0;width:100%}}
+
+/* The two CRM actions under a conversation, beside the chips that say what
+   it is already connected to: plain text buttons, so neither reads as a
+   link to somewhere that exists yet. */
+.reader-related>.related-action{font-size:.75rem;padding:7px 2px;align-self:center}
+.mail-rematch{display:block;margin-top:10px;font-size:.75rem;text-align:left}
+
+/* The pipeline's deal cards (crm-ui.js, 0067). A card is an article, not a
+   link — it carries its own buttons — so it needs the pointer and the hover
+   lift .contact-card only gave an anchor, and its company link is the one
+   thing inside it that navigates. The buttons sit on a row of their own, kept
+   off the drag by nothing more than being buttons: a drag started on one
+   still moves the card, which is what a person expects from grabbing it
+   anywhere. */
+.deal-card{cursor:grab}
+.deal-card:active{cursor:grabbing}
+.deal-card>p{font-size:.8125rem;color:#66758a;margin-top:6px}
+.deal-card .contact-value{margin:14px 0 10px}
+.deal-card .contact-value span{text-align:right}
+.card-actions{display:flex;flex-wrap:wrap;align-items:center;gap:14px}
+.card-actions .text-btn{padding:0}
+/* A deal on its company's page: name and caption, then what it is worth, then
+   what can be done to it — and on a phone, the three stacked rather than
+   squeezed, since .related-item is a single row everywhere else. */
+.deal-row{align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap}
+.deal-row>div{min-width:0;flex:1 1 180px}
+.deal-row small{display:block;color:#66758a;font-size:.75rem;margin-top:3px}
+.deal-row-value{display:flex;align-items:center;gap:10px;font-variant-numeric:tabular-nums}
+@media (max-width: 520px) { .deal-row{flex-direction:column} .deal-row-value{width:100%} }

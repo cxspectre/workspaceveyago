@@ -46,7 +46,7 @@
   var state = {
     loaded: false, loading: false, error: null, loadedAt: null,
     failed: [], notice: null,
-    overview: null, revenue: [], revenueMix: [], companies: [], projectEvents: [],
+    overview: null, revenue: [], revenueMix: [], companies: [], deals: [], projectEvents: [],
     projectMembers: [], projectContacts: [], projectFiles: [], projectBudgets: [],
     /* mailboxesFailed: the mailbox LIST itself did not load — different from
        there being none. Threads still load (loadMail falls back to no
@@ -241,6 +241,15 @@
     part('companies', 'companies',
       function (d) { return d.companies(); },
       function (rows) { state.companies = rows; }),
+    /* Every deal, open and closed (crm_deals, 0067): the pipeline board, and
+       the Won and Lost columns that are its history. Not CORE — companies are,
+       because a write matching a typed client name against them could make a
+       second company, and nothing about a deal can do that. The board says
+       "Deals did not load" and they are tried again by themselves, which is
+       how every other non-CORE part already behaves. */
+    part('deals', 'deals',
+      function (d) { return d.deals(); },
+      function (rows) { state.deals = rows; }),
     /* Meetings booked on projects, from today on — not only this week's. */
     part('projectEvents', 'project meetings',
       function (d) { return d.upcomingProjectEvents(); },

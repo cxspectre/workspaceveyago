@@ -64,6 +64,26 @@ const mailModel = (function () {
       .join('/');
   }
 
+  /* Where a conversation can be sent from the reading pane, and what each one
+     is called in the workspace's own words. The three the owner settled on
+     (2026-09-21): archive, junk, and delete — where DELETE MEANS Outlook's
+     Deleted Items and never a permanent purge, which is why its button says
+     where the mail goes rather than only "Delete". The `to` values are what
+     move-mail-thread takes, which are mail_messages.folder's own words
+     (0025's check constraint), so nothing between here and the database
+     renames them.
+
+     Order matters: archive first, since it is what most conversations want
+     and the least drastic; delete last, furthest from the reply buttons it
+     sits beside. */
+  const MOVES = Object.freeze([
+    Object.freeze({ to: 'archive', label: 'Archive', title: 'Archive this conversation in Outlook', done: 'Archived.' }),
+    Object.freeze({ to: 'spam', label: 'Junk', title: 'Mark this conversation as junk in Outlook', done: 'Marked as junk.' }),
+    Object.freeze({ to: 'trash', label: 'Delete', title: 'Move this conversation to Deleted Items in Outlook', done: 'Moved to Deleted Items.' })
+  ]);
+
+  const moveFor = to => MOVES.find(m => m.to === to) || null;
+
   /* The folder a conversation's page opens under: its own when the mail view
      has it, Starred for a starred one filed away in Outlook (0045), and
      otherwise where the person already is — the thread opens by its id there. A
@@ -177,7 +197,7 @@ const mailModel = (function () {
       subject: hit.subject, preview: hit.preview, time: hit.time,
       unread: false, starred: false, count: undefined,
       mailboxId: hit.mailboxId, folder: null,
-      ticketId: null, contactId: null,
+      ticketId: null, contactId: null, companyId: null,
       body: undefined, bodyHtml: undefined, thread: undefined,
       row: hit.row, fromSearch: true
     });
@@ -453,6 +473,18 @@ const mailModel = (function () {
     return Object.freeze([...found.values()]);
   }
 
+  /* Whether the other party on a conversation is already someone the CRM
+     knows, by address — the same thing rematch_mail_threads() matches on
+     (`lower(c.email) = lower(t.other_party_email)`, 0055), so "Add sender to
+     the CRM" is never offered for somebody who is already in it and the
+     button a person sees agrees with what the database would do. A contact
+     with no address on file matches nobody rather than everybody. */
+  function contactByEmail(contacts, email) {
+    const key = lower(email);
+    if (!key) return null;
+    return (contacts || []).find(c => c && lower(c.email) === key) || null;
+  }
+
   /* What a mailbox's last error says, as the list shows it: the first sentence,
      short enough for the column, with the whole of it kept for a closer look.
      A mailbox still syncing can carry one too — mail the sync went on without
@@ -468,9 +500,10 @@ const mailModel = (function () {
   }
 
   return Object.freeze({
-    ALL, FOLDERS, mailboxesFor, mailboxNote, parseMailRoute, mailRoute, folderForThread, visibleThreads, unreadCount,
+    ALL, FOLDERS, MOVES, moveFor, mailboxesFor, mailboxNote, parseMailRoute, mailRoute, folderForThread,
+    visibleThreads, unreadCount,
     isTruncated, unreadCountInfo, trueUnreadTotal, mergeOlder, threadFromSearchHit, recipientLine,
     LIMITS, PURIFY_CONFIG, isAddress, subjectFor, answerFor, parseAddresses, storageName, attachmentProblem,
-    signatureFor, sendProblem, addressBook
+    signatureFor, sendProblem, addressBook, contactByEmail
   });
 })();

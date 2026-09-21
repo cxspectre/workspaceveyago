@@ -23,7 +23,11 @@ const U3 = '8b3c4d5e-6f70-4b81-9c9d-0e1f2a3b4c5d';
 const TYPED = '<img src=x onerror=alert(1)>';
 const MARKUP = /<img/i;
 const STAGES = ['lead', 'qualified', 'proposal', 'client', 'dormant', 'lost'];
-const EVERYTHING = ['contacts', 'companies', 'invoices', 'mail', 'team', 'projectContacts', 'notes'];
+/* The deals board's own columns (crm_deals, 0067): the four stages an open
+   deal can stand at, then the two outcomes. Not the company stages above —
+   'client' is a relationship, and won and lost are outcomes, never stages. */
+const COLUMNS = ['lead', 'qualified', 'proposal', 'dormant', 'won', 'lost'];
+const EVERYTHING = ['contacts', 'companies', 'deals', 'invoices', 'mail', 'team', 'projectContacts', 'notes'];
 
 const escape = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const isNotFound = html => /This record is unavailable\./.test(html);
@@ -55,7 +59,7 @@ function fakeClock() {
 
 /* The page as it runs: workspace.js's helpers, the models and crm-ui.js, with
    the store's lists and app.js's globals as stand-ins. */
-function load({ route = ['crm'], query = '', contacts = [], companies = [], loaded = EVERYTHING,
+function load({ route = ['crm'], query = '', contacts = [], companies = [], deals = [], loaded = EVERYTHING,
   projects = [], projectContacts = [], tickets = [], invoices = [], mails = [], team = [], manager = true, overview = null,
   events = [], projectEvents = [], past = {}, notes = {}, viewer = null, drafts = null, workspaceLoaded = true,
   refuse = null, clock = null, enquiries = null, enquiriesFail = false, promoteResult = 'new-contact-1', refusePromote = null,
@@ -113,6 +117,11 @@ function load({ route = ['crm'], query = '', contacts = [], companies = [], load
         if (refuse) throw new Error(refuse);
         return { id };
       },
+      updateDeal: async (id, changes) => {
+        written.push(['updateDeal', id, { ...changes }]);
+        if (refuse) throw new Error(refuse);
+        return { id };
+      },
       promoteEnquiry: async id => {
         promoted.push(id);
         if (refusePromote) throw new Error(refusePromote);
@@ -121,7 +130,7 @@ function load({ route = ['crm'], query = '', contacts = [], companies = [], load
     },
     workspaceStore: {
       has: part => loaded.includes(part),
-      state: { companies, projectContacts, overview, projectEvents, loaded: workspaceLoaded },
+      state: { companies, deals, projectContacts, overview, projectEvents, loaded: workspaceLoaded },
       pastMeetings: (key, filter) => {
         pastAsked.push([key, JSON.parse(JSON.stringify(filter))]);
         return past[key] || { state: 'loading', meetings: [], more: false };
@@ -143,7 +152,7 @@ function load({ route = ['crm'], query = '', contacts = [], companies = [], load
   if (clock) { context.window.setTimeout = clock.setTimeout; context.window.clearTimeout = clock.clearTimeout; }
   else { context.window.setTimeout = (...args) => setTimeout(...args); context.window.clearTimeout = (...args) => clearTimeout(...args); }
   vm.runInContext(HELPERS, context);
-  for (const file of ['overview-model.js', 'finance-model.js', 'projects-model.js', 'crm-model.js', 'tasks-model.js', 'agenda-model.js', 'crm-ui.js']) {
+  for (const file of ['overview-model.js', 'finance-model.js', 'projects-model.js', 'crm-model.js', 'deals-model.js', 'tasks-model.js', 'agenda-model.js', 'crm-ui.js', 'deals-board.js']) {
     vm.runInContext(readFileSync(new URL(`../dist/${file}`, import.meta.url), 'utf8'), context);
   }
   /* A DOM event of `type` landing on an element with these data attributes,
@@ -206,6 +215,19 @@ function contact(name, email, at = null, over = {}) {
   return { id: row.id, name, initial: name[0], company: at ? at.name : '—', email, notes: row.notes || '', row };
 }
 
+/* A deal as queries.deals() hands it to the store, at `at` — a company() —
+   with the row under `row`, the way the query returns it. */
+let dealsMade = 0;
+function deal(at, over = {}) {
+  dealsMade += 1;
+  const row = {
+    id: `deal-${dealsMade}`, company_id: at ? at.id : null, title: `Deal ${dealsMade}`,
+    stage: 'lead', value: null, currency: 'USD', owner_id: null, expected_close: null,
+    outcome: null, closed_at: null, notes: null, created_at: `2026-09-0${dealsMade % 9 + 1}T00:00:00Z`, ...over
+  };
+  return { id: row.id, title: row.title, stage: row.outcome || row.stage, value: '—', row };
+}
+
 /* An invoice as queries.invoices() hands it to the store. */
 function invoice(over = {}) {
   const row = {
@@ -223,7 +245,7 @@ function figure(stats, label) {
 }
 
 /* The part of the board between a column's heading and the next column. */
-const column = (html, stage) => html.split(`<h2 id="crm-stage-${stage}">`)[1].split('<section')[0];
+const column = (html, stage) => html.split(`<h2 id="crm-deal-${stage}">`)[1].split('<section')[0];
 const bodyRows = html => html.split('<tbody>')[1].split('</tbody>')[0].split('<tr>').filter(Boolean);
 
 /* ── The figures ──────────────────────────────────────────────────────── */
@@ -430,59 +452,84 @@ test('a note box is drawn with what was written in it before the page was drawn 
 });
 
 test('the strip is contacts, pipeline value and active clients, in that order', () => {
-  assert.deepEqual([...ui.stats([], [])].map(item => item[0]), ['Contacts', 'Pipeline value', 'Active clients']);
+  assert.deepEqual([...ui.stats([], [], null, [])].map(item => item[0]), ['Contacts', 'Pipeline value', 'Active clients']);
 });
 
-test('pipeline value counts each company once, however many people work there', () => {
-  const northline = company('proposal', 12000);
-  const harbor = company('lead', 3000);
+test('pipeline value is every open deal, so one client with two in flight counts both — which one value per company could not', () => {
+  const northline = company('client', 12000);
   const people = ['Ana', 'Ben', 'Cy'].map(name => contact(name, `${name.toLowerCase()}@northline.example`, northline));
-  const stats = ui.stats(people, [northline, harbor]);
+  const stats = ui.stats(people, [northline], null,
+    [deal(northline, { stage: 'proposal', value: 12000 }), deal(northline, { stage: 'qualified', value: 3000 })]);
   assert.deepEqual(figure(stats, 'Contacts'), { value: 3, caption: 'People in your network' });
   assert.equal(figure(stats, 'Pipeline value').value, money(15000, 'USD'));
   assert.match(figure(stats, 'Pipeline value').value, /^\$15,000(\.00)?$/);
-  assert.equal(figure(stats, 'Pipeline value').caption, '2 companies still to win', 'a company with nobody at it is still a deal');
+  assert.equal(figure(stats, 'Pipeline value').caption, '2 deals still to win');
 });
 
-test('the pipeline is the deals still to be won — leads, qualified deals and proposals, not clients, dormant or lost deals', () => {
-  const stats = ui.stats([], STAGES.map((stage, i) => company(stage, 10 ** i)));
+test('the pipeline is the open deals at a live stage — never a dormant one, and never one already won or lost', () => {
+  const at = company('client', 0);
+  const stats = ui.stats([], [at], null, [
+    deal(at, { stage: 'lead', value: 1 }),
+    deal(at, { stage: 'qualified', value: 10 }),
+    deal(at, { stage: 'proposal', value: 100 }),
+    deal(at, { stage: 'dormant', value: 1000 }),
+    deal(at, { stage: 'proposal', value: 10000, outcome: 'won', closed_at: '2026-09-10T09:00:00Z' }),
+    deal(at, { stage: 'lead', value: 100000, outcome: 'lost', closed_at: '2026-09-10T09:00:00Z' })
+  ]);
   assert.equal(figure(stats, 'Pipeline value').value, money(111, 'USD'));
-  assert.equal(figure(stats, 'Pipeline value').caption, '3 companies still to win');
+  assert.equal(figure(stats, 'Pipeline value').caption, '3 deals still to win');
 });
 
 test('one currency is never added into another: each has its own total, side by side', () => {
-  const stats = ui.stats([], [company('lead', 1000, 'USD'), company('proposal', 3500, 'EUR'), company('lead', 250, 'usd')]);
+  const at = company('lead', 0);
+  const stats = ui.stats([], [at], null, [
+    deal(at, { value: 1000, currency: 'USD' }), deal(at, { stage: 'proposal', value: 3500, currency: 'EUR' }),
+    deal(at, { value: 250, currency: 'usd' })
+  ]);
   assert.equal(figure(stats, 'Pipeline value').value, `${money(3500, 'EUR')} · ${money(1250, 'USD')}`);
 });
 
 test('a currency stored before currencies had to be codes is never added to the dollars', () => {
-  const parts = figure(ui.stats([], [company('lead', 1000, 'USD'), company('lead', 50, 'US$')]), 'Pipeline value').value.split(' · ');
+  const at = company('lead', 0);
+  const parts = figure(ui.stats([], [at], null,
+    [deal(at, { value: 1000, currency: 'USD' }), deal(at, { value: 50, currency: 'US$' })]), 'Pipeline value').value.split(' · ');
   assert.equal(parts.length, 2);
   assert.ok(parts.includes(money(1000, 'USD')), 'the dollars are only the dollars');
   assert.ok(parts.includes(money(50, 'US$')));
 });
 
-test('active clients are companies, not the people who work at them', () => {
+test('active clients are companies, not the people who work at them, and not their deals', () => {
   const client = company('client', 9000);
   const people = ['Ana', 'Ben', 'Cy'].map(name => contact(name, `${name.toLowerCase()}@client.example`, client));
-  const stats = ui.stats(people, [client, company('lead', 10), company('dormant', 20)]);
+  const stats = ui.stats(people, [client, company('lead', 10), company('dormant', 20)], null,
+    [deal(client), deal(client)]);
   assert.deepEqual(figure(stats, 'Active clients'), { value: 1, caption: 'Companies you work with' });
 });
 
-test('companies that did not load are a dash, not a zero, and the people who did load are still counted', () => {
+test('companies that did not load are a dash, not a zero, and the deals and people that did load are still counted', () => {
+  const at = company('lead', 0);
   for (const companies of [null, undefined]) {
-    const stats = ui.stats([contact('Ana', 'ana@northline.example')], companies);
+    const stats = ui.stats([contact('Ana', 'ana@northline.example')], companies, null, [deal(at, { value: 500 })]);
     assert.equal(figure(stats, 'Contacts').value, 1);
-    assert.deepEqual(figure(stats, 'Pipeline value'), { value: '—', caption: 'Companies did not load' });
+    assert.equal(figure(stats, 'Pipeline value').value, money(500, 'USD'), 'deals loaded fine on their own');
     assert.deepEqual(figure(stats, 'Active clients'), { value: '—', caption: 'Companies did not load' });
   }
 });
 
+test('deals that did not load are a dash that says so, not a zero, while the clients are still counted', () => {
+  for (const list of [null, undefined]) {
+    const stats = ui.stats([], [company('client', 9000)], null, list);
+    assert.deepEqual(figure(stats, 'Pipeline value'), { value: '—', caption: 'Deals did not load' });
+    assert.equal(figure(stats, 'Active clients').value, 1);
+  }
+});
+
 test('contacts that did not load are a dash, not a zero, in the strip', () => {
+  const at = company('lead', 0);
   for (const contactsList of [null, undefined]) {
-    const stats = ui.stats(contactsList, [company('lead', 500)]);
+    const stats = ui.stats(contactsList, [at], null, [deal(at, { value: 500 })]);
     assert.deepEqual(figure(stats, 'Contacts'), { value: '—', caption: 'Contacts did not load' });
-    assert.equal(figure(stats, 'Pipeline value').value, money(500, 'USD'), 'companies loaded fine on their own');
+    assert.equal(figure(stats, 'Pipeline value').value, money(500, 'USD'), 'deals loaded fine on their own');
   }
 });
 
@@ -496,28 +543,39 @@ test('before contacts have loaded the strip and the contacts tab say so, not tha
   assert.doesNotMatch(tab, /Ana/, 'the stale global array is not drawn as if it had loaded');
 });
 
-test('with no deal to win the value is a dash that says so, a deal with no value adds nothing, and no clients is zero', () => {
-  const none = ui.stats([], []);
-  assert.deepEqual(figure(none, 'Pipeline value'), { value: '—', caption: 'No open deals' });
-  assert.equal(figure(none, 'Active clients').value, 0);
-  const unvalued = ui.stats([], [company('lead', null), company('proposal', '')]);
-  assert.deepEqual(figure(unvalued, 'Pipeline value'), { value: '—', caption: '2 companies still to win' });
-  assert.equal(figure(ui.stats([], [company('lead', 500)]), 'Pipeline value').caption, '1 company still to win');
+test('before deals have loaded the strip and the board say so, not that there are none', () => {
+  const withoutDeals = EVERYTHING.filter(part => part !== 'deals');
+  const html = load({ route: ['crm'], companies: [company('lead', 100)], loaded: withoutDeals }).view();
+  assert.match(html, /<span>Pipeline value<\/span><strong>—<\/strong><small>Deals did not load<\/small>/);
+  assert.match(html, /<h3>Deals did not load<\/h3><p>They are tried again by themselves\.<\/p>/);
+  assert.doesNotMatch(html, /crm-deal-/, 'no empty board is drawn in their place');
 });
 
-test('a company loaded twice counts once: in the value, the caption and the clients', () => {
+test('with no deal to win the value is a dash that says so, a deal with no value adds nothing, and no clients is zero', () => {
+  const at = company('lead', 0);
+  const none = ui.stats([], [], null, []);
+  assert.deepEqual(figure(none, 'Pipeline value'), { value: '—', caption: 'No open deals' });
+  assert.equal(figure(none, 'Active clients').value, 0);
+  const unvalued = ui.stats([], [], null, [deal(at, { value: null }), deal(at, { stage: 'proposal', value: '' })]);
+  assert.deepEqual(figure(unvalued, 'Pipeline value'), { value: '—', caption: '2 deals still to win' });
+  assert.equal(figure(ui.stats([], [], null, [deal(at, { value: 500 })]), 'Pipeline value').caption, '1 deal still to win');
+});
+
+test('a deal loaded twice counts once, and a company loaded twice is one client', () => {
   const client = company('client', 9000);
-  const lead = company('lead', 500);
-  const stats = ui.stats([], [client, client, lead, lead]);
+  const open = deal(client, { value: 500 });
+  const stats = ui.stats([], [client, client], null, [open, open]);
   assert.equal(figure(stats, 'Active clients').value, 1);
-  assert.deepEqual(figure(stats, 'Pipeline value'), { value: money(500, 'USD'), caption: '1 company still to win' });
+  assert.deepEqual(figure(stats, 'Pipeline value'), { value: money(500, 'USD'), caption: '1 deal still to win' });
 });
 
 test('the studio\'s currency comes first, then the other codes, then what was stored before currencies were codes', () => {
-  const list = [company('lead', 7, 'EUR'), company('lead', 50, 'US$'), company('lead', 1000, 'USD'), company('lead', 3, 'CHF')];
-  assert.equal(figure(ui.stats([], list, 'USD'), 'Pipeline value').value,
+  const at = company('lead', 0);
+  const list = [deal(at, { value: 7, currency: 'EUR' }), deal(at, { value: 50, currency: 'US$' }),
+    deal(at, { value: 1000, currency: 'USD' }), deal(at, { value: 3, currency: 'CHF' })];
+  assert.equal(figure(ui.stats([], [], 'USD', list), 'Pipeline value').value,
     [money(1000, 'USD'), money(3, 'CHF'), money(7, 'EUR'), money(50, 'US$')].join(' · '));
-  assert.equal(figure(ui.stats([], list, null), 'Pipeline value').value,
+  assert.equal(figure(ui.stats([], [], null, list), 'Pipeline value').value,
     [money(3, 'CHF'), money(7, 'EUR'), money(1000, 'USD'), money(50, 'US$')].join(' · '), 'with no studio currency, the codes in order');
 });
 
@@ -562,42 +620,89 @@ test('the pipeline, the companies and the contacts are each an address of their 
   assert.equal(current(['crm', 'contacts']), 'crm/contacts');
 });
 
-test('the pipeline has a column for each of the six stages, each named by its heading, and a company with nobody at it is on it', () => {
+test('the pipeline has a column for each stage an open deal can stand at, and one for each outcome', () => {
   const northline = company('client', 12000, 'EUR', { name: 'Northline' });
   const kite = company('lead', 2500, 'USD', { name: 'Kite Labs' });
-  const quiet = company('dormant', 5000, 'USD', { name: 'Quiet Co' });
-  const html = load({ companies: [northline, kite, quiet], contacts: [contact('Olivia', 'olivia@northline.example', northline)] }).view();
-  assert.deepEqual([...html.matchAll(/<h2 id="crm-stage-[a-z]+">([^<]+)<\/h2>/g)].map(m => m[1]),
-    ['Leads', 'Qualified', 'Proposals', 'Clients', 'Dormant', 'Lost']);
-  for (const stage of STAGES) {
-    assert.match(html, new RegExp(`<section class="board-column"[^>]* aria-labelledby="crm-stage-${stage}"[^>]*>`), `the ${stage} column is named by its heading`);
-    assert.match(html, new RegExp(`<section class="board-column"[^>]* data-crm-column="${stage}"[^>]*>`), `the ${stage} column says which stage a drop onto it means`);
+  const html = load({
+    companies: [northline, kite],
+    deals: [
+      deal(northline, { title: 'Retainer renewal', stage: 'proposal' }),
+      deal(kite, { title: 'First site', stage: 'lead' }),
+      deal(northline, { title: 'Old audit', stage: 'dormant' }),
+      deal(northline, { title: 'Rebrand', stage: 'proposal', outcome: 'won', closed_at: '2026-09-10T09:00:00Z' }),
+      deal(kite, { title: 'Pitch', stage: 'qualified', outcome: 'lost', closed_at: '2026-08-01T09:00:00Z' })
+    ]
+  }).view();
+  assert.deepEqual([...html.matchAll(/<h2 id="crm-deal-[a-z]+">([^<]+)<\/h2>/g)].map(m => m[1]),
+    ['Leads', 'Qualified', 'Proposals', 'Dormant', 'Won', 'Lost']);
+  for (const col of COLUMNS) {
+    assert.match(html, new RegExp(`<section class="board-column"[^>]* aria-labelledby="crm-deal-${col}"[^>]*>`), `the ${col} column is named by its heading`);
+    assert.match(html, new RegExp(`<section class="board-column"[^>]* data-deal-column="${col}"[^>]*>`), `the ${col} column says which column a drop onto it means`);
   }
-  assert.match(column(html, 'lead'), new RegExp(`href="#crm/companies/${kite.id}"`), 'Kite Labs has nobody yet, and is on the board');
-  assert.match(column(html, 'dormant'), /Quiet Co/, 'a dormant company is not dropped off the board');
-  assert.match(column(html, 'client'), /Olivia/, 'a card says who works there');
+  assert.match(column(html, 'proposal'), /Retainer renewal/);
+  assert.match(column(html, 'dormant'), /Old audit/, 'a dormant deal is open, and on the board');
+  assert.match(column(html, 'won'), /Rebrand/, 'a won deal is drawn by its outcome, not by the stage it kept');
+  assert.doesNotMatch(column(html, 'proposal'), /Rebrand/);
+  assert.match(column(html, 'lost'), /Pitch/);
+  assert.doesNotMatch(column(html, 'qualified'), /Pitch/);
 });
 
-test('a card says who works there and what it is worth, its name is a heading under its column\'s, and its initials are not read out', () => {
-  const harbor = company('client', 9000, 'USD', { name: 'Harbor & Co' });
-  const kite = company('lead', null, 'USD', { name: 'Kite Labs' });
-  const html = load({ companies: [harbor, kite], contacts: [contact('Ben', 'ben@harbor.example', harbor), contact('Maya', 'maya@harbor.example', harbor)] }).view();
-  assert.match(column(html, 'client'), /<h3>Harbor &amp; Co<\/h3><p>Ben and 1 more<\/p>/);
-  assert.match(column(html, 'client'), /<strong>\$9,000\.00<\/strong><span>Yearly value<\/span>/);
-  assert.match(column(html, 'lead'), /<p>Nobody here yet<\/p>/);
-  assert.match(column(html, 'lead'), /<strong>—<\/strong><span>Deal value<\/span>/, 'a deal with no value is a dash, not $0.00');
-  assert.match(column(html, 'client'), /<div class="avatar contact-avatar" aria-hidden="true">/);
+test('one company holds several open deals at once, on different columns — what one stage per company could never do', () => {
+  const northline = company('client', 12000, 'EUR', { id: U1, name: 'Northline' });
+  const html = load({
+    companies: [northline],
+    deals: [deal(northline, { title: 'Renewal', stage: 'proposal' }), deal(northline, { title: 'New site', stage: 'qualified' })]
+  }).view();
+  assert.match(column(html, 'proposal'), /Renewal/);
+  assert.match(column(html, 'qualified'), /New site/);
+  assert.equal((html.match(new RegExp(`href="#crm/companies/${U1}"`, 'g')) || []).length, 2, 'both cards open the one company');
+});
+
+test('a card names the deal, links to its company, says what it is worth and when, and carries its own buttons', () => {
+  const harbor = company('client', 9000, 'USD', { id: U1, name: 'Harbor & Co' });
+  const html = load({
+    companies: [harbor],
+    deals: [
+      deal(harbor, { id: U2, title: 'Harbor rebrand', stage: 'proposal', value: 9000, expected_close: '2026-11-30' }),
+      deal(harbor, { id: U3, title: 'Harbor audit', stage: 'lead' }),
+      deal(harbor, { title: 'Harbor pilot', stage: 'qualified', value: 400, outcome: 'won', closed_at: '2026-09-14T09:00:00Z' })
+    ]
+  }).view();
+  const proposal = column(html, 'proposal');
+  assert.match(proposal, /<h3 id="deal-title-[^"]+">Harbor rebrand<\/h3>/);
+  assert.match(proposal, new RegExp(`href="#crm/companies/${U1}">Harbor &amp; Co<`), 'the company is the link a card opens');
+  assert.match(proposal, /<strong>\$9,000\.00<\/strong><span>Expected Nov 30<\/span>/);
+  assert.match(proposal, new RegExp(`data-deal-edit="${U2}"`));
+  assert.match(proposal, new RegExp(`data-deal-close="${U2}"`));
+  assert.doesNotMatch(proposal, /data-deal-reopen/, 'an open deal is closed, not reopened');
+  assert.match(column(html, 'lead'), /<strong>—<\/strong><span>No close date yet<\/span>/, 'a deal with no value is a dash, not $0.00');
+  const won = column(html, 'won');
+  assert.match(won, /<span>Won from Qualified · Sep 14<\/span>/, 'a closed deal says the stage it was at when it closed');
+  assert.match(won, /data-deal-reopen=/);
+  assert.doesNotMatch(won, /data-deal-close=/);
+  assert.match(proposal, /<div class="avatar contact-avatar" aria-hidden="true">/);
+  assert.match(proposal, /<article class="panel contact-card deal-card" draggable="true"/, 'an article, not a link: it holds buttons');
 });
 
 test('each column says what it is worth in each currency, never added together', () => {
-  const html = load({ companies: [company('lead', 1000, 'USD'), company('lead', 3500, 'EUR'), company('client', 10)] }).view();
+  const at = company('lead', 0, 'USD', { name: 'Anyone' });
+  const html = load({
+    companies: [at],
+    deals: [deal(at, { value: 1000, currency: 'USD' }), deal(at, { value: 3500, currency: 'EUR' }),
+      deal(at, { stage: 'proposal', value: 10, outcome: 'won', closed_at: '2026-09-10T09:00:00Z' })]
+  }).view();
   assert.ok(column(html, 'lead').includes(`<p class="board-total">${money(3500, 'EUR')} · ${money(1000, 'USD')}</p>`));
   assert.doesNotMatch(column(html, 'qualified'), /board-total/, 'a column worth nothing says nothing');
+  assert.ok(column(html, 'won').includes(`<p class="board-total">${money(10, 'USD')}</p>`), 'the closed columns are worth something too');
 });
 
 test('the pages put the studio\'s currency first, in the strip and on the board', () => {
   /* Dollars, which a list in code order puts after euros. */
-  const html = load({ overview: { revenue_currency: 'usd' }, companies: [company('lead', 1000, 'USD'), company('lead', 500, 'EUR')] }).view();
+  const at = company('lead', 0, 'USD', { name: 'Anyone' });
+  const html = load({
+    overview: { revenue_currency: 'usd' }, companies: [at],
+    deals: [deal(at, { value: 1000, currency: 'USD' }), deal(at, { value: 500, currency: 'EUR' })]
+  }).view();
   const dollarsFirst = `${money(1000, 'USD')} · ${money(500, 'EUR')}`;
   assert.ok(html.includes(`<strong>${dollarsFirst}</strong>`), 'the strip');
   assert.ok(column(html, 'lead').includes(`<p class="board-total">${dollarsFirst}</p>`), 'the column');
@@ -683,15 +788,150 @@ test('the pipeline\'s six columns narrow for a phone: the plain board\'s own pho
   assert.ok(css.indexOf(at520[0]) > css.indexOf(at760[0]), 'and 520px after 760px, so it wins at the smallest width');
 });
 
-test('while companies did not load the pipeline says so, rather than showing an empty board', () => {
-  const html = load({ loaded: ['contacts'] }).view();
+test('while companies did not load the pipeline says so, rather than showing a board of deals belonging to nobody', () => {
+  const html = load({ loaded: ['contacts', 'deals'] }).view();
   assert.match(html, /Companies did not load/);
-  assert.doesNotMatch(html, /crm-stage-/);
+  assert.doesNotMatch(html, /crm-deal-/);
 });
 
-/* ── Filtering and sorting the companies list ────────────────────────────── */
+/* ── A company's deals ───────────────────────────────────────────────────── */
 
-test('the filter bar narrows the pipeline and the companies table by stage, kind and owner, each an exact match', () => {
+test('a company\'s page lists its deals, open first and then its history, and offers Add deal', () => {
+  const northline = company('client', 12000, 'EUR', { id: U1, name: 'Northline' });
+  const elsewhere = company('lead', 1, 'USD', { name: 'Harbor' });
+  const html = load({
+    route: ['crm', 'companies', U1], companies: [northline, elsewhere],
+    deals: [
+      deal(northline, { title: 'Won last year', stage: 'proposal', value: 8000, outcome: 'won', closed_at: '2025-09-10T09:00:00Z' }),
+      deal(northline, { title: 'Open now', stage: 'proposal', value: 12000 }),
+      deal(northline, { title: 'Lost recently', stage: 'lead', outcome: 'lost', closed_at: '2026-08-01T09:00:00Z' }),
+      deal(elsewhere, { title: 'Not theirs' })
+    ]
+  }).view();
+  const panel = html.split('<h2>Deals</h2>')[1].split('</section>')[0];
+  assert.deepEqual([...panel.matchAll(/<strong>([^<]+)<\/strong><small>/g)].map(m => m[1]),
+    ['Open now', 'Lost recently', 'Won last year'], 'what is live before what is history, newest closed first');
+  assert.doesNotMatch(panel, /Not theirs/, 'another company\'s deal is not on this page');
+  assert.match(panel, /<span class="pill">Proposal<\/span><strong>\$12,000\.00<\/strong>/);
+  assert.match(panel, /<span class="pill">Won<\/span>/, 'a closed deal is named by its outcome');
+  assert.match(html, new RegExp(`data-deal-new="${U1}"`), 'Add deal arrives with the company already picked');
+});
+
+test('a company\'s deals offer Edit and Won or lost while open, Reopen once closed, and Remove only to a manager', () => {
+  const northline = company('client', 1, 'EUR', { id: U1, name: 'Northline' });
+  const page = manager => load({
+    route: ['crm', 'companies', U1], companies: [northline], manager,
+    deals: [deal(northline, { id: U2, title: 'Open now' }),
+      deal(northline, { id: U3, title: 'Won then', outcome: 'won', closed_at: '2026-09-10T09:00:00Z' })]
+  }).view().split('<h2>Deals</h2>')[1].split('</section>')[0];
+  const asManager = page(true);
+  assert.match(asManager, new RegExp(`data-deal-edit="${U2}"`));
+  assert.match(asManager, new RegExp(`data-deal-close="${U2}"`));
+  assert.match(asManager, new RegExp(`data-deal-reopen="${U3}"`));
+  assert.match(asManager, new RegExp(`data-deal-delete="${U2}"`));
+  const asStaff = page(false);
+  assert.match(asStaff, new RegExp(`data-deal-edit="${U2}"`), 'staff still add and change deals');
+  assert.doesNotMatch(asStaff, /data-deal-delete/, 'only an owner or admin removes one');
+});
+
+test('a company with no deals says so, and deals that did not load say that instead', () => {
+  const northline = company('client', 1, 'EUR', { id: U1, name: 'Northline' });
+  const none = load({ route: ['crm', 'companies', U1], companies: [northline] }).view();
+  assert.match(none, /No deals yet\. Add one with Add deal\./);
+  const failed = load({ route: ['crm', 'companies', U1], companies: [northline], loaded: EVERYTHING.filter(p => p !== 'deals') }).view();
+  assert.match(failed, /Deals did not load\. They are tried again by themselves\./);
+  assert.doesNotMatch(failed, /No deals yet/, 'a list that did not answer is not a company with none');
+});
+
+test('New deal is offered on the lists only once there is a company to file one under', () => {
+  assert.match(load({ companies: [company('lead', 1)] }).view(), /data-deal-new/);
+  assert.doesNotMatch(load({ companies: [] }).view(), /data-deal-new/);
+});
+
+/* ── Filtering and sorting the board and the companies list ──────────────── */
+
+test('the board\'s filter bar narrows it by stage and owner, each an exact match, and never by a company\'s kind', () => {
+  const sam = { id: 'e-sam', name: 'Sam Rivera' };
+  const at = company('lead', 0, 'USD', { name: 'Anyone' });
+  const list = [
+    deal(at, { title: 'Owned lead', stage: 'lead', owner_id: 'e-sam' }),
+    deal(at, { title: 'Spare proposal', stage: 'proposal' }),
+    deal(at, { title: 'Won proposal', stage: 'proposal', outcome: 'won', closed_at: '2026-09-10T09:00:00Z' })
+  ];
+
+  const plain = load({ companies: [at], deals: list, team: [sam] }).view();
+  assert.doesNotMatch(plain, /data-deal-filter="kind"/, 'a kind is a company\'s, and this board draws deals');
+
+  const byStage = load({ companies: [at], deals: list, team: [sam] });
+  byStage.change({ 'data-deal-filter': 'stage' }, 'proposal');
+  const staged = byStage.view();
+  assert.match(staged, /Spare proposal/);
+  assert.match(staged, /Won proposal/, 'a closed deal is filtered by the stage it kept, so a win out of Proposal is still found');
+  assert.doesNotMatch(staged, /Owned lead/);
+
+  const byOwner = load({ companies: [at], deals: list, team: [sam] });
+  byOwner.change({ 'data-deal-filter': 'owner' }, 'e-sam');
+  assert.match(byOwner.view(), /Owned lead/);
+  assert.doesNotMatch(byOwner.view(), /Spare proposal/);
+
+  const unowned = load({ companies: [at], deals: list, team: [sam] });
+  unowned.change({ 'data-deal-filter': 'owner' }, 'unowned');
+  assert.doesNotMatch(unowned.view(), /Owned lead/);
+  assert.match(unowned.view(), /Spare proposal/);
+});
+
+test('the board sorts by expected close, value, name or company, and a deal with no close date comes after the ones that have one', () => {
+  const at = company('lead', 0, 'USD', { name: 'Alpha Co' });
+  const other = company('lead', 0, 'USD', { name: 'Beta Co' });
+  const list = [
+    deal(at, { title: 'Later', expected_close: '2026-12-01', value: 10 }),
+    deal(other, { title: 'Sooner', expected_close: '2026-10-01', value: 50 }),
+    deal(at, { title: 'Undated', value: 5 })
+  ];
+  const h = load({ companies: [at, other], deals: list });
+  const order = html => [...column(html, 'lead').matchAll(/<h3 id="deal-title-[^"]+">([^<]+)<\/h3>/g)].map(m => m[1]);
+  assert.deepEqual(order(h.view()), ['Sooner', 'Later', 'Undated'], 'soonest first, and a date nobody set is a question still open');
+  h.change({ 'data-deal-sort': '' }, 'value');
+  assert.deepEqual(order(h.view()), ['Sooner', 'Later', 'Undated'], 'highest value first');
+  h.change({ 'data-deal-sort': '' }, 'name');
+  assert.deepEqual(order(h.view()), ['Later', 'Sooner', 'Undated']);
+  h.change({ 'data-deal-sort': '' }, 'company');
+  assert.deepEqual(order(h.view()), ['Later', 'Undated', 'Sooner'], 'Alpha Co\'s two, then Beta Co\'s');
+});
+
+test('the board\'s Clear filters appears only once one is set, and a filter matching nothing says so', () => {
+  const at = company('lead', 0, 'USD', { name: 'Anyone' });
+  const h = load({ companies: [at], deals: [deal(at, { title: 'Only one', stage: 'lead' })] });
+  assert.doesNotMatch(h.view(), /data-deal-clear-filters/);
+  h.change({ 'data-deal-filter': 'stage' }, 'proposal');
+  assert.match(h.view(), /data-deal-clear-filters/);
+  assert.match(column(h.view(), 'lead'), /Nothing here matches\./,
+    'narrowed to nothing is not the same as a pipeline with nothing in it');
+  h.click({ 'data-deal-clear-filters': '' });
+  assert.doesNotMatch(h.view(), /data-deal-clear-filters/);
+  assert.match(column(h.view(), 'lead'), /Only one/);
+});
+
+test('an empty board says what is missing, per column, when nothing is narrowing it', () => {
+  const html = load({ companies: [company('lead', 1)] }).view();
+  assert.match(column(html, 'lead'), /No deals at this stage\./);
+  assert.match(column(html, 'won'), /No deals won yet\./);
+  assert.match(column(html, 'lost'), /No deals lost yet\./);
+});
+
+test('the board\'s search finds a deal by its name and by the company it is for', () => {
+  const at = company('lead', 0, 'USD', { name: 'Northline' });
+  const other = company('lead', 0, 'USD', { name: 'Harbor' });
+  const list = [deal(at, { title: 'Retainer renewal' }), deal(other, { title: 'Pilot' })];
+  const byName = load({ companies: [at, other], deals: list, query: 'retainer' }).view();
+  assert.match(byName, /Retainer renewal/);
+  assert.doesNotMatch(column(byName, 'lead'), /Pilot/);
+  const byCompany = load({ companies: [at, other], deals: list, query: 'harbor' }).view();
+  assert.match(column(byCompany, 'lead'), /Pilot/);
+  assert.doesNotMatch(column(byCompany, 'lead'), /Retainer renewal/);
+});
+
+test('the filter bar narrows the companies table by stage, kind and owner, each an exact match', () => {
   const sam = { id: 'e-sam', name: 'Sam Rivera' };
   const northline = company('client', 100, 'USD', { name: 'Northline', owner_id: 'e-sam' });
   const harbor = company('lead', 50, 'USD', { name: 'Harbor', kind: 'partner' });
@@ -726,10 +966,15 @@ test('the filter bar narrows the pipeline and the companies table by stage, kind
 });
 
 test('without the team loaded, only the owner filter is left out — a select with nobody to choose is worse than none', () => {
-  const html = load({ route: ['crm', 'companies'], loaded: EVERYTHING.filter(p => p !== 'team'), companies: [company('lead', 1)] }).view();
-  assert.doesNotMatch(html, /data-crm-filter="owner"/);
-  assert.match(html, /data-crm-filter="stage"/);
-  assert.match(html, /data-crm-sort/);
+  const withoutTeam = EVERYTHING.filter(p => p !== 'team');
+  const table = load({ route: ['crm', 'companies'], loaded: withoutTeam, companies: [company('lead', 1)] }).view();
+  assert.doesNotMatch(table, /data-crm-filter="owner"/);
+  assert.match(table, /data-crm-filter="stage"/);
+  assert.match(table, /data-crm-sort/);
+  const board = load({ route: ['crm'], loaded: withoutTeam, companies: [company('lead', 1)] }).view();
+  assert.doesNotMatch(board, /data-deal-filter="owner"/, 'the board follows the same rule');
+  assert.match(board, /data-deal-filter="stage"/);
+  assert.match(board, /data-deal-sort/);
 });
 
 test('sort orders the companies table by name, by value, or by where each is in the pipeline, ties broken by name', () => {
@@ -766,58 +1011,89 @@ test('a filter or a search with nothing matching says so, kept apart from a CRM 
 
 /* ── Dragging a card to another stage ────────────────────────────────────── */
 
-test('dragging a card onto another column saves its new stage, and dropping it back on its own does nothing', async () => {
-  const northline = company('lead', 1000, 'USD', { id: U1, name: 'Northline' });
-  const h = load({ companies: [northline], route: ['crm'] });
+test('dragging a card onto another stage column saves it there, and dropping it back on its own does nothing', async () => {
+  const at = company('lead', 1000, 'USD', { id: U1, name: 'Northline' });
+  const open = deal(at, { id: U2, title: 'Renewal', stage: 'lead' });
+  const h = load({ companies: [at], deals: [open], route: ['crm'] });
   const dt = h.dataTransfer();
-  h.fire('dragstart', { 'data-crm-card': U1 }, { dataTransfer: dt });
-  assert.equal(dt.getData('text/plain'), U1);
-  const over = h.fire('dragover', { 'data-crm-column': 'client' });
+  h.fire('dragstart', { 'data-deal-card': U2 }, { dataTransfer: dt });
+  assert.equal(dt.getData('text/plain'), U2);
+  const over = h.fire('dragover', { 'data-deal-column': 'proposal' });
   assert.equal(over.defaultPrevented, true, 'a drop is only ever allowed once this runs');
-  h.fire('drop', { 'data-crm-column': 'client' }, { dataTransfer: dt });
+  h.fire('drop', { 'data-deal-column': 'proposal' }, { dataTransfer: dt });
   await settle();
-  assert.deepEqual(h.written, [['updateCompany', U1, { stage: 'client' }]]);
-  assert.equal(h.toasts.at(-1), 'Northline moved to Client.');
+  assert.deepEqual(h.written, [['updateDeal', U2, { stage: 'proposal' }]]);
+  assert.equal(h.toasts.at(-1), 'Renewal moved to Proposal.');
 
-  const same = load({ companies: [northline], route: ['crm'] });
+  const same = load({ companies: [at], deals: [open], route: ['crm'] });
   const dt2 = same.dataTransfer();
-  same.fire('dragstart', { 'data-crm-card': U1 }, { dataTransfer: dt2 });
-  same.fire('drop', { 'data-crm-column': 'lead' }, { dataTransfer: dt2 });
+  same.fire('dragstart', { 'data-deal-card': U2 }, { dataTransfer: dt2 });
+  same.fire('drop', { 'data-deal-column': 'lead' }, { dataTransfer: dt2 });
   await settle();
   assert.deepEqual(same.written, [], 'already there: nothing to save');
 });
 
-test('a drop with no dragged id, no matching company, or before the workspace has loaded saves nothing', async () => {
-  const northline = company('lead', 1, 'USD', { id: U1, name: 'Northline' });
-  const noId = load({ companies: [northline], route: ['crm'] });
-  noId.fire('drop', { 'data-crm-column': 'client' }, { dataTransfer: noId.dataTransfer() });
+test('dropping a card on Won or Lost closes it where it stands, and dropping a closed one back on a stage reopens it', async () => {
+  const at = company('lead', 1000, 'USD', { id: U1, name: 'Northline' });
+  const open = deal(at, { id: U2, title: 'Renewal', stage: 'proposal' });
+  const h = load({ companies: [at], deals: [open], route: ['crm'] });
+  const dt = h.dataTransfer();
+  dt.setData('text/plain', U2);
+  h.fire('drop', { 'data-deal-column': 'won' }, { dataTransfer: dt });
+  await settle();
+  assert.equal(h.written.length, 1);
+  const [verb, id, changes] = h.written[0];
+  assert.equal(verb, 'updateDeal');
+  assert.equal(id, U2);
+  assert.equal(changes.outcome, 'won');
+  assert.match(changes.closed_at, /^\d{4}-\d{2}-\d{2}T/, 'the day it closed goes with the outcome, which the database insists on');
+  assert.equal(Object.keys(changes).includes('stage'), false, 'it keeps the stage it was at: that is the history');
+  assert.equal(h.toasts.at(-1), 'Renewal moved to Won.');
+
+  const closed = deal(at, { id: U3, title: 'Pilot', stage: 'qualified', outcome: 'lost', closed_at: '2026-08-01T09:00:00Z' });
+  const back = load({ companies: [at], deals: [closed], route: ['crm'] });
+  const dt2 = back.dataTransfer();
+  dt2.setData('text/plain', U3);
+  back.fire('drop', { 'data-deal-column': 'proposal' }, { dataTransfer: dt2 });
+  await settle();
+  assert.deepEqual(back.written, [['updateDeal', U3, { stage: 'proposal', outcome: null, closed_at: null }]],
+    'a deal cannot sit in a stage column and still hold an outcome, so both are cleared in the one write');
+});
+
+test('a drop with no dragged id, no matching deal, or before the workspace has loaded saves nothing', async () => {
+  const at = company('lead', 1, 'USD', { id: U1, name: 'Northline' });
+  const open = deal(at, { id: U2, stage: 'lead' });
+  const noId = load({ companies: [at], deals: [open], route: ['crm'] });
+  noId.fire('drop', { 'data-deal-column': 'proposal' }, { dataTransfer: noId.dataTransfer() });
   await settle();
   assert.deepEqual(noId.written, []);
 
-  const goneCompany = load({ companies: [northline], route: ['crm'] });
-  const dt = goneCompany.dataTransfer();
+  const goneDeal = load({ companies: [at], deals: [open], route: ['crm'] });
+  const dt = goneDeal.dataTransfer();
   dt.setData('text/plain', 'not-a-real-id');
-  goneCompany.fire('drop', { 'data-crm-column': 'client' }, { dataTransfer: dt });
+  goneDeal.fire('drop', { 'data-deal-column': 'proposal' }, { dataTransfer: dt });
   await settle();
-  assert.deepEqual(goneCompany.written, []);
+  assert.deepEqual(goneDeal.written, []);
 
-  const loading = load({ companies: [northline], route: ['crm'], workspaceLoaded: false });
+  const loading = load({ companies: [at], deals: [open], route: ['crm'], workspaceLoaded: false });
   const dt2 = loading.dataTransfer();
-  dt2.setData('text/plain', U1);
-  loading.fire('drop', { 'data-crm-column': 'client' }, { dataTransfer: dt2 });
+  dt2.setData('text/plain', U2);
+  loading.fire('drop', { 'data-deal-column': 'proposal' }, { dataTransfer: dt2 });
   await settle();
   assert.deepEqual(loading.written, []);
   assert.equal(loading.toasts.at(-1), 'Not yet: the workspace is still loading.');
 });
 
-test('a stage a drop refuses to save says so in a toast, as any other CRM write does', async () => {
-  const northline = company('lead', 1, 'USD', { id: U1, name: 'Northline' });
-  const h = load({ companies: [northline], route: ['crm'], refuse: 'The company was not saved: it has been removed from the CRM, or you may not change it.' });
+test('a move a drop refuses to save says so in a toast, as any other CRM write does', async () => {
+  const at = company('lead', 1, 'USD', { id: U1, name: 'Northline' });
+  const open = deal(at, { id: U2, stage: 'lead' });
+  const h = load({ companies: [at], deals: [open], route: ['crm'],
+    refuse: 'The deal was not saved: it has been removed, or you may not change it.' });
   const dt = h.dataTransfer();
-  dt.setData('text/plain', U1);
-  h.fire('drop', { 'data-crm-column': 'client' }, { dataTransfer: dt });
+  dt.setData('text/plain', U2);
+  h.fire('drop', { 'data-deal-column': 'proposal' }, { dataTransfer: dt });
   await settle();
-  assert.equal(h.toasts.at(-1), 'The company was not saved: it has been removed from the CRM, or you may not change it.');
+  assert.equal(h.toasts.at(-1), 'The deal was not saved: it has been removed, or you may not change it.');
 });
 
 /* ── Debouncing the search box ───────────────────────────────────────────── */

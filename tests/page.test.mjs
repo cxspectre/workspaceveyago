@@ -50,6 +50,13 @@ test('the models load before the views that use them', () => {
   assert.ok(at('finance-model.js') < at('crm-ui.js'), 'the pipeline value is written the way Finance writes money');
   assert.ok(at('workspace.js') < at('crm-ui.js'), 'crm-ui.js draws the CRM with the page helpers workspace.js defines');
   assert.ok(at('projects-model.js') < at('crm-ui.js'), 'a contact\'s role on a project is named the way the project page names it');
+  assert.ok(at('crm-model.js') < at('deals-model.js'), 'a deal\'s value is counted with the CRM model\'s own money rules');
+  assert.ok(at('deals-model.js') < at('deals-board.js'), 'the pipeline board reads the deals model as soon as it is drawn');
+  assert.ok(at('crm-ui.js') < at('deals-board.js'), 'the board writes a column total the way crm-ui.js writes the strip\'s, through crmUi.moneyLine');
+  assert.ok(at('finance-model.js') < at('deals-board.js'), 'a deal\'s value is written the way Finance writes money');
+  assert.ok(at('deals-board.js') < at('deal-forms.js'), 'the board draws the buttons the deal dialogs answer');
+  assert.ok(at('deals-model.js') < at('deal-forms.js'), 'the deal dialogs check what they save with the model');
+  assert.ok(at('dialog-forms.js') < at('deal-forms.js'), 'the deal dialogs take their shared helpers as they load');
   assert.ok(at('crm-model.js') < at('crm-forms.js'), 'the CRM dialogs check what they save with the model');
   assert.ok(at('dialog-forms.js') < at('crm-forms.js'), 'the CRM dialogs take their shared helpers as they load');
   assert.ok(at('dialog-forms.js') < at('finance-ui.js'), 'Finance\'s dialogs use the shared helpers');
