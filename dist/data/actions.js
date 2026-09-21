@@ -852,6 +852,43 @@
         'The event was not changed: it was changed or removed since this was opened, or only whoever booked it, or an owner or admin, can change it. Close this and open the event again.')[0];
     },
 
+    /* Answering an invitation (0068). Never a table write, whoever is asking:
+       0057's column guard holds a non-manager to an event's title, times,
+       place and details, and response_status is deliberately not among them —
+       a reply recorded here that never reached Outlook is an answer no
+       organiser was ever told about, which is worse than no answer at all. So
+       this always goes through respond-calendar-event, which sends it to
+       Graph first and writes the row with the service role only once Graph
+       has taken it — the same order updateEvent and deleteEvent already use
+       for a synced event.
+
+       `scope` answers for this date ('occurrence', the default) or for every
+       one in the series ('series'), which the function resolves through the
+       row's own series_master_id: the browser never has to know Outlook's id
+       for anything. The three answers are Graph's own spellings, checked here,
+       again in the function, and a third time by the column's check
+       constraint — one spelling all the way down. */
+    async respondToEvent(eventId, response, options) {
+      var ANSWERS = ['accepted', 'tentativelyAccepted', 'declined'];
+      var settings = options || {};
+      must(eventId, 'Which event to answer was not given.');
+      must(ANSWERS.indexOf(response) !== -1, 'A reply is Accept, Maybe or Decline.');
+      var scope = settings.scope === 'series' ? 'series' : 'occurrence';
+      var comment = String(settings.comment == null ? '' : settings.comment).trim();
+      must(comment.length <= 1000, 'A note with a reply can be at most 1000 characters.');
+      var res = await sb().functions.invoke('respond-calendar-event', {
+        body: {
+          eventId: eventId, response: response, scope: scope,
+          comment: comment || null,
+          /* The organiser is told unless someone deliberately says not to —
+             one who is never told cannot plan a room. */
+          sendResponse: settings.sendResponse !== false
+        }
+      });
+      if (res.error) throw new Error(await functionError(res, 'The reply was not sent.'));
+      return res.data;
+    },
+
     /* ── Notes ───────────────────────────────────────────────────────── */
 
     /* author_id must be the caller's own employee row — RLS refuses anything

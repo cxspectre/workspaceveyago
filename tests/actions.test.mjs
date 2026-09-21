@@ -278,6 +278,79 @@ test('with no connection id, both still go straight to the table exactly as befo
   assert.equal(ws.invoked.length, 0);
 });
 
+/* ── Answering an invitation (0068) ──────────────────────────────────────── */
+
+test('a reply always goes through respond-calendar-event, never the table', async () => {
+  /* 0057's column guard holds a non-manager to an event's title, times, place
+     and details, and response_status is deliberately not among them: a reply
+     written here that never reached Outlook is an answer no organiser was ever
+     told about. So there is no table path to fall back to, for anyone. */
+  const ws = workspace(async () => ({ data: { ok: true, response: 'accepted', scope: 'occurrence', updated: 1 }, error: null }));
+  const result = await ws.actions.respondToEvent('ev-1', 'accepted');
+  assert.deepEqual(result, { ok: true, response: 'accepted', scope: 'occurrence', updated: 1 });
+  assert.deepEqual(ws.invoked, [{
+    name: 'respond-calendar-event',
+    body: { eventId: 'ev-1', response: 'accepted', scope: 'occurrence', comment: null, sendResponse: true }
+  }], 'this date by default, the organiser told by default, and no note unless one was written');
+  assert.equal(ws.written.length, 0);
+});
+
+test('a reply can answer for the whole series, and carry a note to the organiser', async () => {
+  const ws = workspace(async () => ({ data: { ok: true, updated: 12 }, error: null }));
+  await ws.actions.respondToEvent('ev-1', 'declined', { scope: 'series', comment: '  Clashes with the studio day.  ' });
+  assert.deepEqual(ws.invoked[0].body, {
+    eventId: 'ev-1', response: 'declined', scope: 'series',
+    comment: 'Clashes with the studio day.', sendResponse: true
+  });
+});
+
+test('a scope nobody offers answers for this date rather than for every one of them', async () => {
+  const ws = workspace(async () => ({ data: { ok: true }, error: null }));
+  await ws.actions.respondToEvent('ev-1', 'tentativelyAccepted', { scope: 'everything' });
+  assert.equal(ws.invoked[0].body.scope, 'occurrence');
+});
+
+test('only the three answers Graph knows are sent, in Graph\'s own spelling', async () => {
+  const ws = workspace(async () => ({ data: { ok: true }, error: null }));
+  for (const bad of ['maybe', 'Accepted', 'organizer', 'notResponded', '', undefined]) {
+    await assert.rejects(ws.actions.respondToEvent('ev-1', bad), { message: 'A reply is Accept, Maybe or Decline.' });
+  }
+  await assert.rejects(ws.actions.respondToEvent('', 'accepted'), /which event/i);
+  assert.equal(ws.invoked.length, 0, 'refused here, so Outlook is never asked');
+});
+
+test('a note longer than the function would take is refused before the round trip', async () => {
+  const ws = workspace(async () => ({ data: { ok: true }, error: null }));
+  await assert.rejects(ws.actions.respondToEvent('ev-1', 'accepted', { comment: 'x'.repeat(1001) }), /1000 characters/);
+  assert.equal(ws.invoked.length, 0);
+});
+
+test('the organiser can be left untold, but only by saying so', async () => {
+  const ws = workspace(async () => ({ data: { ok: true }, error: null }));
+  await ws.actions.respondToEvent('ev-1', 'accepted', { sendResponse: false });
+  assert.equal(ws.invoked[0].body.sendResponse, false);
+});
+
+test('a refusal is said in respond-calendar-event\'s own words', async () => {
+  const ws = workspace(async () => httpError(409, { error: 'You organised this meeting, so there is no invitation to answer.' }));
+  await assert.rejects(ws.actions.respondToEvent('ev-1', 'accepted'),
+    { message: 'You organised this meeting, so there is no invitation to answer.' });
+});
+
+test('an answer that never arrived is still a refusal, and never a quiet success', async () => {
+  /* The transport's own words win over the fallback here, exactly as they do
+     for every other function this file calls (errorMessage). What matters is
+     that the reply is REFUSED rather than resolving: a decline that silently
+     "worked" would leave an organiser waiting forever. */
+  const ws = workspace(async () => unreachable);
+  await assert.rejects(ws.actions.respondToEvent('ev-1', 'declined'), /Failed to send a request/);
+});
+
+test('a gateway page rather than JSON falls back to this action\'s own sentence', async () => {
+  const ws = workspace(async () => httpError(502, undefined));
+  await assert.rejects(ws.actions.respondToEvent('ev-1', 'declined'), { message: 'Edge Function returned a non-2xx status code' });
+});
+
 /* ── Connecting and syncing a calendar (0057) ────────────────────────────── */
 
 test('connecting a calendar asks microsoft-connect for that provider, and hands back Microsoft\'s page', async () => {

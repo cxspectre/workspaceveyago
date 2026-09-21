@@ -529,6 +529,21 @@ a.agenda-item:focus-visible{outline:2px solid #0071e3;outline-offset:2px;border-
 .attendee-list small{color:#66758a;font-size:.75rem;overflow-wrap:anywhere}
 .attendee-reply{flex-shrink:0;color:#66758a;font-size:.75rem}
 
+/* Answering an invitation (0068, event-invite.js). The answer already given
+   reads as the one in effect rather than being hidden: changing your mind is
+   ordinary, and someone who accepted last week still needs to see that they
+   did. aria-pressed carries the same thing for a screen reader, so the colour
+   is never the only way to tell. */
+.invite-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.invite-actions .reply-btn{padding:6px 14px;font-size:.8125rem}
+.invite-actions .reply-btn[aria-pressed="true"]{border-color:#0071e3;background:#eef5ff;color:#0b4da2;font-weight:500}
+.invite-actions .reply-btn:disabled{opacity:.55;cursor:progress}
+/* A meeting that is one of a series, marked wherever it is drawn: a small
+   glyph beside the time in a week or a day, a word in the schedule. The
+   glyph is aria-hidden — the card's own sentence says "repeats" instead. */
+.repeat-mark{margin-left:4px;opacity:.75}
+.repeat-note{margin-left:8px;color:#66758a;font-size:.75rem}
+
 /* The agenda's calendars (agenda-ui.js): each a toggle in its colour, above the
    week so a phone has them too; a hidden one reads faded and struck through. */
 .agenda-kinds{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 16px}
