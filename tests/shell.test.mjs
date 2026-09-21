@@ -69,6 +69,26 @@ test('a database search for a past meeting or a far-off event (searchEvents, 006
   assert.deepEqual([...events.map(r => r.route)], ['agenda/e1', 'agenda/past1']);
 });
 
+test('a database search for a message body or an older thread (searchMail, 0055) is found too, and not doubled up with what is already loaded', () => {
+  const withSearch = { ...sources, searchedMails: [
+    /* What threadFromSearchHit hands back: no sender or address, since a
+       search hit knows the message but not the thread's own state. */
+    { id: 'th9', subject: 'Draft for review, older copy', sender: 'Unknown sender', email: '', preview: 'buried in the body', folder: null },
+    /* Already on screen under the same id — one entry, not two. */
+    { id: 'th1', subject: 'Draft for review', sender: 'Unknown sender', email: '', preview: 'Here it is', folder: null }
+  ] };
+  const mail = model.search(model.searchItems(withSearch), 'draft for review').results.filter(r => r.type === 'Mail');
+  assert.equal(mail.length, 2, 'the loaded thread and the one only the database knew about — not three');
+  assert.deepEqual([...mail.map(r => r.route)], ['mail/all/inbox/th1', 'mail/all/null/th9'],
+    'the loaded one keeps its folder; a search hit has none and the route falls back');
+});
+
+test('a message found only by its body is reachable even though nothing loaded mentions the words', () => {
+  const hit = { id: 'th9', subject: 'Nothing matching here', sender: 'Unknown sender', email: '', preview: 'zzbodyonly deep in the message', folder: null };
+  const found = model.search(model.searchItems({ ...sources, searchedMails: [hit] }), 'zzbodyonly').results;
+  assert.deepEqual([...found.map(r => r.type + ':' + r.route)], ['Mail:mail/all/null/th9']);
+});
+
 test('a company opens its own page, whoever works there', () => {
   assert.ok(found('northline').includes('Company:crm/companies/co1'));
   assert.deepEqual([...found('quiet')], ['Company:crm/companies/co2']);

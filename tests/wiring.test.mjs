@@ -198,24 +198,34 @@ test('search is handed the project meetings coming up, beside the weeks loaded',
   assert.deepEqual([...vm.runInContext('searchSources()', context).projectEvents], [], 'before the store is on the page, none');
 });
 
-/* app.js's own searchEventsForBox(): the database half of global search
-   (0064's search_events), asked only once typing settles and only for a
-   query still current when the answer lands. */
-function loadSearchEvents({ searchEvents = null } = {}) {
+/* app.js's own searchDatabaseForBox(): the database half of global search —
+   0064's search_events and 0055's search_mail — asked only once typing
+   settles and only for a query still current when the answer lands. Both
+   ride one debounce and one sequence number, so a late answer from either
+   drops for the same reason. */
+function loadSearchEvents({ searchEvents = null, searchMail = null } = {}) {
   const timers = [];
   const asked = [];
+  const data = {};
+  if (searchEvents) data.searchEvents = q => { asked.push(q); return searchEvents(q); };
+  if (searchMail) data.searchMail = q => { asked.push(q); return searchMail(q); };
   const context = vm.createContext({
     setTimeout: (fn, ms) => { timers.push({ fn, ms, cleared: false, fired: false }); return timers.length - 1; },
     clearTimeout: id => { if (timers[id]) timers[id].cleared = true; },
     showResults: () => {},
-    workspaceData: searchEvents ? { searchEvents: q => { asked.push(q); return searchEvents(q); } } : undefined
+    /* threadFromSearchHit is mail-model's; the shape it returns is all this
+       harness needs, and keeping it here means the wiring test does not drag
+       the whole model in. */
+    mailModel: { threadFromSearchHit: h => ({ id: h.threadId, subject: h.subject, preview: h.preview }) },
+    workspaceData: (searchEvents || searchMail) ? data : undefined
   });
   context.window = context;
-  vm.runInContext(['let searchedEvents=', 'const GLOBAL_SEARCH_DEBOUNCE_MS=', 'function searchEventsForBox(q){'].map(take).join('\n'), context);
+  vm.runInContext(['let searchedEvents=', 'const GLOBAL_SEARCH_DEBOUNCE_MS=', 'function searchDatabaseForBox(q){'].map(take).join('\n'), context);
   return {
-    call: q => vm.runInContext(`searchEventsForBox(${JSON.stringify(q)})`, context),
+    call: q => vm.runInContext(`searchDatabaseForBox(${JSON.stringify(q)})`, context),
     fire: () => timers.filter(t => !t.cleared && !t.fired).forEach(t => { t.fired = true; t.fn(); }),
     searchedEvents: () => vm.runInContext('searchedEvents', context),
+    searchedMails: () => vm.runInContext('searchedMails', context),
     asked
   };
 }
@@ -235,6 +245,27 @@ test('a query asks the database only once typing settles, and a slow answer supe
   resolveFirst([{ id: 'stale' }]);
   await Promise.resolve(); await Promise.resolve();
   assert.deepEqual([...h.searchedEvents()].map(e => e.id), ['e1'], 'the late, superseded answer for "first" never overwrites "second"\'s');
+});
+
+test('the same settled query asks for mail as well as events, and a superseded mail answer is dropped the same way', async () => {
+  let resolveFirst;
+  const h = loadSearchEvents({
+    searchEvents: () => Promise.resolve([{ id: 'e1' }]),
+    searchMail: q => (q === 'first'
+      ? new Promise(resolve => { resolveFirst = resolve; })
+      : Promise.resolve([{ threadId: 'th2', subject: 'Second', preview: '' }]))
+  });
+  h.call('first');
+  h.fire();
+  h.call('second');
+  h.fire();
+  await Promise.resolve(); await Promise.resolve();
+  assert.deepEqual([...h.searchedMails()].map(m => m.id), ['th2'],
+    'a mail hit is stored as a thread, by its thread id');
+  resolveFirst([{ threadId: 'stale', subject: 'Stale', preview: '' }]);
+  await Promise.resolve(); await Promise.resolve();
+  assert.deepEqual([...h.searchedMails()].map(m => m.id), ['th2'],
+    'the late answer for "first" never overwrites "second"\'s, exactly as events behave');
 });
 
 test('typing again before the debounce elapses never asks the database for what was typed first', () => {

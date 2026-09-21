@@ -290,7 +290,7 @@ window.addEventListener('hashchange',()=>navigate(location.hash.slice(1)));
    well as records — best matches first, twelve at a time, and usable with the
    arrow keys (shell-model.js). */
 const search=document.querySelector('#search'),results=document.querySelector('#search-results');
-function searchSources(){return {navs:overviewModel.visibleNavs(navs,isManagerNow()),tickets,projects,contacts,companies:(window.workspaceStore&&workspaceStore.state.companies)||[],team,events,projectEvents:(window.workspaceStore&&workspaceStore.state.projectEvents)||[],invoices:shapedInvoices(),invoiceMatches:financeModel.matchesQuery,mails,notes:recordNotes,mailRoute:m=>mailModel.mailRoute({mailbox:mailModel.ALL,folder:mailModel.folderForThread(m,'inbox'),threadId:m.id}),searchedEvents};}
+function searchSources(){return {navs:overviewModel.visibleNavs(navs,isManagerNow()),tickets,projects,contacts,companies:(window.workspaceStore&&workspaceStore.state.companies)||[],team,events,projectEvents:(window.workspaceStore&&workspaceStore.state.projectEvents)||[],invoices:shapedInvoices(),invoiceMatches:financeModel.matchesQuery,mails,notes:recordNotes,mailRoute:m=>mailModel.mailRoute({mailbox:mailModel.ALL,folder:mailModel.folderForThread(m,'inbox'),threadId:m.id}),searchedEvents,searchedMails};}
 function showResults(){const q=search.value.trim();results.hidden=!q;if(!q)return;const found=shellModel.search(shellModel.searchItems(searchSources()),q);results.innerHTML=found.results.map(x=>`<button type="button" data-nav="${esc(x.route)}">${esc(x.label)}<small>${esc(x.type)}${x.detail?' · '+esc(x.detail):''}</small></button>`).join('')+(found.more?`<p class="search-more">${overviewModel.plural(found.more,'more match','more matches')} — keep typing to narrow it down.</p>`:'')||'<div class="empty-state">No matching records.</div>';}
 function moveInResults(e){const buttons=[...results.querySelectorAll('button[data-nav]')];if(!buttons.length||results.hidden)return;e.preventDefault();const next=shellModel.nextFocus(buttons.indexOf(document.activeElement),e.key,buttons.length);if(next===-1)search.focus();else buttons[next].focus();}
 /* A past meeting, or an event weeks away with no project, is not in any array
@@ -300,10 +300,15 @@ function moveInResults(e){const buttons=[...results.querySelectorAll('button[dat
    currently asked, never an older answer landing late. Cleared, not left as
    it was, the moment the query changes at all — the loaded-only results are
    still correct on their own; a previous query's events are not. */
-let searchedEvents=[],globalSearchDebounce=null,globalSearchSeq=0;
+let searchedEvents=[],searchedMails=[],globalSearchDebounce=null,globalSearchSeq=0;
 const GLOBAL_SEARCH_DEBOUNCE_MS=200;
-function searchEventsForBox(q){clearTimeout(globalSearchDebounce);const seq=++globalSearchSeq;if(searchedEvents.length){searchedEvents=[];showResults();}if(!q||typeof window.workspaceData==='undefined'||typeof workspaceData.searchEvents!=='function')return;globalSearchDebounce=setTimeout(()=>{workspaceData.searchEvents(q).then(rows=>{if(seq!==globalSearchSeq)return;searchedEvents=rows||[];showResults();}).catch(()=>{});},GLOBAL_SEARCH_DEBOUNCE_MS);}
-search.addEventListener('input',()=>{showResults();searchEventsForBox(search.value.trim());});
+/* Both database searches ride one debounce and one sequence number: they are
+   asked for the same query at the same moment, so a single late answer must
+   drop for the same reason either would. Mail hits come back as search rows
+   and are turned into thread-shaped objects (mailModel.threadFromSearchHit),
+   which is what gives them an id to dedupe on and a route to open. */
+function searchDatabaseForBox(q){clearTimeout(globalSearchDebounce);const seq=++globalSearchSeq;if(searchedEvents.length||searchedMails.length){searchedEvents=[];searchedMails=[];showResults();}if(!q||typeof window.workspaceData==='undefined')return;globalSearchDebounce=setTimeout(()=>{if(typeof workspaceData.searchEvents==='function')workspaceData.searchEvents(q).then(rows=>{if(seq!==globalSearchSeq)return;searchedEvents=rows||[];showResults();}).catch(()=>{});if(typeof workspaceData.searchMail==='function')workspaceData.searchMail(q).then(hits=>{if(seq!==globalSearchSeq)return;searchedMails=(hits||[]).map(h=>mailModel.threadFromSearchHit(h));showResults();}).catch(()=>{});},GLOBAL_SEARCH_DEBOUNCE_MS);}
+search.addEventListener('input',()=>{showResults();searchDatabaseForBox(search.value.trim());});
 search.addEventListener('keydown',e=>{if(e.key==='ArrowDown'||e.key==='ArrowUp')moveInResults(e);});
 results.addEventListener('keydown',e=>{if(['ArrowDown','ArrowUp','Home','End'].includes(e.key))moveInResults(e);if(e.key==='Escape'){e.preventDefault();e.stopPropagation();results.hidden=true;search.focus();}});
 /* Picking a result puts focus back in the box before the page changes: a new

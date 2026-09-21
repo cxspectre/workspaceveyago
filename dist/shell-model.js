@@ -5,8 +5,11 @@
  * projects, contacts, this week's events, invoices and loaded mail — no people,
  * companies, tasks or notes — stopped at eight results without saying so, and
  * could only be used with a mouse. The bell listed things with no way to reach
- * them. Kept apart from app.js so it can be tested without a browser —
- * tests/shell.test.mjs.
+ * them. It now covers all of those, twelve at a time with the rest counted,
+ * and reaches past what is loaded on both sides that mattered: search_events
+ * (0064) for a past meeting or one weeks away, and search_mail (0055) for a
+ * message body or an older thread. Kept apart from app.js so it can be tested
+ * without a browser — tests/shell.test.mjs.
  */
 const shellModel = (function () {
   'use strict';
@@ -72,8 +75,21 @@ const shellModel = (function () {
     (s.invoices || []).forEach(v => items.push(entry('Invoice', v.id + ' · ' + text(v.client), v.status,
       [v.id, v.client, v.amount].join(' '), 'finance/' + v.uuid,
       typeof s.invoiceMatches === 'function' ? query => s.invoiceMatches(v, query) : null)));
-    (s.mails || []).forEach(m => items.push(entry('Mail', m.subject, m.sender,
-      [m.subject, m.sender, m.email, m.preview].join(' '), s.mailRoute ? s.mailRoute(m) : 'mail')));
+    /* Mail already on screen, and — once a query has actually gone to the
+       database (queries.js searchMail, 0055) — every other message this
+       person could open: a body, an older thread, anything outside the
+       200-per-folder window mailThreads() keeps, which is the half of this
+       box's old "only what is loaded" that events alone did not fix. Each
+       counted once, the same way events are: the database will happily
+       re-find a thread that is already on screen. */
+    const seenMail = new Set();
+    [...(s.mails || []), ...(s.searchedMails || [])].forEach(m => {
+      const key = text(m && m.id).toLowerCase();
+      if (!key || seenMail.has(key)) return;
+      seenMail.add(key);
+      items.push(entry('Mail', m.subject, m.sender,
+        [m.subject, m.sender, m.email, m.preview].join(' '), s.mailRoute ? s.mailRoute(m) : 'mail'));
+    });
     const notes = s.notes || {};
     Object.keys(NOTE_ROUTES).forEach(kind => {
       Object.keys(notes[kind] || {}).forEach(id => (notes[kind][id] || []).forEach(note => {
