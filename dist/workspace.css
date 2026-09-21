@@ -636,3 +636,26 @@ a.agenda-item:focus-visible{outline:2px solid #0071e3;outline-offset:2px;border-
    link to somewhere that exists yet. */
 .reader-related>.related-action{font-size:.75rem;padding:7px 2px;align-self:center}
 .mail-rematch{display:block;margin-top:10px;font-size:.75rem;text-align:left}
+
+/* The pipeline's deal cards (crm-ui.js, 0067). A card is an article, not a
+   link — it carries its own buttons — so it needs the pointer and the hover
+   lift .contact-card only gave an anchor, and its company link is the one
+   thing inside it that navigates. The buttons sit on a row of their own, kept
+   off the drag by nothing more than being buttons: a drag started on one
+   still moves the card, which is what a person expects from grabbing it
+   anywhere. */
+.deal-card{cursor:grab}
+.deal-card:active{cursor:grabbing}
+.deal-card>p{font-size:.8125rem;color:#66758a;margin-top:6px}
+.deal-card .contact-value{margin:14px 0 10px}
+.deal-card .contact-value span{text-align:right}
+.card-actions{display:flex;flex-wrap:wrap;align-items:center;gap:14px}
+.card-actions .text-btn{padding:0}
+/* A deal on its company's page: name and caption, then what it is worth, then
+   what can be done to it — and on a phone, the three stacked rather than
+   squeezed, since .related-item is a single row everywhere else. */
+.deal-row{align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap}
+.deal-row>div{min-width:0;flex:1 1 180px}
+.deal-row small{display:block;color:#66758a;font-size:.75rem;margin-top:3px}
+.deal-row-value{display:flex;align-items:center;gap:10px;font-variant-numeric:tabular-nums}
+@media (max-width: 520px) { .deal-row{flex-direction:column} .deal-row-value{width:100%} }

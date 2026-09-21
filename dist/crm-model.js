@@ -629,6 +629,11 @@ const crmModel = (function () {
   return Object.freeze({
     STAGES, STAGE_LABELS, KINDS, VALUE_LIMIT,
     stageValue, stageLabel, kindValue,
+    /* The money rules, exported so deals-model.js counts a deal's value the
+       way this file has always counted a company's (0067 gave crm_deals the
+       same numeric(12,2) and the same three-letter currency rule 0049 gave
+       crm_companies, so the reading of them must not drift apart). */
+    amountOf, currencyOf, parseAmount, readValue, totalsOf,
     nameKey, companyKey, domainKey, isPublicMail,
     contactById, companyById, contactRoute, companyRoute, route,
     shapeCompany, shapeContact, contactList, companyList, companyWork, contactWork,

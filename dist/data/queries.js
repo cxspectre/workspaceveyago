@@ -667,6 +667,39 @@
       });
     },
 
+    /* Every deal, a page at a time (everyRow), as companies and contacts are:
+       a studio's pipeline only ever grows, and the closed deals are the part
+       that never stops growing.
+
+       Open and closed alike — the board draws both, and the Won and Lost
+       columns ARE the history 0067 added the table for. Soft-deleted ones are
+       left out, the same as a removed company or contact.
+
+       Ordered by created_at then id, so every reload puts a column's cards in
+       the same order rather than PostgREST's own. The shape stays thin on
+       purpose: dealsModel.shapeDeal() builds what the views read, from these
+       same columns, and is tested without a browser. */
+    async deals() {
+      var rows = await everyRow(function (from, to) {
+        return sb()
+          .from('crm_deals')
+          .select('id, company_id, title, stage, value, currency, owner_id, ' +
+                  'expected_close, outcome, closed_at, notes, created_at')
+          .is('deleted_at', null)
+          .order('created_at')
+          .order('id')
+          .range(from, to);
+      }, 'deals');
+      return rows.map(function (r) {
+        return {
+          id: r.id, title: r.title,
+          stage: label(r.outcome || r.stage),
+          value: money(r.value, r.currency) || '—',
+          row: r
+        };
+      });
+    },
+
     /* Leads from the public "Get a quote" form (managers only — RLS returns []
        for anyone else, 0019). The site admin already lists these; this is the
        same table, read for the workspace's own Promote button. */
